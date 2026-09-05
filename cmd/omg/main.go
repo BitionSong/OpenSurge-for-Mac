@@ -30,6 +30,10 @@ var (
 	fetchConnections    = mihomo.FetchConnections
 	fetchProviders      = mihomo.FetchProviders
 	updateProxyProvider = mihomo.UpdateProxyProvider
+	startGatewayConfig  = gateway.StartConfig
+	stopGatewayConfig   = gateway.StopConfig
+	reloadGatewayConfig = gateway.ReloadConfig
+	restartMihomoConfig = gateway.RestartMihomoConfig
 	newGatewayManager   = func(cfg config.Config) gatewayManager {
 		return gateway.New(cfg)
 	}
@@ -73,6 +77,27 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "format: %v\n", err)
 		return 2
 	}
+	ctx := context.Background()
+	var lifecycleAction func(context.Context, string) error
+	switch command {
+	case "start":
+		lifecycleAction = startGatewayConfig
+	case "stop":
+		lifecycleAction = stopGatewayConfig
+	case "reload":
+		lifecycleAction = reloadGatewayConfig
+	case "restart-mihomo":
+		lifecycleAction = restartMihomoConfig
+	}
+	if lifecycleAction != nil {
+		if err := lifecycleAction(ctx, *configPath); err != nil {
+			return writeErrorExit(command, jsonOutput, 1, command, err)
+		}
+		if jsonOutput {
+			return writeJSONExit(commandResultJSON{Command: command, OK: true, ConfigPath: *configPath})
+		}
+		return 0
+	}
 
 	loadConfig := config.LoadRuntime
 	if commandRequiresDesiredPolicy(command) {
@@ -83,38 +108,9 @@ func run(args []string) int {
 		return writeErrorExit(command, jsonOutput, 1, "config", err)
 	}
 
-	ctx := context.Background()
 	manager := newGatewayManager(cfg)
 
 	switch command {
-	case "start":
-		if err := manager.Start(ctx); err != nil {
-			return writeErrorExit(command, jsonOutput, 1, "start", err)
-		}
-		if jsonOutput {
-			return writeJSONExit(commandResultJSON{Command: "start", OK: true, ConfigPath: *configPath})
-		}
-	case "stop":
-		if err := manager.Stop(ctx); err != nil {
-			return writeErrorExit(command, jsonOutput, 1, "stop", err)
-		}
-		if jsonOutput {
-			return writeJSONExit(commandResultJSON{Command: "stop", OK: true, ConfigPath: *configPath})
-		}
-	case "reload":
-		if err := manager.Reload(ctx); err != nil {
-			return writeErrorExit(command, jsonOutput, 1, "reload", err)
-		}
-		if jsonOutput {
-			return writeJSONExit(commandResultJSON{Command: "reload", OK: true, ConfigPath: *configPath})
-		}
-	case "restart-mihomo":
-		if err := manager.RestartMihomo(ctx); err != nil {
-			return writeErrorExit(command, jsonOutput, 1, "restart-mihomo", err)
-		}
-		if jsonOutput {
-			return writeJSONExit(commandResultJSON{Command: "restart-mihomo", OK: true, ConfigPath: *configPath})
-		}
 	case "status":
 		status, err := manager.Status(ctx)
 		if err != nil {
@@ -316,7 +312,7 @@ func run(args []string) int {
 
 func commandRequiresDesiredPolicy(command string) bool {
 	switch command {
-	case "start", "reload", "doctor", "render-mihomo", "validate-mihomo":
+	case "reload", "doctor", "render-mihomo", "validate-mihomo":
 		return true
 	default:
 		return false

@@ -115,8 +115,27 @@ Tailnet 仍使用原来的 4 秒预热预算，Exit Node 仍使用原来的 15 �
 配置明确的 `exit-node` 后，编译器生成可见的
 `open-surge/tailscale-exit -> open-surge/tailscale` selector。该组会加入 device
 policy 候选；当 `allow_mac` 为真时也会加入 `open-surge/mac-global`，供用户在
-Mac 本机全局出口中显式选择。创建该组不会自动切换 Mac 或任何设备，也不修改
-任意导入订阅的策略组。原始 `open-surge/tailscale` 仍作为兼容目标被校验器接受。
+Mac 本机全局出口中显式选择。最终运行配置还会在导入 profile 与附加配置已经合成后，
+为所有用户定义的 `type: select` 组追加该 Exit Node 候选，包括只有 `use`、
+`include-all` 或隐藏显示的用户组；不向自动测速/故障转移/负载均衡组、Mac 内部组、
+设备专用组和 Exit 包装组批量注入。原始订阅与附加配置源文件保持不变。共享的 YAML
+anchor/alias 在注入前展开为独立运行节点，避免手动组的新增成员泄漏进自动组。
+导入 profile、全局附加配置与 Tailscale 都是独立可空的输入；例如只有全局附加配置时，
+其中新增的手动 `select` 组仍会在停止态策略预览和 Web GUI 最终启动事务中获得同一个
+Exit 候选（前提是 Tailscale Exit Node 本身已启用），而没有 Tailscale 时则保持原组成员。
+
+本次只追加 `proxies` 成员并去重，不修改 mihomo 的 Provider 展开、过滤、默认选择或
+持久化规则。有有效历史选择时仍由内核恢复；没有有效选择时使用内核的第一候选，
+所以原本只有 `use` 的组可能默认选择新增的 Exit Node。`include-all`、`filter`、
+`exclude-filter` 与 `exclude-type` 保留原样，因此排除条件仍可能隐藏新增候选。
+删除或停用 Exit Node 后，下一份最终配置不再包含自动追加的成员；普通用户组原先
+选中的 Exit 消失时仍按内核原生规则选择，不承诺保留或阻止这次回退。设备专用出口
+仍保留原有的“先换掉设备出口再停用”校验。
+
+用户组的选择由所有命中流量共享，Mac Rule 与跟随网关规则的设备使用同一项选择。
+这些公网候选不受 `allow_mac` / `allowed_devices` 限制；这些授权字段仍控制明确
+Tailnet 目标的前置允许/拒绝规则，不能因为增加候选而扩大 Tailnet 目标访问。
+原始 `open-surge/tailscale` 仍作为兼容目标被校验器接受。
 Exit Node 使用不依赖 DNS 的公网固定 IP 探测；自动预热和 GUI 手动检测会给移动网络/
 DERP 慢链路更宽的探测预算，但这只改变检测，不改 mihomo 普通 TCP 连接的全局拨号
 超时。公网探测只证明该 Exit Node 到一个检测目标的单次可达性，不能把 GFW、目标站点

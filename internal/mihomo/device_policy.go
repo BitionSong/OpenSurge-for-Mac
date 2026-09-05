@@ -21,6 +21,15 @@ type policySections struct {
 	ipv6      bool
 }
 
+// RenderManagedBaseProfile supplies the user-owned portion of a managed
+// configuration as an importable profile for global overlay composition.
+// Device, local-routing and Tailscale sections are added only by the final
+// RenderConfig pass, after the overlay has been validated.
+func RenderManagedBaseProfile(cfg config.Config) (string, error) {
+	cfg.Tailscale.Enabled = false
+	return composeManagedPolicySections(cfg, policySections{}, localRoutingGeneratedPolicy{})
+}
+
 func renderPolicySections(cfg config.Config, imported *importedProfile) (string, error) {
 	scope, err := cfg.LANScope()
 	if err != nil {
@@ -141,6 +150,9 @@ func composeManagedPolicySections(cfg config.Config, policy policySections, loca
 }
 
 func composeImportedPolicySections(cfg config.Config, imported *importedProfile, policy policySections, localRouting localRoutingGeneratedPolicy) (string, error) {
+	if err := appendImportedTailscaleExitCandidates(imported, cfg); err != nil {
+		return "", err
+	}
 	if err := appendImportedTailscaleProxy(imported, cfg); err != nil {
 		return "", err
 	}

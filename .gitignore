@@ -9,3 +9,5 @@
 /output/playwright/
 /.playwright-cli/
 *.tsbuildinfo
+/.codex-tmp/
+/.agents/skills/opensurge-social-posters/

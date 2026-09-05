@@ -46,7 +46,7 @@ const source: Source = {
   size: 100,
   valid: true,
   validation: 'valid',
-  desired: false,
+  desired: true,
   applied: false,
   versions: [],
   diff: { proxies_added: [], proxies_removed: [], groups_added: [], groups_removed: [], proxy_providers_added: [], proxy_providers_removed: [], rule_providers_added: [], rule_providers_removed: [], rule_count_delta: 0 },
@@ -116,7 +116,43 @@ describe('ProfileOverlayPanel', () => {
     expect(saved.enabled).toBe(true)
     expect(saved.rules.prepend).toEqual(['DOMAIN,first.example,DIRECT'])
     expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ revision: 'saved-revision' }))
-    expect(await screen.findByText(/运行网关才会改变/)).toBeTruthy()
+    expect(await screen.findByText(/停止态可在策略页预览或直接启动/)).toBeTruthy()
+  })
+
+  it('treats the built-in configuration as a complete base when no source exists', async () => {
+    vi.mocked(api.saveProfileOverlayDocument).mockImplementation(async candidate => ({
+      ...overlay,
+      revision: 'standalone-revision',
+      document: candidate,
+      yaml: 'schema-version: 1\nenabled: true\n',
+      desired: false,
+    }))
+    render(<ProfileOverlayPanel overlay={overlay} sources={[]} onSaved={vi.fn()} />)
+
+    await userEvent.click(screen.getByRole('heading', { name: '高级：全局附加配置' }))
+    expect(screen.getByText('内置配置')).toBeTruthy()
+    expect(screen.getByText(/无需导入来源/)).toBeTruthy()
+    expect(screen.queryByLabelText('选择要预览的来源')).toBeNull()
+    const policiesLink = screen.getByRole('link', { name: '前往策略页预览' })
+    expect(policiesLink.getAttribute('href')).toBe('/policies')
+
+    await userEvent.click(screen.getByRole('switch', { name: '已停用' }))
+    await userEvent.type(screen.getByLabelText('高优先级自定义规则'), 'DOMAIN,standalone.example,DIRECT')
+    expect(policiesLink.getAttribute('href')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: '保存附加配置草稿' }))
+
+    expect(await screen.findByText(/无需导入来源；可以进入策略页预览、选择或测速，也可以直接启动/)).toBeTruthy()
+  })
+
+  it('does not make an unused source draft a prerequisite for the standalone overlay', async () => {
+    const unusedSource = { ...source, desired: false, applied: false }
+    render(<ProfileOverlayPanel overlay={overlay} sources={[unusedSource]} onSaved={vi.fn()} />)
+
+    await userEvent.click(screen.getByRole('heading', { name: '高级：全局附加配置' }))
+    expect(screen.getByText('内置配置')).toBeTruthy()
+    expect(screen.getByText(/无需导入来源/)).toBeTruthy()
+    expect(screen.getByRole('link', { name: '前往策略页预览' }).getAttribute('href')).toBe('/policies')
+    expect(screen.queryByLabelText('选择要预览的来源')).toBeNull()
   })
 
   it('previews every composition layer and the final mihomo config', async () => {

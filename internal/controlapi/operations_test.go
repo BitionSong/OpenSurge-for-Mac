@@ -260,3 +260,12 @@ func TestSlowProgressObserverCannotHoldUpLifecycleCleanup(t *testing.T) {
 		t.Fatalf("observer held up cleanup for %s", elapsed)
 	}
 }
+
+func TestLifecycleDeadlineContractKeepsCallerOutsideHelperCommitWindow(t *testing.T) {
+	if policyWorkspaceStartTimeout != 110*time.Second || helperConnectionTimeout != 2*time.Minute || gatewayOperationTimeout != 3*time.Minute {
+		t.Fatalf("unexpected candidate/Helper/Web deadlines: %s %s %s", policyWorkspaceStartTimeout, helperConnectionTimeout, gatewayOperationTimeout)
+	}
+	if gatewayOperationTimeout <= helperConnectionTimeout {
+		t.Fatalf("gateway operation timeout=%s must exceed helper connection timeout=%s", gatewayOperationTimeout, helperConnectionTimeout)
+	}
+}

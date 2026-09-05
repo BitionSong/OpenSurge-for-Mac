@@ -85,9 +85,9 @@ func (s *Server) handleSourcePreview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "source_not_previewable", "source must be a structurally valid mihomo profile")
 		return
 	}
-	sourceData, err := os.ReadFile(source.SnapshotPath)
+	sourceData, _, err := readValidatedSourceSnapshot(s.store.Dir(), source)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "source_snapshot_unavailable", err.Error())
+		writeError(w, http.StatusConflict, "source_snapshot_unavailable", err.Error())
 		return
 	}
 	overlayData, document, _, err := s.loadProfileOverlay()
@@ -219,7 +219,7 @@ func (s *Server) profileOverlayResponse() (ProfileOverlayResponse, error) {
 		if desired && cfg.Mihomo.ProfileMode == config.MihomoProfileModeImported {
 			desiredProfile, profileErr := config.MihomoProfileDigest(cfg)
 			if profileErr == nil {
-				if state, exists, stateErr := runtime.LoadState(runtime.NewPaths(cfg).StateFile); stateErr == nil && exists {
+				if state, exists := currentBootRuntimeState(cfg); exists {
 					applied = state.ProfileDigest == desiredProfile
 				}
 			}
@@ -236,9 +236,21 @@ func (s *Server) profileOverlayResponse() (ProfileOverlayResponse, error) {
 	}, nil
 }
 
+func currentBootRuntimeState(cfg config.Config) (runtime.State, bool) {
+	state, exists, err := runtime.LoadState(runtime.NewPaths(cfg).StateFile)
+	if err != nil || !exists {
+		return runtime.State{}, false
+	}
+	boot, err := runtime.CurrentBootSession()
+	if err != nil || !state.BelongsToBoot(boot) {
+		return runtime.State{}, false
+	}
+	return state, true
+}
+
 func (s *Server) loadProfileOverlay() ([]byte, mihomo.ProfileOverlayDocument, string, error) {
 	data, err := s.store.ProfileOverlay()
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) || (err == nil && len(bytes.TrimSpace(data)) == 0) {
 		data, err = mihomo.RenderProfileOverlay(mihomo.DefaultProfileOverlayDocument())
 	}
 	if err != nil {

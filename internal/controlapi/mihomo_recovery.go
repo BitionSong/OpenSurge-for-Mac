@@ -232,7 +232,7 @@ func (s *Server) evaluateMihomoRecovery(ctx context.Context) {
 		s.mihomoRecovery.finishAutomatic(err)
 		return
 	}
-	go s.runOperationLocked(op, cfg.Gateway.Mode, recovery, s.mihomoRecovery.finishAutomatic)
+	go s.runOperationLocked(op, cfg.Gateway.Mode, recovery, nil, s.mihomoRecovery.finishAutomatic)
 }
 
 func mihomoFailureReason(status gateway.Status) string {

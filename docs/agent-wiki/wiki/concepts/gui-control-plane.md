@@ -80,6 +80,32 @@ gateway start/stop API。真实生命周期动作留在网络页，使 topology�
 接管与恢复状态在用户确认前保持可见。“启动网关”只切换页面，不改变当前滚动位置；
 “停止网关”切换页面后滚动到页面底部，完整露出恢复状态机的当前操作按钮。
 
+策略页不再依赖网关已经启动。运行中读取真实运行 core；停止时由 root Helper 通过长连接
+lease 维持一个仅开放随机、带 secret 的 loopback Controller 的 prepared mihomo。页面从同一
+workspace API 获取最终策略组、选择与健康状态，因此 Provider、全局附加节点和 Tailscale
+Exit Node 都以最终合成结果出现，选择写入与下一次网关共用的 mihomo cache。prepared core
+不能开启 mixed/SOCKS/HTTP 业务端口、DNS listener、TUN、DHCP、pf、forwarding 或 IPv6
+packet ingress；Control Service 退出/断连、Helper 重启以及真实 gateway start/stop 都必须
+回收或交接它，且不能根据未验证 PID 杀进程。
+
+没有导入 mihomo YAML 也是策略页的一等状态。启用的全局附加配置以 OpenSurge 的 managed
+最小 profile 为基底，可以独立添加节点、`select` 组与规则。停止态策略页的 read/select/test
+只生成准备态产物并使用原有选择/测速缓存，不修改 desired 或基础恢复记录。用户可以不打开策略页，
+直接从 Web GUI 启动；Control Service 会把服务器端读取的同一来源/附加配置快照交给 Helper，
+Helper 在一个跨进程 lifecycle lock 内合成候选，由 Manager 解析最终网络参数、渲染并执行
+一次真实 `mihomo -t`，成功后才提交 desired 并接管网络；失败不能退回旧配置启动。策略页因此是可选的预览、选择与测速入口，
+不是启动前置步骤。来源、附加配置或 Tailscale 任一为空都必须返回正常的空/部分策略快照，
+而不是崩溃。运行中仍只展示 applied core，不能因为轮询策略页而把尚未显式应用的草稿热重载
+进当前网关。`sudo omg start` 只启动已经持久化的 root-owned desired 配置，不读取用户 Control
+Store 中的 Web 草稿。仅附加配置的运行中草稿通过下一次 App 启动采用。
+候选错误必须显示具体原因并清除旧成功快照；Provider 首次加载尚无节点属于正常空状态。
+
+workspace 请求同时携带 Control Service 捕获的 gateway running/stopped 状态。Helper 在跨进程
+lifecycle lock 内重新读取 state；若 CLI 或另一客户端已经完成 start/stop，本次 read/select/test
+或 start 必须返回刷新/重试，而不能跨状态复用快照。HTTP/file Provider 沿用既有相对、绝对
+和缺省路径解释，不做通用缓存重命名。新合成产物、选择缓存与 Tailscale 身份共用固定的
+受信任工作目录；composition base metadata 位于 runtime 控制目录，并只随显式提交更新。
+
 网络页对 `same_wifi_dhcp` 保留带恢复证据的完整状态机；`same_lan` 与 `isolated_lan`
 使用独立“网关运行控制”卡片直接调用 start/stop operation。未保存配置必须阻止启动，
 但不能阻止运行中网关的安全停止；`degraded` 仍属于运行中状态。两种直接启停路径都要

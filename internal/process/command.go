@@ -54,13 +54,20 @@ func RunTimeout(timeout time.Duration, name string, args ...string) error {
 }
 
 func RunBufferedTimeout(timeout time.Duration, output *bytes.Buffer, name string, args ...string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return RunBufferedContext(context.Background(), timeout, output, name, args...)
+}
+
+func RunBufferedContext(parent context.Context, timeout time.Duration, output *bytes.Buffer, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout = output
 	cmd.Stderr = output
 	err := cmd.Run()
+	if err := parent.Err(); err != nil {
+		return fmt.Errorf("%s: %w", formatCommand(name, args), err)
+	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("%s timed out after %s", formatCommand(name, args), timeout)
 	}

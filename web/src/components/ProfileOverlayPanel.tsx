@@ -29,6 +29,9 @@ export function ProfileOverlayPanel({ overlay, sources, onSaved }: { overlay: Pr
   const documentDirty = Boolean(document && overlay && JSON.stringify(document) !== JSON.stringify(overlay.document))
   const yamlDirty = Boolean(overlay && yaml !== overlay.yaml)
   const dirty = mode === 'guided' ? documentDirty : yamlDirty
+  // Imported snapshots can remain in the library as optional drafts. They do
+  // not become the composition base until one is desired/applied.
+  const standalone = !sources.some(source => source.desired || source.applied)
   const compatible = sources.filter(source => source.overlay_compatible !== false).length
   const expertOperations = document ? expertOperationCount(document) : 0
 
@@ -56,7 +59,11 @@ export function ProfileOverlayPanel({ overlay, sources, onSaved }: { overlay: Pr
         : await api.saveProfileOverlayYAML(yaml, overlay.revision)
       setDocument(structuredClone(saved.document))
       setYAML(saved.yaml)
-      setMessage(t(saved.document.enabled ? '附加配置草稿已保存。请在来源卡片应用，运行网关才会改变。' : '附加配置已停用并保存；如果运行版本曾使用它，请重新应用来源以移除附加内容。'))
+      setMessage(t(saved.document.enabled
+        ? standalone
+          ? '附加配置草稿已保存。无需导入来源；可以进入策略页预览、选择或测速，也可以直接启动，启动前会生成并校验同一配置。'
+          : '附加配置草稿已保存。停止态可在策略页预览或直接启动；若网关正在运行，请从来源卡片应用。'
+        : '附加配置已停用并保存；下次通过 App 启动或从来源卡片应用配置时，会移除附加内容。'))
       await onSaved(saved)
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
@@ -104,13 +111,13 @@ export function ProfileOverlayPanel({ overlay, sources, onSaved }: { overlay: Pr
     <details className={`section profile-overlay-panel ${document.enabled ? 'enabled' : ''}`}>
       <summary className="profile-overlay-hero">
         <div className="profile-overlay-symbol" aria-hidden="true">⌘</div>
-        <div><small>ADVANCED · GLOBAL EXTENSION</small><h2>{t('高级：全局附加配置')}</h2><p>{t('默认折叠；只在需要跨订阅保留个人规则或节点时启用。')}</p></div>
+        <div><small>ADVANCED · GLOBAL EXTENSION</small><h2>{t('高级：全局附加配置')}</h2><p>{t('既可以跨订阅保留个人规则与节点，也可以不导入订阅而独立组成完整策略。')}</p></div>
         <div className="profile-overlay-controls"><span className={`overlay-status ${statusTone}`}>{status}</span><i aria-hidden="true">⌄</i></div>
       </summary>
 
       <div className="profile-overlay-body">
         <div className="overlay-enable-row">
-          <div><strong>{t('全局应用')}</strong><small>{t('保存只产生草稿；订阅刷新会重新检查，应用来源后才改变网关。')}</small></div>
+          <div><strong>{t('全局应用')}</strong><small>{t('保存先产生草稿；有来源时与来源组合，无来源时与 OpenSurge 内置最小配置组合。')}</small></div>
           <button className={`overlay-switch ${document.enabled ? 'on' : ''}`} type="button" role="switch" aria-checked={document.enabled} onClick={() => update(current => { current.enabled = !current.enabled })}><i aria-hidden="true" /><span>{t(document.enabled ? '已启用' : '已停用')}</span></button>
         </div>
 
@@ -118,7 +125,7 @@ export function ProfileOverlayPanel({ overlay, sources, onSaved }: { overlay: Pr
           <OverlayMetric value={document.rules.prepend.length} label="自定义规则" />
           <OverlayMetric value={document.proxies.add.length} label="自定义节点" />
           <OverlayMetric value={expertOperations} label="专家操作" />
-          <OverlayMetric value={`${compatible}/${sources.length}`} label="来源兼容" />
+          <OverlayMetric value={standalone ? t('内置配置') : `${compatible}/${sources.length}`} label={standalone ? '合成基底' : '来源兼容'} />
         </div>
 
         {mode === 'guided' ? <div className="overlay-guided-editor">
@@ -134,15 +141,17 @@ export function ProfileOverlayPanel({ overlay, sources, onSaved }: { overlay: Pr
         </section>
 
         <div className="overlay-source-compatibility">
-          <div><strong>{t('来源兼容性')}</strong><small>{t('保存草稿后，每个订阅独立检查名称冲突和高级引用。')}</small></div>
-          <div className="compatibility-chips">{sources.length ? sources.map(source => <span key={source.id} className={source.overlay_compatible === false ? 'bad' : 'ok'} title={source.overlay_validation ? t(source.overlay_validation) : undefined}>{source.overlay_compatible === false ? '!' : '✓'} {source.name}</span>) : <span className="muted">{t('导入来源后可检查')}</span>}</div>
+          <div><strong>{t(standalone ? '独立配置' : '来源兼容性')}</strong><small>{t(standalone ? 'mihomo YAML 来源是可选项；附加节点、策略组与规则会直接叠加到内置最小配置。' : '保存草稿后，每个订阅独立检查名称冲突和高级引用。')}</small></div>
+          <div className="compatibility-chips">{standalone ? <span className="ok">✓ {t('无需导入来源')}</span> : sources.map(source => <span key={source.id} className={source.overlay_compatible === false ? 'bad' : 'ok'} title={source.overlay_validation ? t(source.overlay_validation) : undefined}>{source.overlay_compatible === false ? '!' : '✓'} {source.name}</span>)}</div>
         </div>
 
-        <div className="overlay-preview-row">
-          <label>{t('最终配置预览')}<select aria-label={t('选择要预览的来源')} value={previewSource} onChange={event => setPreviewSource(event.target.value)}><option value="">{t('选择一个来源')}</option>{sources.map(source => <option key={source.id} value={source.id}>{source.name}{source.overlay_compatible === false ? t(' · 存在冲突') : ''}</option>)}</select></label>
-          <button type="button" disabled={busy || !previewSource || dirty} onClick={() => void openPreview()}>{t('查看组合结果')}</button>
-          {dirty ? <small>{t('保存草稿后才能生成权威预览。')}</small> : <small>{t('预览包含原始来源、附加层、有效来源和 OpenSurge 最终配置。')}</small>}
-        </div>
+        {standalone
+          ? <div className="overlay-preview-row standalone"><div><strong>{t('最终配置预览')}</strong><small>{t('策略页会加载真实合成配置，可直接选择节点并检测延迟；直接启动也会先生成并校验同一配置。')}</small></div><a className={dirty ? 'disabled' : ''} aria-disabled={dirty} href={dirty ? undefined : '/policies'}>{t('前往策略页预览')}</a>{dirty ? <small>{t('请先保存草稿，再预览或启动这份配置。')}</small> : <small>{t('无需先导入 mihomo YAML；策略页不是启动前置步骤。')}</small>}</div>
+          : <div className="overlay-preview-row">
+              <label>{t('最终配置预览')}<select aria-label={t('选择要预览的来源')} value={previewSource} onChange={event => setPreviewSource(event.target.value)}><option value="">{t('选择一个来源')}</option>{sources.map(source => <option key={source.id} value={source.id}>{source.name}{source.overlay_compatible === false ? t(' · 存在冲突') : ''}</option>)}</select></label>
+              <button type="button" disabled={busy || !previewSource || dirty} onClick={() => void openPreview()}>{t('查看组合结果')}</button>
+              {dirty ? <small>{t('保存草稿后才能生成权威预览。')}</small> : <small>{t('预览包含原始来源、附加层、有效来源和 OpenSurge 最终配置。')}</small>}
+            </div>}
 
         {error ? <div className="overlay-feedback error" role="alert"><span aria-hidden="true">!</span><div><strong>{t('附加配置未完成')}</strong><p>{error}</p></div></div> : null}
         {message ? <div className="overlay-feedback success" role="status"><span aria-hidden="true">✓</span><div><strong>{t('草稿已保存')}</strong><p>{message}</p></div></div> : null}

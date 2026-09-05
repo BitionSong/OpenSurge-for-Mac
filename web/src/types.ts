@@ -66,6 +66,18 @@ export type ProxyHealthTestResponse = {
   test_url: string
   results: Array<{ name: string; status: ProxyHealthEntry['status']; delay_ms?: number; tested_at: string; test_url: string; error?: string }>
 }
+export type PolicyWorkspaceRequest =
+  | { action: 'read' }
+  | { action: 'select'; group: string; policy: string }
+  | { action: 'test'; names: string[] }
+export type PolicyWorkspaceSnapshot = {
+  schema_version: number
+  mode: 'prepared' | 'running'
+  revision: string
+  groups: ProxyGroup[]
+  health: ProxyHealthSnapshot
+  results?: ProxyHealthTestResponse['results']
+}
 export type ProviderProxy = { name: string; type: string; alive: boolean }
 export type ProxyProvider = { name: string; type: string; vehicle_type: string; updated_at?: string; proxy_count: number; proxies: ProviderProxy[] }
 export type RuleProvider = { name: string; type: string; vehicle_type: string; behavior?: string; updated_at?: string; rule_count: number }

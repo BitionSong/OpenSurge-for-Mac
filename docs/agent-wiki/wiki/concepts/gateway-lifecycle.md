@@ -184,12 +184,29 @@ status 读取失败、runtime 非 active、以及不允许恢复的 DHCP 接管�
 既不触发恢复，也不能累计健康确认或清除本次 incident 的单次尝试保护。上次开机留下的
 interrupted runtime 同样不会触发。
 
-start、stop、reload、手动/自动 `restart-mihomo` 和运行中 source apply 共享 Control
-Service 生命周期互斥锁，避免两个 helper 动作同时修改 runtime。Manager 还在 runtime
-目录持有跨进程 advisory lock，使直接运行的 `sudo omg` 与 Helper 动作也不能并发；
-Control Service 发现这个锁正在被外部生命周期命令持有时，把 Mihomo 缺失视为受控停机
-窗口，不触发自动恢复。锁文件不保存状态，进程退出后以内核释放的文件锁为准，不能根据
-文件是否存在判断忙闲。这个自动化只实现了窄的
+start、stop、reload、手动/自动 `restart-mihomo`、prepared policy workspace，以及所有
+配置 apply/rollback 共享 Control Service 生命周期互斥锁。runtime 目录中的跨进程
+advisory lock 还会排斥直接运行的 `sudo omg`；CLI 生命周期入口必须先根据 config 定位并
+取得这把锁，再在锁内重新读取 desired config，然后才构造 Manager。不能先把配置读进内存、
+等待锁、再启动旧 candidate。配置 apply 则从 revision 检查、prepared core 交接、候选写入、
+真实校验、reload/start 到失败 rollback 全程持有同一把锁，不能在持久化和运行切换之间留缝。
+
+App 的候选启动复用 Manager 生命周期：锁内检查 revision/停止状态、合成候选、停止 prepared
+core，再确定 IPv6 自动解析和设备策略快照、执行既有预检、渲染并做一次真实 `mihomo -t`。
+`StartCandidateLocked` 只在最终校验成功后、网络接管前调用配置提交。后续启动使用已生成文件，
+不重新读取草稿。校验/提交失败保留旧 desired；提交后接管失败按原 rollback 恢复网络，保留
+已验证的新 desired 供重试。已有运行中 reload/apply 的预校验和恢复契约不变。
+
+候选启动动作上限为 110 秒，真实校验同时受动作 context 和 90 秒进程上限约束。Helper 连接
+仍为 2 分钟，Web operation 仍为 3 分钟；不将所有操作扩大为多轮校验的预算。取消/超时后
+不再提交或开始下一接管阶段；已发生的修改继续通过独立有界的 rollback 恢复。
+
+Web GUI 的直接 start 也在锁内检查请求捕获时的 gateway state 仍是 stopped；策略页每次
+read/select/test 同样绑定 captured running/stopped state。若外部 CLI 在请求排队期间改变
+状态，本次请求必须要求刷新，不能把 running 快照中的空草稿误当成停止态配置。Control
+Service 发现跨进程锁正在被外部生命周期命令持有时，把 Mihomo 缺失视为受控停机窗口，
+不触发自动恢复。锁文件不保存状态，进程退出后以内核释放的文件锁为准，不能根据文件是否
+存在判断忙闲。这个自动化只实现了窄的
 Mihomo-only 重启边界；在真实 same-WiFi 断开/重连门槛完成前，不得把单元测试描述成物理
 链路恢复已经验收。
 

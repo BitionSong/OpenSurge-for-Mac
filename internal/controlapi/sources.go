@@ -18,7 +18,6 @@ import (
 
 	"open-mihomo-gateway/internal/config"
 	"open-mihomo-gateway/internal/mihomo"
-	"open-mihomo-gateway/internal/runtime"
 
 	"gopkg.in/yaml.v3"
 )
@@ -208,7 +207,7 @@ func (s *Server) decorateSourceStates(sources []Source) []Source {
 		result[i].OverlayCompatible = overlayErr == nil
 		if overlayErr != nil {
 			result[i].OverlayValidation = overlayErr.Error()
-		} else if data, err := os.ReadFile(result[i].SnapshotPath); err != nil {
+		} else if data, _, err := readValidatedSourceSnapshot(s.store.Dir(), result[i]); err != nil {
 			result[i].OverlayCompatible = false
 			result[i].OverlayValidation = err.Error()
 		} else if composition, err := mihomo.ComposeProfileOverlay(data, overlay); err != nil {
@@ -240,7 +239,7 @@ func (s *Server) profileCompositionDigests() (string, string, string) {
 		desiredSource = desired
 	}
 	applied := ""
-	if state, exists, _ := runtime.LoadState(runtime.NewPaths(cfg).StateFile); exists {
+	if state, exists := currentBootRuntimeState(cfg); exists {
 		applied = state.ProfileDigest
 	}
 	return desired, applied, desiredSource

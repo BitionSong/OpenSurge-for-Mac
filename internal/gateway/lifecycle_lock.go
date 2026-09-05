@@ -1,65 +1,33 @@
 package gateway
 
 import (
-	"errors"
+	"context"
 	"fmt"
-	"os"
 	"path/filepath"
-	"syscall"
 
 	"open-mihomo-gateway/internal/config"
+	"open-mihomo-gateway/internal/runtime"
 )
 
-const lifecycleLockName = ".gateway-lifecycle.lock"
-
-var ErrLifecycleOperationInProgress = errors.New("another gateway lifecycle operation is already running")
+var ErrLifecycleOperationInProgress = runtime.ErrLifecycleOperationInProgress
 
 type lifecycleLock struct {
-	file *os.File
+	lock *runtime.LifecycleLock
 }
 
 func acquireLifecycleLock(cfg config.Config) (*lifecycleLock, error) {
-	if err := os.MkdirAll(cfg.Runtime.Dir, 0o755); err != nil {
-		return nil, fmt.Errorf("prepare gateway lifecycle lock directory: %w", err)
-	}
-	path := filepath.Join(cfg.Runtime.Dir, lifecycleLockName)
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	lock, err := runtime.AcquireLifecycleLock(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("open gateway lifecycle lock: %w", err)
-	}
-	if err := ensureLifecycleLockFile(file); err != nil {
-		_ = file.Close()
 		return nil, err
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = file.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, ErrLifecycleOperationInProgress
-		}
-		return nil, fmt.Errorf("lock gateway lifecycle: %w", err)
-	}
-	return &lifecycleLock{file: file}, nil
+	return &lifecycleLock{lock: lock}, nil
 }
 
 func (l *lifecycleLock) release() error {
-	if l == nil || l.file == nil {
+	if l == nil {
 		return nil
 	}
-	unlockErr := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
-	closeErr := l.file.Close()
-	l.file = nil
-	return errors.Join(unlockErr, closeErr)
-}
-
-func ensureLifecycleLockFile(file *os.File) error {
-	info, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("inspect gateway lifecycle lock: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("gateway lifecycle lock is not a regular file")
-	}
-	return nil
+	return l.lock.Release()
 }
 
 // LifecycleOperationInProgress lets the unprivileged control service avoid
@@ -67,35 +35,88 @@ func ensureLifecycleLockFile(file *os.File) error {
 // helper for a crashed mihomo process. The lock file contains no state; the
 // kernel-held advisory lock is the only authority.
 func LifecycleOperationInProgress(cfg config.Config) (bool, error) {
-	path := filepath.Join(cfg.Runtime.Dir, lifecycleLockName)
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("open gateway lifecycle lock for inspection: %w", err)
-	}
-	defer file.Close()
-	if err := ensureLifecycleLockFile(file); err != nil {
-		return false, err
-	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return true, nil
-		}
-		return false, fmt.Errorf("inspect gateway lifecycle lock: %w", err)
-	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_UN); err != nil {
-		return false, fmt.Errorf("release inspected gateway lifecycle lock: %w", err)
-	}
-	return false, nil
+	return runtime.LifecycleOperationInProgress(cfg)
 }
 
 func (m Manager) withLifecycleLock(run func() error) error {
-	lock, err := acquireLifecycleLock(m.cfg)
+	return runtime.WithLifecycleLock(m.cfg, run)
+}
+
+type configLifecycleDeps struct {
+	loadRuntime func(string) (config.Config, error)
+	loadLocked  func(string) (config.Config, error)
+	runLocked   func(context.Context, config.Config) error
+}
+
+// StartConfig acquires the runtime lifecycle lock before loading the desired
+// configuration used for startup. This closes the read-before-lock race where
+// another privileged transaction could persist a new graph after a CLI had
+// already captured the old one in memory.
+func StartConfig(ctx context.Context, configPath string) error {
+	return runConfigLifecycle(ctx, configPath, configLifecycleDeps{
+		loadRuntime: config.LoadRuntime,
+		loadLocked:  config.Load,
+		runLocked: func(ctx context.Context, cfg config.Config) error {
+			manager := New(cfg)
+			return manager.StartLocked(ctx)
+		},
+	})
+}
+
+// ReloadConfig follows the same lock-before-load rule as StartConfig so a
+// delayed CLI reload cannot replace a newly applied live graph with the old
+// configuration it observed before the apply transaction.
+func ReloadConfig(ctx context.Context, configPath string) error {
+	return runConfigLifecycle(ctx, configPath, configLifecycleDeps{
+		loadRuntime: config.LoadRuntime,
+		loadLocked:  config.Load,
+		runLocked: func(ctx context.Context, cfg config.Config) error {
+			manager := New(cfg)
+			return manager.ReloadLocked(ctx)
+		},
+	})
+}
+
+// RestartMihomoConfig reloads runtime-safe desired fields only after taking
+// the lifecycle lock. It deliberately continues to defer a mutable invalid
+// device-policy draft so recovery of the already-applied gateway stays usable.
+func RestartMihomoConfig(ctx context.Context, configPath string) error {
+	return runConfigLifecycle(ctx, configPath, configLifecycleDeps{
+		loadRuntime: config.LoadRuntime,
+		loadLocked:  config.LoadRuntime,
+		runLocked: func(ctx context.Context, cfg config.Config) error {
+			manager := New(cfg)
+			return manager.restartMihomo(ctx)
+		},
+	})
+}
+
+// StopConfig loads runtime-safe paths and applied-state controls only after
+// taking the lifecycle lock, matching the other path-based transitions.
+func StopConfig(ctx context.Context, configPath string) error {
+	return runConfigLifecycle(ctx, configPath, configLifecycleDeps{
+		loadRuntime: config.LoadRuntime,
+		loadLocked:  config.LoadRuntime,
+		runLocked: func(ctx context.Context, cfg config.Config) error {
+			manager := New(cfg)
+			return manager.stop(ctx)
+		},
+	})
+}
+
+func runConfigLifecycle(ctx context.Context, configPath string, deps configLifecycleDeps) error {
+	lockConfig, err := deps.loadRuntime(configPath)
 	if err != nil {
 		return err
 	}
-	runErr := run()
-	return errors.Join(runErr, lock.release())
+	return runtime.WithLifecycleLock(lockConfig, func() error {
+		desired, err := deps.loadLocked(configPath)
+		if err != nil {
+			return err
+		}
+		if filepath.Clean(desired.Runtime.Dir) != filepath.Clean(lockConfig.Runtime.Dir) {
+			return fmt.Errorf("runtime.dir changed while a gateway lifecycle action was waiting; retry the action")
+		}
+		return deps.runLocked(ctx, desired)
+	})
 }

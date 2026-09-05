@@ -29,7 +29,7 @@ type profileApplyDeps struct {
 	start       func(context.Context, config.Config) error
 }
 
-func defaultProfileApplyDeps() profileApplyDeps {
+func defaultLockedProfileApplyDeps() profileApplyDeps {
 	return profileApplyDeps{
 		geteuid: os.Geteuid,
 		validate: func(cfg config.Config) error {
@@ -47,13 +47,22 @@ func defaultProfileApplyDeps() profileApplyDeps {
 			_, exists, err := runtime.LoadState(runtime.NewPaths(cfg).StateFile)
 			return exists, err
 		},
-		reload: func(ctx context.Context, cfg config.Config) error { return gateway.New(cfg).Reload(ctx) },
-		start:  func(ctx context.Context, cfg config.Config) error { return gateway.New(cfg).Start(ctx) },
+		reload: func(ctx context.Context, cfg config.Config) error { return gateway.New(cfg).ReloadLocked(ctx) },
+		start:  func(ctx context.Context, cfg config.Config) error { return gateway.New(cfg).StartLocked(ctx) },
 	}
 }
 
 func (DirectRunner) ApplyProfile(ctx context.Context, configPath, revision string, payload []byte, sourceDigest, overlayDigest string) (ProfileApplyResult, error) {
-	return applyProfile(ctx, configPath, revision, payload, sourceDigest, overlayDigest, defaultProfileApplyDeps())
+	if os.Geteuid() != 0 {
+		return ProfileApplyResult{}, fmt.Errorf("privileged helper is required")
+	}
+	var result ProfileApplyResult
+	err := withConfigurationLifecycleLock(configPath, func() error {
+		var err error
+		result, err = applyProfile(ctx, configPath, revision, payload, sourceDigest, overlayDigest, defaultLockedProfileApplyDeps())
+		return err
+	})
+	return result, err
 }
 
 func applyProfile(ctx context.Context, configPath, revision string, payload []byte, sourceDigest, overlayDigest string, deps profileApplyDeps) (ProfileApplyResult, error) {
@@ -142,7 +151,16 @@ func applyProfile(ctx context.Context, configPath, revision string, payload []by
 }
 
 func (DirectRunner) ApplyTailscale(ctx context.Context, configPath, revision string, payload []byte) (ProfileApplyResult, error) {
-	return applyTailscale(ctx, configPath, revision, payload, defaultProfileApplyDeps())
+	if os.Geteuid() != 0 {
+		return ProfileApplyResult{}, fmt.Errorf("privileged helper is required")
+	}
+	var result ProfileApplyResult
+	err := withConfigurationLifecycleLock(configPath, func() error {
+		var err error
+		result, err = applyTailscale(ctx, configPath, revision, payload, defaultLockedProfileApplyDeps())
+		return err
+	})
+	return result, err
 }
 
 func applyTailscale(ctx context.Context, configPath, revision string, payload []byte, deps profileApplyDeps) (ProfileApplyResult, error) {
@@ -388,14 +406,23 @@ func tailscaleApplyRollbackError(reloadErr, rollbackErr, restartErr error) error
 }
 
 func (DirectRunner) ForgetTailscaleIdentity(_ context.Context, configPath, revision string) (string, error) {
-	return forgetTailscaleIdentity(configPath, revision, forgetTailscaleDeps{
-		geteuid: os.Geteuid,
-		stateExists: func(cfg config.Config) (bool, error) {
-			_, exists, err := runtime.LoadState(runtime.NewPaths(cfg).StateFile)
-			return exists, err
-		},
-		removeAll: os.RemoveAll,
+	if os.Geteuid() != 0 {
+		return "", fmt.Errorf("privileged helper is required")
+	}
+	var result string
+	err := withConfigurationLifecycleLock(configPath, func() error {
+		var err error
+		result, err = forgetTailscaleIdentity(configPath, revision, forgetTailscaleDeps{
+			geteuid: os.Geteuid,
+			stateExists: func(cfg config.Config) (bool, error) {
+				_, exists, err := runtime.LoadState(runtime.NewPaths(cfg).StateFile)
+				return exists, err
+			},
+			removeAll: os.RemoveAll,
+		})
+		return err
 	})
+	return result, err
 }
 
 type forgetTailscaleDeps struct {
@@ -457,6 +484,19 @@ func profileApplyRollbackError(reloadErr, rollbackErr, restartErr error) error {
 }
 
 func (DirectRunner) ApplyDevicePolicy(ctx context.Context, configPath, revision string, payload []byte) (string, error) {
+	if os.Geteuid() != 0 {
+		return "", fmt.Errorf("privileged helper is required")
+	}
+	var result string
+	err := withConfigurationLifecycleLock(configPath, func() error {
+		var err error
+		result, err = applyDevicePolicy(ctx, configPath, revision, payload)
+		return err
+	})
+	return result, err
+}
+
+func applyDevicePolicy(ctx context.Context, configPath, revision string, payload []byte) (string, error) {
 	gateway.ReportProgress(ctx, "validating_device_policy")
 	if os.Geteuid() != 0 {
 		return "", fmt.Errorf("privileged helper is required")
@@ -528,7 +568,33 @@ func (DirectRunner) ApplyControlConfig(_ context.Context, configPath, revision s
 	if os.Geteuid() != 0 {
 		return "", fmt.Errorf("privileged helper is required")
 	}
-	return applyControlConfig(configPath, revision, payload)
+	var result string
+	err := withConfigurationLifecycleLock(configPath, func() error {
+		var err error
+		result, err = applyControlConfig(configPath, revision, payload)
+		return err
+	})
+	return result, err
+}
+
+func withConfigurationLifecycleLock(configPath string, run func() error) error {
+	lockConfig, err := config.LoadRuntime(configPath)
+	if err != nil {
+		return err
+	}
+	return runtime.WithLifecycleLock(lockConfig, func() error {
+		current, err := config.LoadRuntime(configPath)
+		if err != nil {
+			return err
+		}
+		if filepath.Clean(current.Runtime.Dir) != filepath.Clean(lockConfig.Runtime.Dir) {
+			return fmt.Errorf("runtime.dir changed while configuration update was waiting; retry the update")
+		}
+		if err := mihomo.StopPreparedLocked(current); err != nil {
+			return fmt.Errorf("release prepared engine before configuration update: %w", err)
+		}
+		return run()
+	})
 }
 
 func applyControlConfig(configPath, revision string, payload []byte) (string, error) {

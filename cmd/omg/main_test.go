@@ -112,16 +112,16 @@ runtime:
 }
 
 func TestStartCommandPrintsJSON(t *testing.T) {
-	oldNewGatewayManager := newGatewayManager
+	oldStartGatewayConfig := startGatewayConfig
 	t.Cleanup(func() {
-		newGatewayManager = oldNewGatewayManager
+		startGatewayConfig = oldStartGatewayConfig
 	})
 	fake := &fakeGatewayManager{}
-	newGatewayManager = func(cfg config.Config) gatewayManager {
-		if cfg.Runtime.Dir == "" {
-			t.Fatalf("runtime dir empty")
+	startGatewayConfig = func(_ context.Context, path string) error {
+		if path == "" {
+			t.Fatal("config path empty")
 		}
-		return fake
+		return fake.Start(context.Background())
 	}
 
 	configPath := writeRuntimeConfig(t)
@@ -146,12 +146,12 @@ func TestStartCommandPrintsJSON(t *testing.T) {
 }
 
 func TestStartCommandPrintsJSONError(t *testing.T) {
-	oldNewGatewayManager := newGatewayManager
+	oldStartGatewayConfig := startGatewayConfig
 	t.Cleanup(func() {
-		newGatewayManager = oldNewGatewayManager
+		startGatewayConfig = oldStartGatewayConfig
 	})
-	newGatewayManager = func(cfg config.Config) gatewayManager {
-		return &fakeGatewayManager{startErr: errors.New("boom")}
+	startGatewayConfig = func(context.Context, string) error {
+		return errors.New("boom")
 	}
 
 	configPath := writeRuntimeConfig(t)
@@ -173,14 +173,12 @@ func TestStartCommandPrintsJSONError(t *testing.T) {
 }
 
 func TestStopCommandPrintsJSON(t *testing.T) {
-	oldNewGatewayManager := newGatewayManager
+	oldStopGatewayConfig := stopGatewayConfig
 	t.Cleanup(func() {
-		newGatewayManager = oldNewGatewayManager
+		stopGatewayConfig = oldStopGatewayConfig
 	})
 	fake := &fakeGatewayManager{}
-	newGatewayManager = func(cfg config.Config) gatewayManager {
-		return fake
-	}
+	stopGatewayConfig = func(context.Context, string) error { return fake.Stop(context.Background()) }
 
 	configPath := writeRuntimeConfig(t)
 	var exitCode int
@@ -204,10 +202,10 @@ func TestStopCommandPrintsJSON(t *testing.T) {
 }
 
 func TestReloadCommandPrintsJSON(t *testing.T) {
-	oldNewGatewayManager := newGatewayManager
-	t.Cleanup(func() { newGatewayManager = oldNewGatewayManager })
+	oldReloadGatewayConfig := reloadGatewayConfig
+	t.Cleanup(func() { reloadGatewayConfig = oldReloadGatewayConfig })
 	fake := &fakeGatewayManager{}
-	newGatewayManager = func(cfg config.Config) gatewayManager { return fake }
+	reloadGatewayConfig = func(context.Context, string) error { return fake.Reload(context.Background()) }
 
 	configPath := writeRuntimeConfig(t)
 	var exitCode int
@@ -227,10 +225,10 @@ func TestReloadCommandPrintsJSON(t *testing.T) {
 }
 
 func TestRestartMihomoCommandPrintsJSON(t *testing.T) {
-	oldNewGatewayManager := newGatewayManager
-	t.Cleanup(func() { newGatewayManager = oldNewGatewayManager })
+	oldRestartMihomoConfig := restartMihomoConfig
+	t.Cleanup(func() { restartMihomoConfig = oldRestartMihomoConfig })
 	fake := &fakeGatewayManager{}
-	newGatewayManager = func(cfg config.Config) gatewayManager { return fake }
+	restartMihomoConfig = func(context.Context, string) error { return fake.RestartMihomo(context.Background()) }
 
 	configPath := writeRuntimeConfig(t)
 	var exitCode int
@@ -1065,10 +1063,10 @@ func TestDevicesCommandUsesAppliedSnapshotAndReportsDesiredDrift(t *testing.T) {
 }
 
 func TestStopCommandDoesNotDependOnValidNextDevicePolicy(t *testing.T) {
-	previous := newGatewayManager
-	t.Cleanup(func() { newGatewayManager = previous })
+	previous := stopGatewayConfig
+	t.Cleanup(func() { stopGatewayConfig = previous })
 	manager := &fakeGatewayManager{}
-	newGatewayManager = func(config.Config) gatewayManager { return manager }
+	stopGatewayConfig = func(context.Context, string) error { return manager.Stop(context.Background()) }
 	configPath := writeDevicePolicyConfig(t)
 	cfg, err := config.LoadRuntime(configPath)
 	if err != nil {

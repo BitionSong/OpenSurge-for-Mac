@@ -62,6 +62,21 @@ func TestValidateConfigWithTimeoutReportsSlowEngine(t *testing.T) {
 	}
 }
 
+func TestValidateConfigHonorsActionContext(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "mihomo")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := validateConfigContext(ctx, configValidationTimeout, binary, dir, filepath.Join(dir, "mihomo.yaml"))
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second {
+		t.Fatalf("validator ignored enclosing action deadline: elapsed=%s err=%v", time.Since(started), err)
+	}
+}
+
 func TestWaitForTUNWaitsForEnabledRuntimeState(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

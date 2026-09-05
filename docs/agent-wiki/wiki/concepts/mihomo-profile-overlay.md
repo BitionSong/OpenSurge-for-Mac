@@ -15,7 +15,10 @@ from the OpenSurge config file's directory. Relative `path:` entries inside
 imported `proxy-providers` and `rule-providers` are resolved from the imported
 mihomo profile's directory. When starting or validating mihomo for an imported
 profile, OpenSurge passes `-d <profile-dir>` so mihomo SAFE_PATHS accepts those
-provider files:
+provider files. HTTP and file Providers retain their existing path semantics:
+relative paths are anchored to the profile directory, absolute and URL-shaped
+paths stay unchanged, and missing paths remain absent. The loader does not
+namespace or migrate downloaded caches. Imported sections are:
 
 - `proxies`
 - `proxy-providers`
@@ -29,12 +32,16 @@ text. Both block and flow collections are supported, including compact
 OpenSurge does not rewrite the imported source snapshot; only the generated
 runtime mihomo config may normalize collection style or indentation.
 
-## Global profile overlay draft
+## Global profile overlay and optional sources
 
 The Web GUI's **Global Extension** is an independent, versioned draft in
-`global-profile-overlay.yaml`. It is reapplied to each raw imported source for
-compatibility checks and previews, but never mutates the managed source
-snapshot. Its schema is intentionally operation-based:
+`global-profile-overlay.yaml`. An imported mihomo YAML is an optional input,
+not a prerequisite. When a source is selected, the overlay is reapplied to its
+raw snapshot for compatibility checks and composition without mutating that
+snapshot. When no source exists, OpenSurge renders its minimal managed profile
+as the base, then applies the same overlay operations. This makes an overlay
+containing added proxies, groups and rules a complete usable configuration on
+its own. Its schema is intentionally operation-based:
 
 - prepend rules, or append rules immediately before the imported terminal
   `MATCH`; an overlay may not add its own `MATCH`;
@@ -60,14 +67,82 @@ OpenSurge-owned namespaces and gateway-facing fields are rejected. In
 particular, an overlay cannot add or replace the managed
 `open-surge/tailscale` proxy; the generated Tailscale proxy and its access
 rules remain owned by OpenSurge and are composed after the imported profile.
-Saving this document only creates a draft: source refresh recomputes
-compatibility and the effective preview, while the running gateway changes
-only after the user applies a source and the complete generated mihomo config
-passes engine validation. A final preview that includes the managed Tailscale
-proxy must replace its `auth-key` value with `<redacted>`. The desired config
-records both the raw source digest and the enabled overlay digest so the GUI
-can distinguish source drift from overlay drift; legacy imported configs
-without this metadata remain readable.
+Saving this document first creates a draft. A running gateway continues to use
+its applied core and never consumes that draft implicitly; applying its desired
+source remains the explicit hot-reload transaction. While stopped, either
+opening the Policies page or starting from the Web GUI composes the saved draft
+onto the current desired imported source, or onto the managed base when no
+source exists. The Policies path validates and starts the prepared policy core
+without changing desired config or base recovery metadata. App start hands the
+candidate to Gateway Manager, which stops any prepared core, resolves final
+network parameters, renders and validates once, then commits desired before
+network takeover. Preview and startup reuse the same composition entry point.
+Visiting Policies is useful for preview, selection, and latency testing, but is
+not a startup prerequisite. An overlay-only draft saved while running takes
+effect on the next App start; this path adds no running hot-apply mechanism. A final preview that
+includes the managed Tailscale proxy must
+replace its `auth-key` value with `<redacted>`. The desired config records both
+the raw/base digest and the enabled overlay digest so the GUI can distinguish
+source drift from overlay drift; legacy imported configs without this metadata
+remain readable.
+
+Overlay `add` operations are naturally suitable for a source-free document.
+`replace` and `proxy-groups.patch` still require their target to exist in the
+chosen base; a draft written for a particular subscription can therefore be
+valid as an overlay document but incompatible with the source-free managed
+base. The prepared Policies request reports that incompatibility instead of
+silently discarding the operation or inventing an imported source.
+
+## Prepared policy workspace
+
+The Policies page reads one final, engine-backed policy graph in both gateway
+states. While the gateway is running it talks to the running mihomo and ignores
+source and overlay drafts. While stopped, the privileged Helper composes the
+selected raw source when one exists, the saved global overlay when enabled,
+and OpenSurge-managed device/Tailscale sections, then starts a prepared mihomo
+with only a random authenticated loopback controller. Business proxy ports,
+DNS listeners, TUN, custom listeners/tunnels, DHCP, pf, forwarding and IPv6
+packet ingress remain disabled. Resolver policy stays loaded so provider and
+proxy hostnames behave like the future gateway.
+
+The prepared core uses the same cache directory as the next real gateway core,
+so `profile.store-selected` choices, Provider caches, and the Tailscale state
+directory survive the handoff. Only the profile filename contains a digest; the
+working directory does not change with the composition digest.
+There is never a second concurrent owner of that cache or embedded tsnet
+identity: a shared lifecycle lock serializes policy requests and gateway
+transitions, gateway start stops the prepared core first, Control Service EOF
+releases its Helper lease, and Helper startup reconciles an engine left by a
+previous Helper crash. The private controller address and secret are stored
+only in root-owned prepared state and are never returned to the browser.
+
+The authenticated Web GUI start endpoint always supplies a server-authoritative
+workspace snapshot to the privileged Helper. The browser cannot supply raw
+source, overlay, credential, binary, controller, or runtime paths. Composition,
+final network resolution, one real `mihomo -t` validation, desired-config commit,
+and `StartCandidateLocked` takeover are
+one privileged transaction under the cross-process lifecycle lock, so a
+concurrent CLI cannot slip in and start the previous graph between persistence
+and handoff. A raw `sudo omg start` intentionally starts only the already
+persisted root-owned desired config; it does not discover or activate a draft
+from a user's Control Store.
+
+No individual optional input is special-cased as required. An absent source,
+absent/disabled overlay, or disabled Tailscale config is normalized into the
+same composition path. In particular, the source-free overlay path must keep
+working after repeated page polls, selection changes and Control/Helper
+handoffs; the immutable `workspace-profile-<digest>.yaml` and root-only base
+metadata prevent overlay operations from being applied twice. Only explicit
+commit updates the original base and managed upstream recovery record; a failed
+commit restores that record and desired config. Missing raw source is tolerated
+only for an unchanged existing composition. A requested recomposition without
+its original base fails explicitly. Library refreshes and unselected imports do
+not replace the selected source version. Base metadata
+lives below the runtime control directory, outside mihomo's writable `-d`
+directory, so a valid Provider cache path cannot overwrite it. Every request
+also records whether the gateway was running or stopped when its snapshot was
+captured; the Helper rechecks that state under the lifecycle lock and rejects a
+snapshot that crossed a concurrent start/stop transition.
 
 The profile's top-level `dns` section is merged at field level. OpenSurge
 rejects the imported values for `enable`, `listen`, `ipv6`, `enhanced-mode`,

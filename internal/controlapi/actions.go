@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,10 +21,13 @@ import (
 	"open-mihomo-gateway/internal/config"
 	"open-mihomo-gateway/internal/gateway"
 	"open-mihomo-gateway/internal/macosnetwork"
+	"open-mihomo-gateway/internal/mihomo"
+	"open-mihomo-gateway/internal/runtime"
 )
 
 type ActionRunner interface {
 	Run(context.Context, string, string) error
+	StartPolicyWorkspace(context.Context, string, PolicyWorkspaceInput) error
 }
 
 type NetworkRunner interface {
@@ -45,37 +49,43 @@ type ProfileApplyResult struct {
 	Reloaded bool
 }
 
+// Candidate starts fit inside the existing Helper and Web deadlines. The
+// manager's single real validation also observes the candidate action context.
+const (
+	policyWorkspaceStartTimeout = 110 * time.Second
+	helperConnectionTimeout     = 2 * time.Minute
+	gatewayOperationTimeout     = 3 * time.Minute
+)
+
 type DirectRunner struct{}
 
 func (DirectRunner) Run(ctx context.Context, action, configPath string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("privileged helper is not installed or reachable")
 	}
-	var (
-		cfg config.Config
-		err error
-	)
 	if action == "start" {
-		cfg, err = config.Load(configPath)
-	} else {
-		cfg, err = config.LoadRuntime(configPath)
+		return gateway.StartConfig(ctx, configPath)
 	}
-	if err != nil {
-		return err
+	if action == "reload" {
+		return gateway.ReloadConfig(ctx, configPath)
 	}
-	manager := gateway.New(cfg)
-	switch action {
-	case "start":
-		return manager.Start(ctx)
-	case "stop":
-		return manager.Stop(ctx)
-	case "reload":
-		return manager.Reload(ctx)
-	case "restart-mihomo":
-		return manager.RestartMihomo(ctx)
-	default:
-		return fmt.Errorf("unsupported privileged action %q", action)
+	if action == "restart-mihomo" {
+		return gateway.RestartMihomoConfig(ctx, configPath)
 	}
+	if action == "stop" {
+		return gateway.StopConfig(ctx, configPath)
+	}
+	return fmt.Errorf("unsupported privileged action %q", action)
+}
+
+func (DirectRunner) StartPolicyWorkspace(ctx context.Context, configPath string, input PolicyWorkspaceInput) error {
+	return startPolicyWorkspace(ctx, configPath, input, policyWorkspaceStartDeps{
+		geteuid: os.Geteuid,
+		startLocked: func(ctx context.Context, cfg config.Config, commit func() error) error {
+			manager := gateway.New(cfg)
+			return manager.StartCandidateLocked(ctx, commit)
+		},
+	})
 }
 
 func (DirectRunner) SetManual(ctx context.Context, _ string, cfg macosnetwork.ManualConfig) error {
@@ -115,19 +125,26 @@ type HelperRequest struct {
 	SourceDigest   string                     `json:"source_digest,omitempty"`
 	OverlayDigest  string                     `json:"overlay_digest,omitempty"`
 	WatchProgress  bool                       `json:"watch_progress,omitempty"`
+	Workspace      *PolicyWorkspaceInput      `json:"workspace,omitempty"`
 }
 
 type HelperResponse struct {
-	OK          bool              `json:"ok"`
-	Error       string            `json:"error,omitempty"`
-	DHCPServers []string          `json:"dhcp_servers,omitempty"`
-	Revision    string            `json:"revision,omitempty"`
-	Reloaded    bool              `json:"reloaded,omitempty"`
-	Progress    *gateway.Progress `json:"progress,omitempty"`
+	OK          bool                     `json:"ok"`
+	Error       string                   `json:"error,omitempty"`
+	DHCPServers []string                 `json:"dhcp_servers,omitempty"`
+	Revision    string                   `json:"revision,omitempty"`
+	Reloaded    bool                     `json:"reloaded,omitempty"`
+	Progress    *gateway.Progress        `json:"progress,omitempty"`
+	Workspace   *PolicyWorkspaceResponse `json:"workspace,omitempty"`
 }
 
 func (c HelperClient) Run(ctx context.Context, action, configPath string) error {
 	_, err := c.call(ctx, HelperRequest{Action: action, ConfigPath: configPath})
+	return err
+}
+
+func (c HelperClient) StartPolicyWorkspace(ctx context.Context, configPath string, input PolicyWorkspaceInput) error {
+	_, err := c.call(ctx, HelperRequest{Action: "start", ConfigPath: configPath, Workspace: &input})
 	return err
 }
 
@@ -178,7 +195,9 @@ func (c HelperClient) call(ctx context.Context, request HelperRequest) (HelperRe
 		return HelperResponse{}, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
+	_ = conn.SetDeadline(time.Now().Add(helperConnectionTimeout))
 	report := gateway.ProgressReporter(ctx)
 	request.WatchProgress = report != nil
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
@@ -188,6 +207,9 @@ func (c HelperClient) call(ctx context.Context, request HelperRequest) (HelperRe
 	for {
 		var response HelperResponse
 		if err := decoder.Decode(&response); err != nil {
+			if ctx.Err() != nil {
+				return HelperResponse{}, ctx.Err()
+			}
 			return HelperResponse{}, err
 		}
 		if response.Progress != nil {
@@ -214,10 +236,14 @@ func ServeHelper(ctx context.Context, socketPath, allowedRoot, socketGroup strin
 	// does. Keeping it under the installed root lets the restarted helper undo
 	// an interrupted lease before accepting new requests.
 	sleepManager := newSystemSleepLeaseManager(filepath.Join(allowedRoot, "runtime", "sleep-prevention-owned"))
+	policyManager := newHelperPolicyLeases()
 	reconcileCtx, reconcileCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer reconcileCancel()
 	if err := sleepManager.Reconcile(reconcileCtx); err != nil {
 		retrySystemSleepRelease(ctx, sleepManager, err)
+	}
+	if err := reconcilePreparedPolicyEngine(allowedRoot); err != nil {
+		return fmt.Errorf("reconcile prepared policy engine: %w", err)
 	}
 	_ = os.Remove(socketPath)
 	listener, err := net.Listen("unix", socketPath)
@@ -254,7 +280,7 @@ func ServeHelper(ctx context.Context, socketPath, allowedRoot, socketGroup strin
 			}
 			return err
 		}
-		go handleHelperConnWithSleep(ctx, conn, allowedRoot, sleepManager)
+		go handleHelperConnWithManagers(ctx, conn, allowedRoot, sleepManager, policyManager)
 	}
 }
 
@@ -263,10 +289,14 @@ func handleHelperConn(ctx context.Context, conn net.Conn, allowedRoot string) {
 }
 
 func handleHelperConnWithSleep(ctx context.Context, conn net.Conn, allowedRoot string, sleepManager *systemSleepLeaseManager) {
+	handleHelperConnWithManagers(ctx, conn, allowedRoot, sleepManager, nil)
+}
+
+func handleHelperConnWithManagers(ctx context.Context, conn net.Conn, allowedRoot string, sleepManager *systemSleepLeaseManager, policyManager *helperPolicyLeases) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
+	_ = conn.SetDeadline(time.Now().Add(helperConnectionTimeout))
 	var request HelperRequest
-	if err := json.NewDecoder(ioLimitReader(conn, 15<<20)).Decode(&request); err != nil {
+	if err := json.NewDecoder(ioLimitReader(conn, 20<<20)).Decode(&request); err != nil {
 		_ = json.NewEncoder(conn).Encode(HelperResponse{Error: err.Error()})
 		return
 	}
@@ -285,6 +315,7 @@ func handleHelperConnWithSleep(ctx context.Context, conn net.Conn, allowedRoot s
 		err = requireRootOwnedConfig(configPath)
 	}
 	var cfg config.Config
+	policyWorkspacePrepared := false
 	if err == nil {
 		cfg, err = loadHelperConfig(request.Action, configPath)
 	}
@@ -294,7 +325,15 @@ func handleHelperConnWithSleep(ctx context.Context, conn net.Conn, allowedRoot s
 	if err == nil && (request.Action == "start" || request.Action == "reload" || request.Action == "restart-mihomo" || request.Action == "config-apply-profile" || request.Action == "config-apply-tailscale") {
 		err = requireTrustedStartInputs(cfg, allowedRoot)
 	}
-	if err == nil && (request.Action == "config-apply-profile" || request.Action == "config-apply-control" || request.Action == "config-apply-tailscale" || request.Action == "config-forget-tailscale-identity") {
+	if err == nil && request.Action == "policy-workspace" {
+		if _, exists, stateErr := runtime.LoadState(runtime.NewPaths(cfg).StateFile); stateErr != nil {
+			err = stateErr
+		} else if !exists {
+			policyWorkspacePrepared = true
+			err = requireTrustedPreparedInputs(cfg, allowedRoot)
+		}
+	}
+	if err == nil && (request.Action == "config-apply-profile" || request.Action == "config-apply-control" || request.Action == "config-apply-tailscale" || request.Action == "config-forget-tailscale-identity" || policyWorkspacePrepared || (request.Action == "start" && request.Workspace != nil)) {
 		err = requireTrustedDirectory(filepath.Join(filepath.Dir(configPath), "data"), allowedRoot)
 	}
 	if err == nil && request.Action == "config-apply-device-policy" {
@@ -306,6 +345,10 @@ func handleHelperConnWithSleep(ctx context.Context, conn net.Conn, allowedRoot s
 	}
 	if err == nil && request.Action == "config-apply-device-policy" {
 		err = requireTrustedStartInputs(cfg, allowedRoot)
+	}
+	if request.Action == "policy-workspace-hold" {
+		servePolicyWorkspaceLease(ctx, conn, cfg, policyManager, err)
+		return
 	}
 	if request.Action == "sleep-prevention-hold" {
 		if err == nil && sleepManager == nil {
@@ -343,14 +386,57 @@ func handleHelperConnWithSleep(ctx context.Context, conn net.Conn, allowedRoot s
 		}
 		return
 	}
+	if request.Action == "start" && request.Workspace != nil {
+		actionCtx, cancelAction := context.WithTimeout(ctx, policyWorkspaceStartTimeout)
+		defer cancelAction()
+		ctx = actionCtx
+		go func() {
+			_, _ = io.Copy(io.Discard, conn)
+			cancelAction()
+		}()
+	}
 	response := HelperResponse{}
+	if err == nil && policyManager != nil && strings.HasPrefix(request.Action, "config-") {
+		// Serialize configuration edits with policy requests. The DirectRunner
+		// then holds the cross-process lifecycle lock continuously across prepared
+		// cleanup, validation, persistence, reload, and rollback.
+		policyManager.mu.Lock()
+		defer policyManager.mu.Unlock()
+	}
+	if err == nil && policyManager != nil && helperGatewayLifecycleAction(request.Action) {
+		// Browser polling, Helper lifecycle requests and CLI-started transitions
+		// must not race for the shared mihomo cache or tsnet identity. The
+		// cross-process lifecycle lock remains the final authority; this mutex
+		// makes same-Helper transitions wait instead of returning a spurious
+		// conflict while the policy page is reading the controller.
+		policyManager.mu.Lock()
+		defer policyManager.mu.Unlock()
+	}
 	if err == nil {
 		if request.WatchProgress {
 			ctx = withHelperProgress(ctx, conn)
 		}
 		runner := DirectRunner{}
 		switch request.Action {
-		case "start", "stop", "reload", "restart-mihomo":
+		case "policy-workspace":
+			if request.Workspace == nil || policyManager == nil {
+				err = fmt.Errorf("policy workspace lease is required")
+			} else {
+				var result PolicyWorkspaceResponse
+				workspaceCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+				defer cancel()
+				result, err = policyManager.run(cfg, func() (PolicyWorkspaceResponse, error) {
+					return runner.PolicyWorkspace(workspaceCtx, configPath, *request.Workspace)
+				})
+				response.Workspace = &result
+			}
+		case "start":
+			if request.Workspace != nil {
+				err = runner.StartPolicyWorkspace(ctx, configPath, *request.Workspace)
+			} else {
+				err = runner.Run(ctx, request.Action, configPath)
+			}
+		case "stop", "reload", "restart-mihomo":
 			err = runner.Run(ctx, request.Action, configPath)
 		case "network-set-manual":
 			if request.Manual == nil {
@@ -398,7 +484,7 @@ func handleHelperConnWithSleep(ctx context.Context, conn net.Conn, allowedRoot s
 func withHelperProgress(ctx context.Context, conn net.Conn) context.Context {
 	var mu sync.Mutex
 	watching := true
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(helperConnectionTimeout)
 	return gateway.WithProgress(ctx, func(progress gateway.Progress) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -419,15 +505,44 @@ func retrySystemSleepRelease(ctx context.Context, manager *systemSleepLeaseManag
 }
 
 func loadHelperConfig(action, configPath string) (config.Config, error) {
-	if action == "stop" || action == "restart-mihomo" {
+	if action == "stop" || action == "restart-mihomo" || action == "policy-workspace" || action == "policy-workspace-hold" {
 		return config.LoadRuntime(configPath)
 	}
 	return config.Load(configPath)
 }
 
+func reconcilePreparedPolicyEngine(allowedRoot string) error {
+	path := filepath.Join(allowedRoot, "config.yaml")
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := requireRootOwnedConfig(path); err != nil {
+		return err
+	}
+	cfg, err := config.LoadRuntime(path)
+	if err != nil {
+		return err
+	}
+	if err := requireTrustedRuntime(cfg, allowedRoot); err != nil {
+		return err
+	}
+	return mihomo.StopPrepared(cfg)
+}
+
 func helperActionAllowed(action string) bool {
 	switch action {
-	case "start", "stop", "reload", "restart-mihomo", "network-set-manual", "network-set-dhcp", "dhcp-probe", "config-apply-profile", "config-apply-device-policy", "config-apply-control", "config-apply-tailscale", "config-forget-tailscale-identity", "sleep-prevention-hold":
+	case "start", "stop", "reload", "restart-mihomo", "network-set-manual", "network-set-dhcp", "dhcp-probe", "config-apply-profile", "config-apply-device-policy", "config-apply-control", "config-apply-tailscale", "config-forget-tailscale-identity", "sleep-prevention-hold", "policy-workspace", "policy-workspace-hold":
+		return true
+	default:
+		return false
+	}
+}
+
+func helperGatewayLifecycleAction(action string) bool {
+	switch action {
+	case "start", "stop", "reload", "restart-mihomo":
 		return true
 	default:
 		return false
@@ -532,6 +647,16 @@ func requireTrustedStartInputs(cfg config.Config, allowedRoot string) error {
 		}
 	}
 	return nil
+}
+
+// A prepared engine consumes the final proxy graph, but never starts DHCP or
+// another gateway-facing service. Keep the trust boundary for the mihomo
+// binary, profiles, policy documents and tsnet state without making an
+// unrelated dnsmasq installation a prerequisite for the stopped policy page.
+func requireTrustedPreparedInputs(cfg config.Config, allowedRoot string) error {
+	prepared := cfg
+	prepared.DHCP.Enabled = false
+	return requireTrustedStartInputs(prepared, allowedRoot)
 }
 
 func requireTrustedDirectory(path, allowedRoot string) error {

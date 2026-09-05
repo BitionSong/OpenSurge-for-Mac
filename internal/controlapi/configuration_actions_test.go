@@ -13,8 +13,48 @@ import (
 	"testing"
 
 	"open-mihomo-gateway/internal/config"
+	"open-mihomo-gateway/internal/gateway"
 	"open-mihomo-gateway/internal/mihomo"
+	"open-mihomo-gateway/internal/runtime"
 )
+
+func TestConfigurationUpdateRunsUnderSharedLifecycleLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := config.Default()
+	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+	if err := writeAtomic(path, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	if err := withConfigurationLifecycleLock(path, func() error {
+		called = true
+		busy, err := gateway.LifecycleOperationInProgress(cfg)
+		if err != nil {
+			return err
+		}
+		if !busy {
+			t.Fatal("configuration mutation ran outside the gateway lifecycle lock")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("configuration mutation did not run")
+	}
+
+	lock, err := runtime.AcquireLifecycleLock(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	called = false
+	err = withConfigurationLifecycleLock(path, func() error { called = true; return nil })
+	if !errors.Is(err, runtime.ErrLifecycleOperationInProgress) || called {
+		t.Fatalf("concurrent configuration mutation err=%v called=%t", err, called)
+	}
+}
 
 func TestApplyProfileReloadsRunningGateway(t *testing.T) {
 	configPath, original := writeProfileApplyTestConfig(t)

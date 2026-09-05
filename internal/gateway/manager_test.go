@@ -1202,6 +1202,13 @@ func (f *fakeMihomo) ValidateWrittenConfig() error {
 	return f.validateErr
 }
 
+func (f *fakeMihomo) ValidateWrittenConfigContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.ValidateWrittenConfig()
+}
+
 func (f *fakeMihomo) Start() (int, error) {
 	f.startCalled = true
 	if f.events != nil {

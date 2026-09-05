@@ -239,6 +239,10 @@ func (r *countingActionRunner) Run(context.Context, string, string) error {
 	return err
 }
 
+func (r *countingActionRunner) StartPolicyWorkspace(ctx context.Context, _ string, _ PolicyWorkspaceInput) error {
+	return r.Run(ctx, "start", "")
+}
+
 func (r *countingActionRunner) Count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -116,6 +116,7 @@ vi.mock('./api', () => ({
     devices: vi.fn(async () => ({ devices: [], leases: [], drift: false, applied: false })),
     deviceTraffic: vi.fn(async () => ({ schema_version: 1, revision: 'r', sampled_at: '2026-07-13T00:00:00Z', scope: 'active_sessions', gateway_local: { ip: '192.168.1.20', mac: '', online: false, active_connections: 0, upload: 0, download: 0, upload_rate: 0, download_rate: 0, identity_source: 'gateway_local', transport: 'tun' }, devices: [], totals: { devices: 0, active_connections: 0, upload: 0, download: 0, upload_rate: 0, download_rate: 0 }, gateway_rates: { upload: 0, download: 0 }, unidentified_device_connections: 0, unclassified_connections: 0, unmatched_connections: 0 })),
     policies: vi.fn(async () => ({ groups: [] })),
+    policyWorkspace: vi.fn(async () => ({ schema_version: 1, mode: 'prepared', revision: 'workspace-1', groups: [], health: { schema_version: 1, test_url: 'https://www.gstatic.com/generate_204', proxies: [] } })),
     selectPolicy: vi.fn(),
     localRouting: vi.fn(async () => ({ schema_version: 1, mode: 'rule', available_modes: ['rule', 'direct'], udp_behavior: 'rules', transports: ['tun', 'loopback_explicit_proxy'], new_connections_only: true, consistent: true })),
     setLocalRouting: vi.fn(),

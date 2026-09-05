@@ -1,4 +1,4 @@
-import type { APIError, ConnectionRefreshResult, ConnectivityResponse, ControlConfig, DevicePolicyDocument, DevicesResponse, DeviceTraffic, Diagnostics, DoctorRunStatus, GatewayPlan, LocalRouting, LocalRoutingMode, NetworkDefaults, NetworkInterfacesResponse, Operation, Overview, PolicySet, ProfileOverlay, ProfileOverlayDocument, ProfileOverlayPreview, ProxyGroup, ProxyHealthSnapshot, ProxyHealthTestResponse, SleepPreventionStatus, Source, SourceSnapshotFile, TailscaleDiscoveryResponse, TailscaleResponse, TailscaleUpdate, UIPreferences } from './types'
+import type { APIError, ConnectionRefreshResult, ConnectivityResponse, ControlConfig, DevicePolicyDocument, DevicesResponse, DeviceTraffic, Diagnostics, DoctorRunStatus, GatewayPlan, LocalRouting, LocalRoutingMode, NetworkDefaults, NetworkInterfacesResponse, Operation, Overview, PolicySet, PolicyWorkspaceRequest, PolicyWorkspaceSnapshot, ProfileOverlay, ProfileOverlayDocument, ProfileOverlayPreview, ProxyGroup, ProxyHealthSnapshot, ProxyHealthTestResponse, SleepPreventionStatus, Source, SourceSnapshotFile, TailscaleDiscoveryResponse, TailscaleResponse, TailscaleUpdate, UIPreferences } from './types'
 import { getOperation, markOperationConnection, operationStatusUnknownMessage, recordOperation } from './operations'
 
 export class RequestError extends Error {
@@ -82,6 +82,7 @@ export const api = {
   devicePolicy: () => request<DevicePolicyDocument>('/api/v1/device-policy'),
   saveDevicePolicy: (policy: PolicySet, revision: string) => trackedRequest<DevicePolicyDocument>('save-device-policy', '/api/v1/device-policy', { method: 'PUT', headers: { 'If-Match': `"${revision}"` }, body: JSON.stringify(policy) }),
   policies: () => request<{ groups: ProxyGroup[] }>('/api/v1/policies'),
+  policyWorkspace: (action: PolicyWorkspaceRequest) => request<PolicyWorkspaceSnapshot>('/api/v1/policy-workspace', { method: 'POST', body: JSON.stringify(action) }),
   selectPolicy: (group: string, policy: string) => request(`/api/v1/policies/${encodeURIComponent(group)}/selection`, { method: 'POST', body: JSON.stringify({ policy }) }),
   localRouting: () => request<LocalRouting>('/api/v1/local-routing'),
   setLocalRouting: (mode: LocalRoutingMode, globalPolicy?: string) => request<LocalRouting>('/api/v1/local-routing', { method: 'POST', body: JSON.stringify({ mode, global_policy: globalPolicy }) }),

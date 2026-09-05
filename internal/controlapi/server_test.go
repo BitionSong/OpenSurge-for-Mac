@@ -1008,11 +1008,32 @@ func TestHelperRestartMihomoDefersInvalidDesiredDevicePolicy(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("device_policy:\n  file: ./device-policy.json\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadHelperConfig("restart-mihomo", configPath); err != nil {
-		t.Fatalf("restart-mihomo runtime config error=%v", err)
+	for _, action := range []string{"restart-mihomo", "policy-workspace", "policy-workspace-hold"} {
+		if _, err := loadHelperConfig(action, configPath); err != nil {
+			t.Fatalf("%s runtime config error=%v", action, err)
+		}
 	}
 	if _, err := loadHelperConfig("start", configPath); err == nil {
 		t.Fatal("start accepted an invalid desired device policy")
+	}
+}
+
+func TestHelperGatewayLifecycleActionsExcludePolicyWorkspace(t *testing.T) {
+	for _, action := range []string{"start", "stop", "reload", "restart-mihomo"} {
+		if !helperGatewayLifecycleAction(action) {
+			t.Fatalf("lifecycle action %q was not serialized", action)
+		}
+	}
+	for _, action := range []string{"policy-workspace", "policy-workspace-hold", "config-apply-profile"} {
+		if helperGatewayLifecycleAction(action) {
+			t.Fatalf("non-lifecycle action %q was classified as a gateway transition", action)
+		}
+	}
+}
+
+func TestReconcilePreparedPolicyEngineAllowsMissingInstallationConfig(t *testing.T) {
+	if err := reconcilePreparedPolicyEngine(t.TempDir()); err != nil {
+		t.Fatalf("missing installation config should not block helper startup: %v", err)
 	}
 }
 
@@ -1242,6 +1263,88 @@ func TestSourceSnapshotActionsRejectModifiedManagedFile(t *testing.T) {
 	}
 	if called {
 		t.Fatal("Finder was opened for a modified managed snapshot")
+	}
+}
+
+func TestSourcePreviewAndApplyRejectModifiedManagedFile(t *testing.T) {
+	server := newTestServer(t)
+	source, err := server.importReader("home", "mihomo_profile", "file:home.yaml", strings.NewReader("proxy-groups:\n  - {name: Main, type: select, proxies: [DIRECT]}\nrules:\n  - MATCH,Main\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source.SnapshotPath, []byte("rules:\n  - MATCH,REJECT\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	preview := performAuthorized(server, http.MethodGet, "/api/v1/sources/"+source.ID+"/preview", nil)
+	if preview.Code != http.StatusConflict || !strings.Contains(preview.Body.String(), "source_snapshot_unavailable") {
+		t.Fatalf("preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+
+	recorder := &recordingConfigurationRunner{}
+	server.configRunner = recorder
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:61767/api/v1/sources/"+source.ID+"/apply", nil)
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("If-Match", `"`+fileDigest(server.configPath)+`"`)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "source_snapshot_unavailable") {
+		t.Fatalf("apply status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(recorder.profilePayload) != 0 {
+		t.Fatalf("modified snapshot reached configuration runner: %q", recorder.profilePayload)
+	}
+}
+
+func TestProfileAppliedStateIgnoresPreviousBootRuntime(t *testing.T) {
+	server := newTestServer(t)
+	source, err := server.importReader("home", "mihomo_profile", "file:home.yaml", strings.NewReader("proxy-groups:\n  - {name: Main, type: select, proxies: [DIRECT]}\nrules:\n  - MATCH,Main\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := mihomo.DefaultProfileOverlayDocument()
+	document.Enabled = true
+	overlay, err := mihomo.RenderProfileOverlay(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.store.SaveProfileOverlay(overlay); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(server.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Mihomo.ProfileMode = config.MihomoProfileModeImported
+	cfg.Mihomo.Profile = source.SnapshotPath
+	cfg.Mihomo.ProfileSourceDigest = source.Digest
+	cfg.Mihomo.ProfileOverlayDigest = mihomo.ProfileOverlayDigest(overlay)
+	if err := os.WriteFile(server.configPath, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := config.MihomoProfileDigest(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := runtime.NewPaths(cfg)
+	if err := runtime.Ensure(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SaveState(paths.StateFile, runtime.State{BootSessionID: "previous-boot", ProfileDigest: desired}); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := server.profileOverlayResponse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Desired || response.Applied {
+		t.Fatalf("overlay state desired=%v applied=%v, want desired only", response.Desired, response.Applied)
+	}
+	listed := server.decorateSourceStates([]Source{source})
+	if len(listed) != 1 || !listed[0].Desired || listed[0].Applied {
+		t.Fatalf("source state=%#v, want desired but not applied", listed)
 	}
 }
 
@@ -1606,6 +1709,68 @@ func TestGatewayReloadPreservesActiveTakeoverStage(t *testing.T) {
 	recovery, _ := server.store.Recovery()
 	if recovery.Stage != RecoveryClientValidated {
 		t.Fatalf("recovery stage=%q", recovery.Stage)
+	}
+}
+
+func TestGatewayStartUsesAuthoritativeWorkspaceWithoutPolicyVisit(t *testing.T) {
+	server := newTestServer(t)
+	if err := server.store.SaveRecovery(RecoveryState{Stage: RecoveryRouterDHCPDisabledConfirmed, Required: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.store.SaveProfileOverlay([]byte(policyWorkspaceOverlayFixture)); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingActionRunner{}
+	server.runner = runner
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:61767/api/v1/gateway/start", nil)
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("Idempotency-Key", "overlay-only-direct-start")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("start status=%d body=%s", response.Code, response.Body.String())
+	}
+	waitForStoredOperation(t, server, "overlay-only-direct-start", "succeeded")
+	if runner.action != "start" || runner.count != 1 || runner.workspace == nil {
+		t.Fatalf("runner action=%q count=%d workspace=%#v", runner.action, runner.count, runner.workspace)
+	}
+	if runner.workspace.Request.Action != "read" || runner.workspace.ExpectedGatewayState != policyWorkspaceGatewayStopped || len(runner.workspace.Source) != 0 || string(runner.workspace.Overlay) != policyWorkspaceOverlayFixture {
+		t.Fatalf("start did not receive server-authoritative overlay-only workspace: %#v", runner.workspace)
+	}
+	if runner.workspace.Revision != fileDigest(server.configPath) {
+		t.Fatalf("workspace revision=%q, want current %q", runner.workspace.Revision, fileDigest(server.configPath))
+	}
+}
+
+func TestGatewayStartRejectsSnapshotCapturedWhileAlreadyRunning(t *testing.T) {
+	server := newTestServer(t)
+	if err := server.store.SaveRecovery(RecoveryState{Stage: RecoveryRouterDHCPDisabledConfirmed, Required: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadRuntime(server.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(runtime.NewPaths(cfg).StateFile, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingActionRunner{}
+	server.runner = runner
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:61767/api/v1/gateway/start", nil)
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("Idempotency-Key", "reject-running-start")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "gateway_already_running") {
+		t.Fatalf("running start status=%d body=%s", response.Code, response.Body.String())
+	}
+	if runner.count != 0 || runner.workspace != nil {
+		t.Fatalf("running gateway dispatched another start: %#v", runner)
+	}
+	if _, err := server.store.Operation("reject-running-start"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected running start created an operation: %v", err)
 	}
 }
 
@@ -2377,10 +2542,14 @@ func newReadyMihomoTestServer(t *testing.T) *httptest.Server {
 type fakeRunner struct{}
 
 func (fakeRunner) Run(_ context.Context, _, _ string) error { return nil }
+func (fakeRunner) StartPolicyWorkspace(_ context.Context, _ string, _ PolicyWorkspaceInput) error {
+	return nil
+}
 
 type recordingActionRunner struct {
-	action string
-	count  int
+	action    string
+	count     int
+	workspace *PolicyWorkspaceInput
 }
 
 func (r *recordingActionRunner) Run(_ context.Context, action, _ string) error {
@@ -2389,10 +2558,21 @@ func (r *recordingActionRunner) Run(_ context.Context, action, _ string) error {
 	return nil
 }
 
+func (r *recordingActionRunner) StartPolicyWorkspace(_ context.Context, _ string, input PolicyWorkspaceInput) error {
+	r.action = "start"
+	r.count++
+	r.workspace = &input
+	return nil
+}
+
 type actionRunnerFunc func(context.Context, string, string) error
 
 func (f actionRunnerFunc) Run(ctx context.Context, action, configPath string) error {
 	return f(ctx, action, configPath)
+}
+
+func (f actionRunnerFunc) StartPolicyWorkspace(ctx context.Context, configPath string, _ PolicyWorkspaceInput) error {
+	return f(ctx, "start", configPath)
 }
 
 func waitForStoredOperation(t *testing.T, server *Server, id, state string) Operation {

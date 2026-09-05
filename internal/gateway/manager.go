@@ -45,6 +45,7 @@ type mihomoService interface {
 	Check() error
 	WriteConfig() error
 	ValidateWrittenConfig() error
+	ValidateWrittenConfigContext(context.Context) error
 	Start() (int, error)
 	Stop(int) error
 	Running(int) bool
@@ -108,6 +109,7 @@ type gatewayDeps struct {
 	processFingerprint  func(int) (string, error)
 	processMatches      func(int, string) (bool, error)
 	warmTailscale       func(context.Context, config.Config) error
+	stopPrepared        func(config.Config) error
 	now                 func() time.Time
 }
 
@@ -151,6 +153,7 @@ func defaultGatewayDeps() gatewayDeps {
 		processFingerprint: process.Fingerprint,
 		processMatches:     process.MatchesFingerprint,
 		warmTailscale:      mihomo.InitiateTailscaleWarmup,
+		stopPrepared:       mihomo.StopPreparedLocked,
 		now:                time.Now,
 	}
 }
@@ -285,7 +288,33 @@ func (m Manager) Start(ctx context.Context) error {
 	return m.withLifecycleLock(func() error { return m.start(ctx) })
 }
 
+// StartLocked starts the gateway while the caller holds the shared runtime
+// lifecycle lock. It exists for transactions that must persist the exact
+// desired policy graph and start that same graph without allowing a CLI or a
+// second Helper request to enter between those two steps.
+func (m Manager) StartLocked(ctx context.Context) error {
+	return m.start(ctx)
+}
+
+// StartCandidateLocked commits an App candidate only after final runtime
+// validation, before host takeover. The caller must hold the lifecycle lock.
+// A later startup failure rolls back the network but keeps the committed desired
+// configuration available for retry.
+func (m Manager) StartCandidateLocked(ctx context.Context, commit func() error) error {
+	if commit == nil {
+		return fmt.Errorf("candidate commit is required")
+	}
+	return m.startWithCommit(ctx, commit)
+}
+
 func (m Manager) start(ctx context.Context) error {
+	return m.startWithCommit(ctx, nil)
+}
+
+func (m Manager) startWithCommit(ctx context.Context, commit func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	ReportProgress(ctx, "checking_runtime")
 	deps := m.gatewayDeps()
 	if deps.geteuid() != 0 {
@@ -300,6 +329,11 @@ func (m Manager) start(ctx context.Context) error {
 		return err
 	}
 	if err := config.Validate(m.cfg); err != nil {
+		return err
+	}
+	// Prepared and gateway engines share cache.db and the managed tsnet
+	// identity. This happens under the cross-process lock, including CLI start.
+	if err := m.stopPreparedEngine(deps); err != nil {
 		return err
 	}
 	ReportProgress(ctx, "validating_network")
@@ -350,7 +384,22 @@ func (m Manager) start(ctx context.Context) error {
 		return err
 	}
 	ReportProgress(ctx, "validating_config")
-	if err := mihomoManager.ValidateWrittenConfig(); err != nil {
+	if err := mihomoManager.ValidateWrittenConfigContext(ctx); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if commit != nil {
+		ReportProgress(ctx, "saving_config")
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := commit(); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	ReportProgress(ctx, "saving_runtime")
@@ -396,13 +445,26 @@ func (m Manager) start(ctx context.Context) error {
 		_ = device.RemovePolicyBundleSnapshot(m.paths.DevicePolicyApplied)
 		return err
 	}
+	systemProxyStarted := false
+	checkCanceled := func() error {
+		if err := ctx.Err(); err != nil {
+			return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, systemProxyStarted)
+		}
+		return nil
+	}
 
 	ReportProgress(ctx, "enabling_forwarding")
+	if err := checkCanceled(); err != nil {
+		return err
+	}
 	if err := sysctlManager.Enable(); err != nil {
 		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 	}
 
 	ReportProgress(ctx, "starting_mihomo")
+	if err := checkCanceled(); err != nil {
+		return err
+	}
 	mihomoPID, err := mihomoManager.Start()
 	if err != nil {
 		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
@@ -420,6 +482,9 @@ func (m Manager) start(ctx context.Context) error {
 	}
 	if ipv6Resolution.Effective {
 		ReportProgress(ctx, "starting_ipv6")
+		if err := checkCanceled(); err != nil {
+			return err
+		}
 		ipv6PacketPID, startErr := ipv6PacketManager.Start()
 		if startErr != nil {
 			return m.rollback(ctx, startErr, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
@@ -446,12 +511,18 @@ func (m Manager) start(ctx context.Context) error {
 		if err := deps.saveState(m.paths.StateFile, state); err != nil {
 			return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 		}
+		if err := checkCanceled(); err != nil {
+			return err
+		}
 		if err := ipv6HostManager.AddGateway(ctx); err != nil {
 			return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 		}
 	}
 
 	ReportProgress(ctx, "starting_dns")
+	if err := checkCanceled(); err != nil {
+		return err
+	}
 	pid, err := dhcpManager.Start()
 	if err != nil {
 		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
@@ -469,6 +540,9 @@ func (m Manager) start(ctx context.Context) error {
 	}
 
 	ReportProgress(ctx, "applying_firewall")
+	if err := checkCanceled(); err != nil {
+		return err
+	}
 	if err := pfManager.Load(!pfEnabledBefore); err != nil {
 		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 	}
@@ -485,11 +559,18 @@ func (m Manager) start(ctx context.Context) error {
 	}
 	if state.LocalSystemProxy != nil {
 		ReportProgress(ctx, "enabling_system_proxy")
+		if err := checkCanceled(); err != nil {
+			return err
+		}
+		systemProxyStarted = true
 		if err := systemProxyManager.Enable(ctx, *state.LocalSystemProxy, m.cfg.Mihomo.MixedPort); err != nil {
 			return m.rollback(ctx, fmt.Errorf("enable local system proxy coordination: %w", err), state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, true)
 		}
 	}
 	m.warmManagedTailscale(ctx, deps)
+	if err := checkCanceled(); err != nil {
+		return err
+	}
 
 	fmt.Printf("Gateway runtime prepared in %s\n", m.paths.Dir)
 	if mihomoPID > 0 {
@@ -514,6 +595,14 @@ func (m Manager) Reload(ctx context.Context) error {
 		return fmt.Errorf("reload requires sudo/root privileges")
 	}
 	return m.withLifecycleLock(func() error { return m.reload(ctx) })
+}
+
+// ReloadLocked reloads the gateway while the caller holds the shared runtime
+// lifecycle lock. It is used by privileged configuration transactions that
+// must keep validation, persistence, reload, and rollback indivisible from a
+// competing CLI lifecycle action.
+func (m Manager) ReloadLocked(ctx context.Context) error {
+	return m.reload(ctx)
 }
 
 func (m Manager) reload(ctx context.Context) error {
@@ -762,6 +851,9 @@ func (m Manager) stop(ctx context.Context) error {
 	if deps.geteuid() != 0 {
 		return fmt.Errorf("stop requires sudo/root privileges")
 	}
+	if err := m.stopPreparedEngine(deps); err != nil {
+		return err
+	}
 	state, exists, err := deps.loadState(m.paths.StateFile)
 	if err != nil {
 		return err
@@ -810,6 +902,17 @@ func (m Manager) stop(ctx context.Context) error {
 	}
 
 	fmt.Println("Gateway stopped and runtime state cleared.")
+	return nil
+}
+
+func (m Manager) stopPreparedEngine(deps gatewayDeps) error {
+	stop := deps.stopPrepared
+	if stop == nil {
+		stop = mihomo.StopPreparedLocked
+	}
+	if err := stop(m.cfg); err != nil {
+		return fmt.Errorf("release prepared engine before gateway transition: %w", err)
+	}
 	return nil
 }
 
@@ -955,6 +1058,13 @@ func addrHasIPv4(addr net.Addr, target net.IP) bool {
 }
 
 func (m Manager) rollback(ctx context.Context, cause error, state runtime.State, dhcpManager dhcpService, mihomoManager mihomoService, pfManager pfService, sysctlManager sysctlService, systemProxyManager localSystemProxyService, restoreSystemProxy bool) error {
+	if ctx.Err() != nil {
+		// Cancellation stops new takeover stages, but must not cancel restoration
+		// of host state that this action already changed.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		ctx = cleanupCtx
+	}
 	ReportProgress(ctx, "rolling_back")
 	deps := m.gatewayDeps()
 	var cleanupErr error

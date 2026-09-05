@@ -83,6 +83,95 @@ func tailscaleExitSelectorGroups(cfg config.Config) []device.SelectorGroup {
 	}}
 }
 
+// appendImportedTailscaleExitCandidates runs after user profile/overlay
+// composition and before any OpenSurge-owned groups are generated. It adds a
+// public Exit Node choice, not a Tailnet authorization rule. The original
+// selector fields, provider membership and Mihomo selection behavior stay intact.
+func appendImportedTailscaleExitCandidates(imported *importedProfile, cfg config.Config) error {
+	if !cfg.Tailscale.Enabled || cfg.Tailscale.ExitNode == "" || imported.sections["proxy-groups"] == nil {
+		return nil
+	}
+	// A select and an automatic group can share an anchored proxies list (or a
+	// merged group template). Expand aliases into independent runtime nodes before
+	// editing so the new choice cannot leak into the automatic group. Source YAML
+	// is never rewritten, and retained fields/comments are preserved.
+	remainingNodes := 100000
+	for name, section := range imported.sections {
+		cloned, err := cloneTailscaleCandidateNode(section, map[*yaml.Node]bool{}, &remainingNodes, false)
+		if err != nil {
+			return fmt.Errorf("prepare Tailscale Exit Node candidates in %s: %w", name, err)
+		}
+		imported.sections[name] = cloned
+	}
+	for _, group := range imported.sections["proxy-groups"].Content {
+		var fields struct {
+			Name    string   `yaml:"name"`
+			Type    string   `yaml:"type"`
+			Proxies []string `yaml:"proxies"`
+		}
+		if err := group.Decode(&fields); err != nil {
+			return fmt.Errorf("read proxy group for Tailscale Exit Node candidates: %w", err)
+		}
+		if fields.Type != "select" || IsLocalRoutingGroup(fields.Name) || strings.HasPrefix(fields.Name, "device/") || fields.Name == config.TailscaleExitGroupName {
+			continue
+		}
+		alreadyPresent := false
+		for _, candidate := range fields.Proxies {
+			if candidate == config.TailscaleExitGroupName {
+				alreadyPresent = true
+				break
+			}
+		}
+		if alreadyPresent {
+			continue
+		}
+		candidates := make([]*yaml.Node, 0, len(fields.Proxies)+1)
+		for _, candidate := range fields.Proxies {
+			candidates = append(candidates, quotedStringNode(candidate))
+		}
+		candidates = append(candidates, quotedStringNode(config.TailscaleExitGroupName))
+		if index := mappingValueIndex(group, "proxies"); index >= 0 {
+			group.Content[index] = sequenceNode(candidates...)
+		} else {
+			// An explicit field overrides a proxies list inherited through <<.
+			group.Content = append(group.Content, stringNode("proxies"), sequenceNode(candidates...))
+		}
+	}
+	return nil
+}
+
+func cloneTailscaleCandidateNode(node *yaml.Node, visiting map[*yaml.Node]bool, remainingNodes *int, fromAlias bool) (*yaml.Node, error) {
+	if node == nil {
+		return nil, nil
+	}
+	if visiting[node] {
+		return nil, fmt.Errorf("recursive YAML alias is not supported")
+	}
+	if fromAlias {
+		*remainingNodes -= 1
+		if *remainingNodes < 0 {
+			return nil, fmt.Errorf("expanded YAML exceeds the Tailscale candidate node limit")
+		}
+	}
+	visiting[node] = true
+	defer delete(visiting, node)
+	if node.Kind == yaml.AliasNode {
+		return cloneTailscaleCandidateNode(node.Alias, visiting, remainingNodes, true)
+	}
+	cloned := *node
+	cloned.Anchor = ""
+	cloned.Alias = nil
+	cloned.Content = make([]*yaml.Node, 0, len(node.Content))
+	for _, child := range node.Content {
+		value, err := cloneTailscaleCandidateNode(child, visiting, remainingNodes, fromAlias)
+		if err != nil {
+			return nil, err
+		}
+		cloned.Content = append(cloned.Content, value)
+	}
+	return &cloned, nil
+}
+
 func tailscaleAuthKey(cfg config.TailscaleConfig) (string, error) {
 	data, err := os.ReadFile(cfg.AuthKeyFile)
 	if err != nil {

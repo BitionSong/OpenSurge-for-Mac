@@ -37,6 +37,7 @@ type Options struct {
 	NetworkRunner     NetworkRunner
 	ConfigRunner      ConfigurationRunner
 	SleepRunner       SleepPreventionRunner
+	PolicyRunner      PolicyWorkspaceRunner
 	DiscoverNetwork   func(context.Context, string, string) (macosnetwork.Snapshot, error)
 	DiscoverDefault   func(context.Context) (macosnetwork.Snapshot, error)
 	ListInterfaces    func(context.Context) ([]macosnetwork.InterfaceOption, error)
@@ -51,37 +52,39 @@ type Options struct {
 }
 
 type Server struct {
-	configPath        string
-	addr              string
-	store             *Store
-	runner            ActionRunner
-	networkRunner     NetworkRunner
-	configRunner      ConfigurationRunner
-	discoverNetwork   func(context.Context, string, string) (macosnetwork.Snapshot, error)
-	discoverDefault   func(context.Context) (macosnetwork.Snapshot, error)
-	listInterfaces    func(context.Context) ([]macosnetwork.InterfaceOption, error)
-	discoverNeighbors func(context.Context, string) ([]macosnetwork.Neighbor, error)
-	discoverTailscale func(context.Context) (TailscaleDiscoveryResponse, error)
-	lookupRoute       func(context.Context, string) (macosnetwork.RouteSelection, error)
-	fetchTUNRuntime   func(context.Context, config.Config) (mihomo.TUNRuntimeState, error)
-	pingRouter        func(context.Context, string) error
-	static            http.Handler
-	credentials       SourceCredentialStore
-	revealInFinder    func(context.Context, string) error
-	fetchConnections  func(context.Context, config.Config) (mihomo.ConnectionsSnapshot, error)
-	closeConnections  func(context.Context, config.Config, []string) (int, error)
-	fetchProxyHealth  func(context.Context, config.Config) (mihomo.ProxyHealthSnapshot, error)
-	fetchLocalRouting func(context.Context, config.Config) (mihomo.LocalRoutingSnapshot, error)
-	setLocalRouting   func(context.Context, config.Config, string, string) (mihomo.LocalRoutingSnapshot, error)
-	measureProxyDelay func(context.Context, config.Config, string, string, time.Duration) mihomo.ProxyDelayResult
-	probeConnectivity func(context.Context, config.Config, ConnectivityTarget) ConnectivityResult
-	trafficSampler    *trafficRateSampler
-	gatewayStatus     func(context.Context, config.Config) (gateway.Status, error)
-	doctor            *doctorController
-	mihomoRecovery    *mihomoRecoveryController
-	sleepPrevention   *sleepPreventionController
-	token             string
-	baseURL           string
+	configPath            string
+	addr                  string
+	store                 *Store
+	runner                ActionRunner
+	networkRunner         NetworkRunner
+	configRunner          ConfigurationRunner
+	discoverNetwork       func(context.Context, string, string) (macosnetwork.Snapshot, error)
+	discoverDefault       func(context.Context) (macosnetwork.Snapshot, error)
+	listInterfaces        func(context.Context) ([]macosnetwork.InterfaceOption, error)
+	discoverNeighbors     func(context.Context, string) ([]macosnetwork.Neighbor, error)
+	discoverTailscale     func(context.Context) (TailscaleDiscoveryResponse, error)
+	lookupRoute           func(context.Context, string) (macosnetwork.RouteSelection, error)
+	fetchTUNRuntime       func(context.Context, config.Config) (mihomo.TUNRuntimeState, error)
+	pingRouter            func(context.Context, string) error
+	static                http.Handler
+	credentials           SourceCredentialStore
+	revealInFinder        func(context.Context, string) error
+	fetchConnections      func(context.Context, config.Config) (mihomo.ConnectionsSnapshot, error)
+	closeConnections      func(context.Context, config.Config, []string) (int, error)
+	fetchProxyHealth      func(context.Context, config.Config) (mihomo.ProxyHealthSnapshot, error)
+	fetchLocalRouting     func(context.Context, config.Config) (mihomo.LocalRoutingSnapshot, error)
+	setLocalRouting       func(context.Context, config.Config, string, string) (mihomo.LocalRoutingSnapshot, error)
+	measureProxyDelay     func(context.Context, config.Config, string, string, time.Duration) mihomo.ProxyDelayResult
+	probeConnectivity     func(context.Context, config.Config, ConnectivityTarget) ConnectivityResult
+	trafficSampler        *trafficRateSampler
+	gatewayStatus         func(context.Context, config.Config) (gateway.Status, error)
+	doctor                *doctorController
+	mihomoRecovery        *mihomoRecoveryController
+	sleepPrevention       *sleepPreventionController
+	policyWorkspaceRunner PolicyWorkspaceRunner
+	policyWorkspaceLease  policyWorkspaceLease
+	token                 string
+	baseURL               string
 
 	mu          sync.Mutex
 	lifecycleMu sync.Mutex
@@ -150,6 +153,13 @@ func New(options Options) (*Server, error) {
 			options.SleepRunner = HelperClient{SocketPath: "/var/run/opensurge/helper.sock"}
 		}
 	}
+	if options.PolicyRunner == nil {
+		if runner, ok := options.Runner.(PolicyWorkspaceRunner); ok {
+			options.PolicyRunner = runner
+		} else {
+			options.PolicyRunner = HelperClient{SocketPath: "/var/run/opensurge/helper.sock"}
+		}
+	}
 	if options.DiscoverNetwork == nil {
 		options.DiscoverNetwork = macosnetwork.Discover
 	}
@@ -190,31 +200,32 @@ func New(options Options) (*Server, error) {
 		options.RevealInFinder = revealPathInFinder
 	}
 	return &Server{
-		configPath:        configPath,
-		addr:              options.Addr,
-		store:             store,
-		runner:            options.Runner,
-		networkRunner:     options.NetworkRunner,
-		configRunner:      options.ConfigRunner,
-		discoverNetwork:   options.DiscoverNetwork,
-		discoverDefault:   options.DiscoverDefault,
-		listInterfaces:    options.ListInterfaces,
-		discoverNeighbors: options.DiscoverNeighbors,
-		discoverTailscale: options.DiscoverTailscale,
-		lookupRoute:       options.LookupRoute,
-		fetchTUNRuntime:   options.FetchTUNRuntime,
-		pingRouter:        options.PingRouter,
-		static:            options.Static,
-		credentials:       options.Credentials,
-		revealInFinder:    options.RevealInFinder,
-		fetchConnections:  mihomo.FetchConnections,
-		closeConnections:  mihomo.CloseConnections,
-		fetchProxyHealth:  mihomo.FetchProxyHealth,
-		fetchLocalRouting: mihomo.FetchLocalRouting,
-		setLocalRouting:   mihomo.SetLocalRouting,
-		measureProxyDelay: mihomo.MeasureProxyDelay,
-		probeConnectivity: probeConnectivityTarget,
-		trafficSampler:    newTrafficRateSampler(),
+		configPath:            configPath,
+		addr:                  options.Addr,
+		store:                 store,
+		runner:                options.Runner,
+		networkRunner:         options.NetworkRunner,
+		configRunner:          options.ConfigRunner,
+		policyWorkspaceRunner: options.PolicyRunner,
+		discoverNetwork:       options.DiscoverNetwork,
+		discoverDefault:       options.DiscoverDefault,
+		listInterfaces:        options.ListInterfaces,
+		discoverNeighbors:     options.DiscoverNeighbors,
+		discoverTailscale:     options.DiscoverTailscale,
+		lookupRoute:           options.LookupRoute,
+		fetchTUNRuntime:       options.FetchTUNRuntime,
+		pingRouter:            options.PingRouter,
+		static:                options.Static,
+		credentials:           options.Credentials,
+		revealInFinder:        options.RevealInFinder,
+		fetchConnections:      mihomo.FetchConnections,
+		closeConnections:      mihomo.CloseConnections,
+		fetchProxyHealth:      mihomo.FetchProxyHealth,
+		fetchLocalRouting:     mihomo.FetchLocalRouting,
+		setLocalRouting:       mihomo.SetLocalRouting,
+		measureProxyDelay:     mihomo.MeasureProxyDelay,
+		probeConnectivity:     probeConnectivityTarget,
+		trafficSampler:        newTrafficRateSampler(),
 		gatewayStatus: func(ctx context.Context, cfg config.Config) (gateway.Status, error) {
 			return gateway.New(cfg).Status(ctx)
 		},
@@ -297,6 +308,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/devices/{device}/connections/refresh", s.auth(http.HandlerFunc(s.handleDeviceConnectionRefresh)))
 	mux.Handle("POST /api/v1/devices/{device}/selectors/{slot}", s.auth(http.HandlerFunc(s.handleDeviceSelection)))
 	mux.Handle("GET /api/v1/policies", s.auth(http.HandlerFunc(s.handlePolicies)))
+	mux.Handle("POST /api/v1/policy-workspace", s.auth(http.HandlerFunc(s.handlePolicyWorkspace)))
 	mux.Handle("POST /api/v1/policies/{group}/selection", s.auth(http.HandlerFunc(s.handlePolicySelection)))
 	mux.Handle("GET /api/v1/local-routing", s.auth(http.HandlerFunc(s.handleLocalRouting)))
 	mux.Handle("POST /api/v1/local-routing", s.auth(http.HandlerFunc(s.handleLocalRouting)))
@@ -411,6 +423,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 	defer s.sleepPrevention.Close()
+	defer s.policyWorkspaceLease.Close()
 	httpServer := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	go s.monitorMihomoRecovery(ctx)
 	go func() {
@@ -812,6 +825,19 @@ func (s *Server) handleGatewayAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var startWorkspace *PolicyWorkspaceInput
+	if action == "start" {
+		input, err := s.policyWorkspaceInput(PolicyWorkspaceRequest{Action: "read"})
+		if err != nil {
+			writeError(w, http.StatusUnprocessableEntity, "policy_workspace_invalid", err.Error())
+			return
+		}
+		if input.ExpectedGatewayState != policyWorkspaceGatewayStopped {
+			writeError(w, http.StatusConflict, "gateway_already_running", "start requires a stopped gateway; use reload for an active gateway")
+			return
+		}
+		startWorkspace = &input
+	}
 	if action == "reload" {
 		status, statusErr := s.gatewayStatus(r.Context(), cfg)
 		if statusErr == nil && status.RuntimeState == "interrupted" {
@@ -863,16 +889,25 @@ func (s *Server) handleGatewayAction(w http.ResponseWriter, r *http.Request) {
 		s.mihomoRecovery.beginManual()
 	}
 	locked = false
-	go s.runOperationLocked(op, cfg.Gateway.Mode, recovery, nil)
+	go s.runOperationLocked(op, cfg.Gateway.Mode, recovery, startWorkspace, nil)
 	writeJSON(w, http.StatusAccepted, op)
 }
 
-func (s *Server) runOperationLocked(op Operation, topology string, recoveryBefore RecoveryState, completed func(error)) {
+func (s *Server) runOperationLocked(op Operation, topology string, recoveryBefore RecoveryState, startWorkspace *PolicyWorkspaceInput, completed func(error)) {
 	defer s.lifecycleMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), gatewayOperationTimeout)
 	defer cancel()
 	ctx = s.observeOperation(ctx, &op)
-	err := s.runner.Run(ctx, op.Kind, s.configPath)
+	var err error
+	if op.Kind == "start" {
+		if startWorkspace == nil {
+			err = fmt.Errorf("policy workspace snapshot is required for gateway start")
+		} else {
+			err = s.runner.StartPolicyWorkspace(ctx, s.configPath, *startWorkspace)
+		}
+	} else {
+		err = s.runner.Run(ctx, op.Kind, s.configPath)
+	}
 	op.UpdatedAt = time.Now().UTC()
 	if err != nil {
 		op.State = "failed"
@@ -1609,9 +1644,9 @@ func (s *Server) handleSourceApply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "revision_conflict", "If-Match must contain the current config revision")
 		return
 	}
-	sourcePayload, err := os.ReadFile(source.SnapshotPath)
+	sourcePayload, _, err := readValidatedSourceSnapshot(s.store.Dir(), source)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "source_snapshot_unavailable", err.Error())
+		writeError(w, http.StatusConflict, "source_snapshot_unavailable", err.Error())
 		return
 	}
 	_, overlay, overlayRevision, err := s.loadProfileOverlay()
