@@ -8,13 +8,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"gopkg.in/yaml.v3"
 	"open-mihomo-gateway/internal/config"
+	"open-mihomo-gateway/internal/gateway"
 	"open-mihomo-gateway/internal/mihomo"
+	"open-mihomo-gateway/internal/process"
 	"open-mihomo-gateway/internal/runtime"
 )
 
@@ -356,6 +359,141 @@ rules:
 	}
 	if _, exists, err := runtime.LoadState(runtime.NewPaths(desired).StateFile); err != nil || exists {
 		t.Fatalf("provider workspace created gateway state: exists=%t err=%v", exists, err)
+	}
+}
+
+// The existing imported-egress Lab runner owns fixtures, client traffic and
+// cleanup. This opt-in test replaces only its CLI start with the App's actual
+// prepared-workspace handoff; a successful test deliberately leaves it running.
+func TestPolicyWorkspaceLabStartupHandoff(t *testing.T) {
+	path := os.Getenv("OMG_POLICY_WORKSPACE_LAB_CONFIG")
+	if path == "" {
+		t.Skip("run make lab-test-policy-workspace for real gateway takeover")
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() != 0 || !filepath.IsAbs(path) || filepath.Dir(path) != cfg.Runtime.Dir ||
+		cfg.PF.AnchorName != "com.apple/open_mihomo_gateway_lab" || cfg.Transparent.Mode != "tun" ||
+		cfg.Gateway.Mode != config.GatewayModeIsolatedLAN {
+		t.Fatal("requires root and the isolated TUN Lab configuration")
+	}
+	if _, exists, err := runtime.LoadState(runtime.NewPaths(cfg).StateFile); err != nil || exists {
+		t.Fatalf("Lab must be stopped: exists=%t err=%v", exists, err)
+	}
+
+	// Reuse the runner's controlled HTTP provider, DNS and domain rules as an
+	// overlay. No imported source or Tailscale configuration remains selected.
+	profile, err := os.ReadFile(cfg.Mihomo.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Providers map[string]map[string]any `yaml:"proxy-providers"`
+		Groups    []map[string]any          `yaml:"proxy-groups"`
+		DNS       map[string]any            `yaml:"dns"`
+		Rules     []string                  `yaml:"rules"`
+	}
+	if err := yaml.Unmarshal(profile, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	overlay := mihomo.DefaultProfileOverlayDocument()
+	overlay.Enabled = true
+	overlay.ProxyProviders.Add, overlay.ProxyGroups.Add = fixture.Providers, fixture.Groups
+	overlay.DNS.Merge = fixture.DNS
+	for _, rule := range fixture.Rules {
+		if !strings.HasPrefix(rule, "MATCH,") {
+			overlay.Rules.Prepend = append(overlay.Rules.Prepend, rule)
+		}
+	}
+	payload, err := mihomo.RenderProfileOverlay(overlay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Mihomo.ProfileMode, cfg.Mihomo.Profile = config.MihomoProfileModeManaged, ""
+	cfg.Mihomo.ProfileSourceDigest, cfg.Mihomo.ProfileOverlayDigest = "", ""
+	cfg.UpstreamProxy.Enabled = false
+	if cfg.Tailscale.Enabled {
+		t.Fatal("this gate requires the source-free fixture without Tailscale")
+	}
+	if err := writeAtomic(path, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeBase, err := snapshotFile(policyWorkspaceBasePath(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := PolicyWorkspaceInput{
+		Request:              PolicyWorkspaceRequest{Action: "read"},
+		Revision:             fileDigest(path),
+		ExpectedGatewayState: policyWorkspaceGatewayStopped,
+		Overlay:              payload,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		workspace, err := runPolicyWorkspace(ctx, path, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		group := findWorkspaceGroup(workspace.Groups, "TunEgress")
+		if group != nil && containsWorkspaceString(group.Options, "egress-proxy") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("controlled HTTP provider did not become available in preview")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	input.Request = PolicyWorkspaceRequest{Action: "select", Group: "TunEgress", Policy: "egress-proxy"}
+	if _, err := runPolicyWorkspace(ctx, path, input); err != nil {
+		t.Fatal(err)
+	}
+	afterBase, err := snapshotFile(policyWorkspaceBasePath(cfg))
+	if err != nil || !reflect.DeepEqual(beforeBase, afterBase) || input.Revision != fileDigest(path) {
+		t.Fatalf("preview or selection changed desired/base recovery metadata: %v", err)
+	}
+	prepared, exists, err := mihomo.LoadPrepared(cfg)
+	if err != nil || !exists {
+		t.Fatalf("prepared engine ownership is missing: %v", err)
+	}
+	t.Log("preview and selection preserved desired/base; provider selection saved in native cache")
+
+	validationCount := 0
+	ctx = gateway.WithProgress(ctx, func(progress gateway.Progress) {
+		if progress.Phase == "validating_config" {
+			validationCount++
+		}
+	})
+	input.Request = PolicyWorkspaceRequest{Action: "read"}
+	if err := (DirectRunner{}).StartPolicyWorkspace(ctx, path, input); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := config.Load(path)
+	if err != nil || desired.Mihomo.ProfileOverlayDigest != mihomo.ProfileOverlayDigest(payload) || validationCount != 1 {
+		t.Fatalf("App start did not validate and commit the overlay once: validations=%d err=%v", validationCount, err)
+	}
+	if alive, err := process.MatchesFingerprint(prepared.PID, prepared.ProcessFingerprint); err != nil || alive {
+		t.Fatalf("prepared engine survived gateway handoff: alive=%t err=%v", alive, err)
+	}
+	if _, exists, err := mihomo.LoadPrepared(desired); err != nil || exists {
+		t.Fatalf("prepared ownership record survived gateway handoff: %v", err)
+	}
+	if filepath.Dir(desired.Mihomo.Profile) != prepared.ConfigDirectory {
+		t.Fatal("gateway changed the prepared engine's working/cache directory")
+	}
+	groups, err := mihomo.FetchProxyGroups(ctx, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group := findWorkspaceGroup(groups, "TunEgress"); group == nil || group.Selected != "egress-proxy" {
+		t.Fatalf("gateway did not preserve the prepared provider selection: %+v", group)
+	}
+	t.Log("App start committed the validated overlay; prepared engine exited; cache and selection survived")
+	// The existing runner now proves DIRECT -> provider traffic and stop cleanup.
+	if err := mihomo.SelectProxyGroup(ctx, desired, "TunEgress", "DIRECT"); err != nil {
+		t.Fatal(err)
 	}
 }
 

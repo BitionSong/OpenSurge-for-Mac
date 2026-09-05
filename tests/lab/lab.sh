@@ -76,6 +76,7 @@ LAB_MIHOMO_PROFILE="${OMG_LAB_MIHOMO_PROFILE:-}"
 LAB_DEVICE_POLICY_FILE=""
 TUN_EGRESS_PROFILE=0
 LOCAL_ROUTING_TEST="${OMG_LAB_LOCAL_ROUTING_TEST:-false}"
+POLICY_WORKSPACE_TEST="${OMG_LAB_POLICY_WORKSPACE_TEST:-false}"
 EGRESS_PROBE_PID=""
 CONTROL_API_PID=""
 CONTROL_API_TOKEN=""
@@ -750,6 +751,7 @@ collect_artifacts() {
   for evidence in \
     dnsmasq.conf \
     mihomo.yaml \
+    policy-workspace-start.log \
     device-policy.applied.evidence.json \
     state.evidence.json \
     device-policies.json \
@@ -3362,8 +3364,22 @@ run_test() {
     dns_fixture_started=1
   fi
 
-  sudo -n "$BINARY" start --config "$CONFIG"
-  gateway_started=1
+  if [[ "$POLICY_WORKSPACE_TEST" == "true" ]]; then
+    [[ "$mode" == "tun" && "$TUN_EGRESS_PROFILE" == 1 ]] || {
+      echo "policy workspace Lab requires the TUN egress fixture" >&2
+      exit 1
+    }
+    GOCACHE="${GOCACHE:-/private/tmp/open-mihomo-gateway-go-cache}" \
+      go test -c -o "$STATE_DIR/policy-workspace-lab.test" ./internal/controlapi
+    # Stop also removes a prepared engine if the handoff test fails early.
+    gateway_started=1
+    sudo -n env OMG_POLICY_WORKSPACE_LAB_CONFIG="$CONFIG" \
+      "$STATE_DIR/policy-workspace-lab.test" -test.run '^TestPolicyWorkspaceLabStartupHandoff$' -test.v \
+      2>&1 | tee "$STATE_DIR/policy-workspace-start.log"
+  else
+    sudo -n "$BINARY" start --config "$CONFIG"
+    gateway_started=1
+  fi
 
   if [[ "$LOCAL_ROUTING_TEST" == "true" ]]; then
     grep -Fq 'fake-ip-range6: fdfe:dcba:9876::/64' "$STATE_DIR/mihomo.yaml"

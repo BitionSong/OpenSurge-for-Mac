@@ -75,6 +75,7 @@ sudo -v && make lab-test
 sudo -v && make lab-test-tun
 sudo -v && make lab-test-tun-imported-profile
 sudo -v && make lab-test-tun-imported-egress
+sudo -v && make lab-test-policy-workspace
 sudo -v && make lab-test-tun-local-routing
 sudo -v && make lab-test-tun-device-policy
 sudo -v && \
@@ -123,6 +124,17 @@ provider-backed policy selection changes the transparent TUN egress path; it
 does not prove a real subscription node or remote exit IP. The controlled
 proxy binds both upstream DNS and TCP dialing to the physical upstream
 interface so its own traffic cannot re-enter the TUN or use a fake IP.
+
+`lab-test-policy-workspace` reuses that provider, CONNECT proxy and client
+traffic gate with the App's candidate startup path. It turns the fixture into
+a global overlay with no selected imported source or Tailscale input, reads
+and selects the prepared policies, checks that desired and base recovery
+records remain unchanged, then starts through `DirectRunner.StartPolicyWorkspace`.
+It requires one final validation phase, the old prepared process to exit, and
+the same work directory and native provider selection to survive. The runner
+then checks real TUN traffic through DIRECT and the provider, followed by normal
+gateway cleanup. This does not exercise the native App UI or a real Tailnet
+Exit Node. Its root-only Go test is skipped by ordinary `make test`.
 
 `lab-test-tun-local-routing` uses the same imported egress fixture to prove the
 local-Mac Rule/Global/Direct selectors remain isolated from downstream clients:
@@ -398,6 +410,7 @@ make lab-test     # run the end-to-end test and restore the host
 make lab-test-tun # run the TUN transparent proxy gate
 make lab-test-tun-imported-profile # run TUN with an imported profile fixture
 make lab-test-tun-imported-egress  # switch TUN egress through a controlled proxy
+make lab-test-policy-workspace    # prepared selection -> App candidate start -> TUN egress
 make lab-test-tun-local-routing # prove local-Mac mode isolation
 make lab-test-tun-device-policy # prove independent per-device TUN policies
 make lab-tailscale-up # create/start the Tailnet peer (peer key needed once)

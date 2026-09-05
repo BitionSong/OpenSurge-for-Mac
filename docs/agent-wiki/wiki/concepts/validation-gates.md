@@ -387,6 +387,14 @@ Lab 中的受控 CONNECT proxy 必须把上游 DNS 查询和 TCP socket 都绑�
 interface。否则 proxy 自己的连接会再次进入正在测试的 TUN，或者把 mihomo fake-IP
 错误地发到物理接口，产生递归或 TLS timeout，而不是有效的出口切换证据。
 
+策略准备态与 App 候选启动的真实接管使用 `make lab-test-policy-workspace`。
+它复用 imported-egress Lab 的 HTTP Provider、受控 CONNECT proxy 和两台客户端，
+把夹具转为仅全局附加配置，检查预览与选择不写 desired 或基础恢复记录，再调用
+App 共用的 `DirectRunner.StartPolicyWorkspace`。门槛要求最终校验阶段仅一次、
+准备态进程与记录退出、工作目录和原生节点选择保留，然后验证 DIRECT/Provider
+两种 TUN 流量及停止清理。普通 `make test` 跳过该 root 用例；它不证明原生 App UI
+或真实 Tailnet Exit Node 公网出口。CLI 持久化配置路径仍由原 imported-egress 门槛覆盖。
+
 ## Mac 本机模式隔离门槛
 
 运行：
