@@ -70,6 +70,11 @@ func validate(cfg Config, checkDevicePolicy bool) error {
 		return err
 	}
 	if checkDevicePolicy {
+		// Config edits can clear the bundle or change its LAN. All validators,
+		// including Tailscale source authorization, need the same current policy.
+		if err := PrepareDevicePolicy(&cfg); err != nil {
+			return err
+		}
 		if err := validateDevicePolicy(cfg, scope); err != nil {
 			return err
 		}

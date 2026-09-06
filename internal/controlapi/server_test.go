@@ -2091,6 +2091,99 @@ func TestControlConfigRoundTripsIPv6Controls(t *testing.T) {
 	}
 }
 
+func TestControlConfigIPv6SaveWithTailscaleDeviceAccess(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		allowAll      bool
+		disablePolicy bool
+		wantError     string
+	}{
+		{name: "all registered devices", allowAll: true},
+		{name: "selected device"},
+		{name: "cannot disable required policy", allowAll: true, disablePolicy: true, wantError: "tailscale device access requires device_policy.file"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := config.Default()
+			cfg.Gateway.Mode = config.GatewayModeSameWiFiDHCP
+			cfg.Transparent.Mode = config.TransparentModeTUN
+			cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+			cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+			cfg.DevicePolicy.File = filepath.Join(dir, "device-policy.json")
+			policy, err := json.Marshal(device.PolicySet{
+				Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+				Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(cfg.DevicePolicy.File, policy, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg.Tailscale.Enabled = true
+			cfg.Tailscale.AuthKeyFile = filepath.Join(dir, "tailscale-auth-key")
+			cfg.Tailscale.StateDir = filepath.Join(dir, "tailscale-state")
+			cfg.Tailscale.AcceptRoutes = true
+			cfg.Tailscale.SubnetRoutes = []string{"fd7a:115c:a1e0:b1a:0:2a:cb00:7107/128"}
+			cfg.Tailscale.ExitNode = "100.82.10.7"
+			cfg.Tailscale.AllowAllDevices = tt.allowAll
+			if !tt.allowAll {
+				cfg.Tailscale.AllowedDevices = []string{"phone"}
+			}
+			path := filepath.Join(dir, "config.yaml")
+			originalConfig := []byte(config.Render(cfg))
+			if err := os.WriteFile(path, originalConfig, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err = config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := controlConfigFrom(cfg, fileDigest(path))
+			input.DNS.IPv6 = true
+			input.DevicePolicy.Enabled = !tt.disablePolicy
+			payload, err := json.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, saveErr := applyControlConfig(path, input.Revision, payload)
+			if tt.wantError != "" {
+				if saveErr == nil || !strings.Contains(saveErr.Error(), tt.wantError) {
+					t.Fatalf("applyControlConfig() error = %v, want %q", saveErr, tt.wantError)
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(data, originalConfig) {
+					t.Fatal("rejected save changed the configuration")
+				}
+			} else {
+				if saveErr != nil {
+					t.Fatalf("applyControlConfig() error = %v", saveErr)
+				}
+				updated, err := config.Load(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !updated.DNS.IPv6 || updated.Transparent != cfg.Transparent {
+					t.Fatalf("AAAA save changed unexpected IPv6 controls: DNS=%v transparent=%#v", updated.DNS.IPv6, updated.Transparent)
+				}
+				if !reflect.DeepEqual(updated.Tailscale, cfg.Tailscale) || updated.DevicePolicy.File != cfg.DevicePolicy.File {
+					t.Fatalf("AAAA save changed Tailscale or device-policy settings: Tailscale=%#v policy=%q", updated.Tailscale, updated.DevicePolicy.File)
+				}
+			}
+			updatedPolicy, err := os.ReadFile(cfg.DevicePolicy.File)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(updatedPolicy, policy) {
+				t.Fatal("network configuration save changed the device-policy document")
+			}
+		})
+	}
+}
+
 func TestControlConfigAcceptsLegacyPayloadWithoutIPv6TakeoverMode(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.Default()

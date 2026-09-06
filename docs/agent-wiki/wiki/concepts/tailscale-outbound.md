@@ -70,6 +70,12 @@ RFC1918 地址就被 Tailscale 接管。所有允许规则之后还会为这些�
 路由接走。命中允许规则后直接选择 Tailscale outbound；节点离线时 fail closed，
 不增加 `DIRECT` 回退。
 
+完整配置校验必须先按当前 LAN 和网关模式准备设备策略 bundle，再校验
+Tailscale 设备授权。网络配置保存会清除旧 bundle，避免沿用修改前的拓扑；
+不能把“尚未加载”误判为缺少 `device_policy.file`，也不能只检查路径而跳过
+指定设备是否有效的校验。`ValidateRuntime` / `LoadRuntime` 仍跳过可变的期望
+策略文件，保证停止、状态和已应用策略操作不被无效草稿阻塞。
+
 `allow_mac` 必须复用本机 Rule/Global/Direct 编译器的同一组入口身份，
 不能另写一套宽泛的 IPv6 来源匹配。对系统 TUN 的 IPv6，规则同时
 限定 `IN-NAME,DEFAULT-TUN` 和当前实际生效的单个 `/128`：DNS fake-AAAA
@@ -92,6 +98,27 @@ CIDR 完全一致、接口为 `utun*`，且接口不是 OpenSurge 当前系统 T
 运行中的网关在调用 helper 前以 `tailscale_route_conflict` 拒绝应用，GUI 显示路由、
 接口和解除方法。网关停止时允许保存目标值，但必须提示在下次启动前解除冲突。
 OpenSurge 不得自动改写原生 Tailscale App 的 `accept-routes` 状态。
+
+## 同一远端 Mac 兼任 Exit Node 与 Subnet Router
+
+远端 Mac 可以同时提供公网 Exit Node 和子网路由。访问它所在 LAN 的
+SOCKS5、NAS 或 HTTP 服务时，应验证精确 subnet route；公网出口选中该 Mac，
+不等于已验证子网服务。命中 Tailnet 目标的连接日志显示 `open-surge/tailscale`
+是预期行为，不要求经过公网 selector `open-surge/tailscale-exit`。
+
+当本地 LAN 与远端 LAN 的 IPv4 网段重叠时，直接访问远端服务的 IPv4 可能
+命中本地设备。可使用 Tailscale 4via6 精确映射：由远端 Subnet Router 发布并
+批准映射 IPv6 路由，OpenSurge 接受该路由、授权来源并配置 MagicDNS 后缀。
+该路径需要 `dns.ipv6: true` 以允许相关 IPv6 解析，不要把它与为下游设备
+发布 RA 或强制启用下游 IPv6 混为一谈。下游客户端可先以 IPv4/fake-IP
+流量进入 OpenSurge，再由内嵌 tsnet 访问映射地址。
+
+验证必须区分 Mac 本机入口和下游设备入口。在 Mac 上访问成功不能替代
+手机验收；手机需要返回真实 SOCKS5/HTTPS 结果，并与 OpenSurge 日志中的
+手机源 IP、映射目标和 Tailscale action 对应。需要独立证明特定 Mac 转发时，
+还应核对路由发布者，或在该 Mac 的 LAN 接口抓取目标端口的包头。
+详细操作和已验证边界见
+[真实 LAN 的 4via6 子网 smoke](../../sources/validation/tailscale-4via6-subnet-smoke.md)。
 
 ## Tailnet 与 Exit Node 角色
 
@@ -181,5 +208,9 @@ underlay 不作为应用路径证据。Auth Key 只从仓库外 `0600` 文件读
 peer 的 Lima 磁盘和 managed tsnet state 都会持久化，所以普通复跑无需 key；reusable
 key 主要用于删除本地身份后的自动重建。
 
-当前门槛不覆盖 subnet router、Exit Node 公网出口、Headscale 或真实远端 LAN。这些
-路径仍必须增加各自受控 fixture 或真机证据，不能从 peer/MagicDNS 门槛外推。
+该自动化 Lab 门槛不覆盖 subnet router、Exit Node 公网出口、Headscale 或真实远端 LAN。
+单独的 [4via6 真机 smoke](../../sources/validation/tailscale-4via6-subnet-smoke.md)
+已记录 Mac 本机和下游终端经托管 Tailscale 访问远端 IPv4 SOCKS5 服务并取得
+HTTPS `200` 的证据；远端路由器归属、抓包、性能和公网默认出口边界必须按该
+记录分别判断，不能从子网服务成功、peer/MagicDNS 门槛或一次端口连通外推
+所有出口均正常。

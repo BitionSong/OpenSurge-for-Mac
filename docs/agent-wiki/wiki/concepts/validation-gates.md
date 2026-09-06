@@ -189,7 +189,7 @@ DHCP/DNS 并通过 Mac 网关出站。它不替代 `make lab-test` / `make lab-t
 
 当前进度快照来自 `docs/agent-wiki/sources/validation/real-device-smoke.md`。
 截至 2026-07-06 CST，本轮已经验证 explicit/off runner、TUN runner 和最小
-proxy egress runner 可以在物理下游 LAN 启动，真实 Pixel 手机可以获得
+proxy egress runner 可以在物理下游 LAN 启动，真实 Android 终端可以获得
 `192.168.50.100-200` 范围租约且 router/DNS 为 `192.168.50.1`。手机侧无代理
 直连 HTTPS/NAT、显式 `192.168.50.1:17890` HTTP proxy HTTPS、TUN 模式下无
 显式代理 HTTPS，以及本机受控 upstream proxy 命中 `open-surge-egress` 均已完成
@@ -291,7 +291,7 @@ DoH/Private Relay、UDP/QUIC、imported profile 或策略组切换。Android 镜
 而不是把人工浏览器页面成功当成完整自动化证据。
 
 same-LAN 的真实代理出口可以先用最小 `upstream_proxy` 切片验证，不必先导入完整
-订阅。2026-07-09 已用 `api.ipify.org`、Pixel 测试手机和 LAN HTTP 代理完成这一
+订阅。2026-07-09 已用 `api.ipify.org`、下游测试终端和 LAN HTTP 代理完成这一
 层：Android 默认路由经 Mac、Android 显式代理为空、`dnsmasq.log` 看到 Android 源
 IP 查询 `api.ipify.org`、`mihomo.log` 显示
 `Domain(api.ipify.org) using open-surge-egress[same-lan-http-egress]`，Android
@@ -517,6 +517,11 @@ mode `0600` 的文件；reusable、非 Ephemeral key 可以让两个变量指向
 Headscale、真实远端 LAN 或全部 NAT traversal/DERP 组合已验证。Lima peer underlay
 通过 Mac 当前普通上游是允许的；判定应用路径依赖 peer 观察到的 managed source 与
 Mihomo action log，不依赖 underlay 出口 IP。
+
+实际远端 LAN 的端口测试见
+[Tailscale 4via6 子网 smoke](../../sources/validation/tailscale-4via6-subnet-smoke.md)。
+该记录区分 Mac 本机、下游手机和远端路由器证据；同一 Mac 兼任 Exit Node 与
+Subnet Router 时，精确子网路由成功不等于公网默认出口或所有下游设备已验证。
 
 ## same-WiFi 上游断链恢复门槛
 

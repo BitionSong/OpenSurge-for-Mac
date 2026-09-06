@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -621,5 +622,53 @@ func TestValidateTailscaleTargetsAndRouteConflicts(t *testing.T) {
 				t.Fatalf("Validate() error = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidateTailscaleDeviceAccessUsesCurrentLAN(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.Mode = GatewayModeSameWiFiDHCP
+	cfg.Transparent.Mode = TransparentModeTUN
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.AllowedDevices = []string{"phone"}
+	cfg.DevicePolicy.File = "already-loaded.json"
+	scope, err := cfg.LANScope()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := device.CompilePolicyBundleForLAN(device.PolicySet{
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home"}},
+	}, scope, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DevicePolicy.Bundle = &bundle
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate(active device) error = %v", err)
+	}
+
+	cfg.Gateway.LANIP = "192.168.60.1"
+	cfg.DHCP.RangeStart = "192.168.60.100"
+	cfg.DHCP.RangeEnd = "192.168.60.200"
+	cfg.DNS.Listen = cfg.Gateway.LANIP
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), `unknown or inactive device "phone"`) {
+		t.Fatalf("Validate(device outside new LAN) error = %v", err)
+	}
+	if bundle.ActiveLAN != "192.168.50.0/24" || len(bundle.Compiled.Devices) != 1 {
+		t.Fatal("validation mutated the caller's policy snapshot")
+	}
+}
+
+func TestValidateRuntimeDoesNotLoadTailscaleDevicePolicy(t *testing.T) {
+	cfg := Default()
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.AllowAllDevices = true
+	cfg.DevicePolicy.File = filepath.Join(t.TempDir(), "missing-policy.json")
+	if err := ValidateRuntime(cfg); err != nil {
+		t.Fatalf("ValidateRuntime() must not depend on the desired policy file: %v", err)
+	}
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), cfg.DevicePolicy.File) {
+		t.Fatalf("Validate() must report the missing policy file: %v", err)
 	}
 }
