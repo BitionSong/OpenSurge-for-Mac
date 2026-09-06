@@ -107,9 +107,9 @@ deployment:
 | Isolated downstream LAN | A separate AP, SSID, or VLAN | Let the Mac serve the dedicated downstream network |
 
 Set the downstream and upstream interfaces, Mac gateway IPv4, DHCP pool, and
-upstream DNS. Keep **mihomo TUN** enabled for transparent proxying. Enable
-**每设备策略** (Per-device policies) if devices need independent egress
-choices, then select **保存网络配置** (Save network configuration).
+upstream DNS. Keep **mihomo TUN** enabled for transparent proxying. Per-device
+policies are enabled by default; register devices and choose their egress on the
+Devices page. Select **保存网络配置** (Save network configuration) to save network settings.
 
 All three topologies expose the two experimental IPv6 settings. **IPv6 DNS
 queries** controls AAAA answers, while **Downstream IPv6 takeover** establishes

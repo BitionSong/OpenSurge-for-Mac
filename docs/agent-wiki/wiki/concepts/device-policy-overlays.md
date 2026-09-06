@@ -3,10 +3,17 @@
 当任务涉及设备身份、每设备默认出口、设备规则覆盖，或如何把设备策略安全叠加到
 mihomo profile 时，先读此页。
 
-OpenSurge 只运行一个 mihomo。可选的 `device_policy.file` JSON 文件为每台设备记录
+OpenSurge 只运行一个 mihomo。`device_policy.file` JSON 文件为每台设备记录
 固定 IPv4、可选 MAC 与 profile；编译时按拓扑将它们转换为 DHCP reservation、独立 selector
 group，以及以 `SRC-IP-CIDR` 区分来源的 mihomo 规则。它不是“一台设备一份完整
 mihomo YAML”。
+
+安装版始终启用每设备策略：新安装初始化空文件；升级时只为未配置路径的旧配置
+补齐默认路径，已有自定义路径和文件内容保持原样。Web GUI 不再显示启用开关，
+网络配置保存忽略旧客户端的 `device_policy.enabled=false`，并保留受保护地址设置。
+若默认路径已存在此前停用时留下的文件，应重新使用并校验它，禁止用空 starter
+覆盖。保存失败只允许回收本次新建的文件，不能删除旧策略。独立 CLI 配置仍支持
+显式文件路径，配置读取及 stop/status 不承担文件初始化或迁移副作用。
 
 ## 策略模型
 

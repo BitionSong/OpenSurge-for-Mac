@@ -5,14 +5,18 @@ DHCP 模式会将已登记 MAC 固定到 IPv4 租约；`same_lan` 旁路由模�
 IPv4、把 MAC 作为可选身份信息。OpenSurge 为当前拓扑中有效的设备生成独立 selector group，并用
 mihomo 的 `SRC-IP-CIDR` 规则区分流量。
 
-这是可选功能。在 gateway 配置中指定 JSON 文件：
+安装版默认启用每设备策略，Web GUI 不提供关闭开关。新安装会自动创建空策略文件，
+升级时会为旧的未启用配置补齐文件路径，并保留已有策略内容。保存网络配置也始终
+保持启用。需要独立出口时，直接在“设备”页登记和配置设备。
+
+使用独立 CLI 配置时，通过以下字段指定 JSON 文件：
 
 ```yaml
 device_policy:
   file: "./devices.json"
 ```
 
-空的 [starter 文件](../examples/device-policy.example.json) 合法，但不会启用任何设备策略。
+空的 [starter 文件](../examples/device-policy.example.json) 合法，尚未登记设备时不会生成设备专属路由。
 路径相对于 gateway 配置文件解析。设备 IPv4 必须唯一；位于当前网关网段内的地址
 不能是网段地址、广播地址或 `gateway.lan_ip`。网段由 `gateway.lan_ip` 与
 `gateway.lan_prefix_len` 决定（省略时按 /24）。不在当前网段的登记会休眠而不是

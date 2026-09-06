@@ -7,9 +7,15 @@ mode also accepts a fixed IPv4 with MAC as optional identity metadata. It
 generates an independent selector group for every active device and routes
 traffic with mihomo `SRC-IP-CIDR` rules.
 
-This feature is optional. Point `device_policy.file` at a JSON document; the
-empty [starter document](../examples/device-policy.example.json) is valid but
-does not enable any device policy.
+The installed app enables per-device policies by default, and the Web GUI has
+no disable switch. A new installation creates an empty policy file; an upgrade
+adds the path to a previously disabled configuration while preserving existing
+policy data. Network configuration saves also keep policies enabled. Register
+devices and configure their egress directly on the Devices page.
+
+For a standalone CLI configuration, point `device_policy.file` at a JSON document.
+The empty [starter document](../examples/device-policy.example.json) is valid;
+it generates no device-specific routes until devices are registered.
 
 ```yaml
 device_policy:

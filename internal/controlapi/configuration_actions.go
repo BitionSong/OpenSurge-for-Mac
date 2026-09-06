@@ -650,16 +650,18 @@ func applyControlConfig(configPath, revision string, payload []byte) (string, er
 	cfg.LocalSystemProxy.Enabled = input.LocalSystemProxy.Enabled
 	cfg.DevicePolicy.ProtectedIPv4 = append([]string(nil), input.DevicePolicy.ProtectedIPv4...)
 	createdPolicy := ""
-	if input.DevicePolicy.Enabled && cfg.DevicePolicy.File == "" {
-		createdPolicy = filepath.Join(filepath.Dir(configPath), "data", "device-policy.json")
-		empty := []byte("{\n  \"devices\": [],\n  \"profiles\": [],\n  \"templates\": [],\n  \"rule_sets\": []\n}\n")
-		if err := writeAtomic(createdPolicy, empty, 0o640); err != nil {
+	// Device policy is always enabled by the control plane. Ignore the legacy
+	// enabled flag, and preserve any policy left behind by an older client.
+	if cfg.DevicePolicy.File == "" {
+		policyPath := filepath.Join(filepath.Dir(configPath), "data", "device-policy.json")
+		created, err := device.CreateEmptyPolicyFile(policyPath)
+		if err != nil {
 			return "", err
 		}
-		cfg.DevicePolicy.File = createdPolicy
-	} else if !input.DevicePolicy.Enabled {
-		cfg.DevicePolicy.File = ""
-		cfg.DevicePolicy.ProtectedIPv4 = nil
+		if created {
+			createdPolicy = policyPath
+		}
+		cfg.DevicePolicy.File = policyPath
 	}
 	cfg.DevicePolicy.Bundle = nil
 	if err := config.Validate(cfg); err != nil {

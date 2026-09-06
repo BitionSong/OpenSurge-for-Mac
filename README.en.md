@@ -144,7 +144,8 @@ One mihomo process can apply independent policies to registered LAN devices.
 DHCP takeover mode gives each device a MAC-backed fixed IPv4 lease. Same-LAN
 manual-gateway mode instead uses an IPv4 kept stable by the main router and can
 assist registration with current traffic plus ARP-neighbor observations. Both
-topologies emit per-device mihomo selector groups and `SRC-IP-CIDR` rules. The optional JSON
+topologies emit per-device mihomo selector groups and `SRC-IP-CIDR` rules. The installed app
+enables per-device policies by default, and the Web GUI keeps them enabled. The JSON
 policy file lets each device either follow gateway rules or take a
 dedicated device selector before global rules. It also supports direct
 device-specific actions such as `REJECT` and domain/IP/protocol/port/rule-provider

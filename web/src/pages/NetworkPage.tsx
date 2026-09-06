@@ -48,6 +48,7 @@ export function NetworkPage({ overview, onChanged, onNavigate, onNotify }: { ove
   const [planSettled, setPlanSettled] = useState(false)
   const [config, setConfig] = useState<ControlConfig | null>(null)
   const [savedConfig, setSavedConfig] = useState<ControlConfig | null>(null)
+  const [protectedIPv4Draft, setProtectedIPv4Draft] = useState('')
   const [expandedMode, setExpandedMode] = useState<NetworkMode | null>('same_wifi_dhcp')
   const [detailMode, setDetailMode] = useState<NetworkMode>('same_wifi_dhcp')
   const gatewayControlRef = useRef<HTMLButtonElement>(null)
@@ -92,7 +93,7 @@ export function NetworkPage({ overview, onChanged, onNavigate, onNotify }: { ove
 
   useEffect(() => {
     let active = true
-    void api.config().then(value => { if (active) { setConfig(value); setSavedConfig(value); setInitialNetworkSetup(isInstallerNetworkSeed(value)); setExpandedMode(value.gateway.mode); setDetailMode(value.gateway.mode) }; return active ? loadPlan(value) : undefined }).catch(cause => { if (active) setError(cause instanceof Error ? cause.message : String(cause)) })
+    void api.config().then(value => { if (active) { setConfig(value); setSavedConfig(value); setProtectedIPv4Draft(value.device_policy.protected_ipv4.join(', ')); setInitialNetworkSetup(isInstallerNetworkSeed(value)); setExpandedMode(value.gateway.mode); setDetailMode(value.gateway.mode) }; return active ? loadPlan(value) : undefined }).catch(cause => { if (active) setError(cause instanceof Error ? cause.message : String(cause)) })
     void api.networkInterfaces().then(value => { if (active) setInterfaceOptions(value.interfaces) }).catch(() => { if (active) setInterfaceDiscoveryError(true) })
     return () => { active = false }
   }, [loadPlan])
@@ -189,8 +190,9 @@ export function NetworkPage({ overview, onChanged, onNavigate, onNotify }: { ove
         await api.saveDevicePolicy(migration.policy, migration.document.revision)
         policySaved = true
       }
-      const updated = await api.saveConfig(target)
+      const updated = await api.saveConfig({ ...target, device_policy: { ...target.device_policy, enabled: true } })
       setConfig(updated); setSavedConfig(updated); setPolicyMigration(null)
+      setProtectedIPv4Draft(updated.device_policy.protected_ipv4.join(', '))
       setInitialNetworkSetup(false); setNetworkDefaultsMessage(''); setNetworkDefaultsError('')
       await onChanged(); await loadPlan(updated)
       if (migration) {
@@ -525,15 +527,11 @@ export function NetworkPage({ overview, onChanged, onNavigate, onNotify }: { ove
               onChange={enabled => setConfig({ ...config, local_system_proxy: { ...config.local_system_proxy, enabled } })}
             />
           </ConfigField>
-          <ConfigField label="每设备策略" setting="device_policy.file" hint="启用后可在“设备”页为 MAC 固定租约及独立 mihomo 策略；若尚无策略文件，保存时会创建一个空文件。关闭后不再使用此策略文件。">
-            <ConfigSwitch
-              label="启用每设备策略"
-              checked={config.device_policy.enabled}
-              onChange={enabled => setConfig({ ...config, device_policy: { ...config.device_policy, enabled } })}
-            />
-          </ConfigField>
-          <ConfigField className="wide" label="受保护的 IPv4" setting="device_policy.protected_ipv4" hint="以逗号分隔的路由器、恢复设备或其他静态主机地址。每设备策略的固定租约不得占用这些地址；仅在启用每设备策略时可编辑。">
-            <input aria-label={t('受保护的 IPv4')} disabled={!config.device_policy.enabled} placeholder="192.168.1.1, 192.168.1.21" value={config.device_policy.protected_ipv4.join(', ')} onChange={event => setConfig({ ...config, device_policy: { ...config.device_policy, protected_ipv4: event.target.value.split(',').map(item => item.trim()).filter(Boolean) } })} />
+          <ConfigField className="wide" label="受保护的 IPv4" setting="device_policy.protected_ipv4" hint="以逗号分隔的路由器、恢复设备或其他静态主机地址。设备的固定租约不得占用这些地址。">
+            <input aria-label={t('受保护的 IPv4')} placeholder="192.168.1.1, 192.168.1.21" value={protectedIPv4Draft} onChange={event => {
+              setProtectedIPv4Draft(event.target.value)
+              setConfig({ ...config, device_policy: { ...config.device_policy, protected_ipv4: event.target.value.split(',').map(item => item.trim()).filter(Boolean) } })
+            }} />
           </ConfigField>
           </div>
         </fieldset>

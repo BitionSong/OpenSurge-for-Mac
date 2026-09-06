@@ -2096,11 +2096,10 @@ func TestControlConfigIPv6SaveWithTailscaleDeviceAccess(t *testing.T) {
 		name          string
 		allowAll      bool
 		disablePolicy bool
-		wantError     string
 	}{
 		{name: "all registered devices", allowAll: true},
 		{name: "selected device"},
-		{name: "cannot disable required policy", allowAll: true, disablePolicy: true, wantError: "tailscale device access requires device_policy.file"},
+		{name: "legacy disable flag cannot turn policy off", allowAll: true, disablePolicy: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -2110,6 +2109,7 @@ func TestControlConfigIPv6SaveWithTailscaleDeviceAccess(t *testing.T) {
 			cfg.Runtime.Dir = filepath.Join(dir, "runtime")
 			cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
 			cfg.DevicePolicy.File = filepath.Join(dir, "device-policy.json")
+			cfg.DevicePolicy.ProtectedIPv4 = []string{"192.168.50.2"}
 			policy, err := json.Marshal(device.PolicySet{
 				Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
 				Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home"}},
@@ -2146,32 +2146,18 @@ func TestControlConfigIPv6SaveWithTailscaleDeviceAccess(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, saveErr := applyControlConfig(path, input.Revision, payload)
-			if tt.wantError != "" {
-				if saveErr == nil || !strings.Contains(saveErr.Error(), tt.wantError) {
-					t.Fatalf("applyControlConfig() error = %v, want %q", saveErr, tt.wantError)
-				}
-				data, err := os.ReadFile(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !bytes.Equal(data, originalConfig) {
-					t.Fatal("rejected save changed the configuration")
-				}
-			} else {
-				if saveErr != nil {
-					t.Fatalf("applyControlConfig() error = %v", saveErr)
-				}
-				updated, err := config.Load(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !updated.DNS.IPv6 || updated.Transparent != cfg.Transparent {
-					t.Fatalf("AAAA save changed unexpected IPv6 controls: DNS=%v transparent=%#v", updated.DNS.IPv6, updated.Transparent)
-				}
-				if !reflect.DeepEqual(updated.Tailscale, cfg.Tailscale) || updated.DevicePolicy.File != cfg.DevicePolicy.File {
-					t.Fatalf("AAAA save changed Tailscale or device-policy settings: Tailscale=%#v policy=%q", updated.Tailscale, updated.DevicePolicy.File)
-				}
+			if _, err := applyControlConfig(path, input.Revision, payload); err != nil {
+				t.Fatal(err)
+			}
+			updated, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !updated.DNS.IPv6 || updated.Transparent != cfg.Transparent {
+				t.Fatalf("AAAA save changed unexpected IPv6 controls: DNS=%v transparent=%#v", updated.DNS.IPv6, updated.Transparent)
+			}
+			if !reflect.DeepEqual(updated.Tailscale, cfg.Tailscale) || updated.DevicePolicy.File != cfg.DevicePolicy.File || !reflect.DeepEqual(updated.DevicePolicy.ProtectedIPv4, cfg.DevicePolicy.ProtectedIPv4) {
+				t.Fatal("network save changed Tailscale or device-policy settings")
 			}
 			updatedPolicy, err := os.ReadFile(cfg.DevicePolicy.File)
 			if err != nil {
@@ -2292,7 +2278,7 @@ func TestClientAcceptanceCanBeExplicitlySkipped(t *testing.T) {
 	}
 }
 
-func TestControlConfigCanInitializeDevicePolicyFile(t *testing.T) {
+func TestControlConfigAlwaysInitializesDevicePolicyFile(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.Default()
 	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
@@ -2302,7 +2288,7 @@ func TestControlConfigCanInitializeDevicePolicyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := controlConfigFrom(cfg, fileDigest(path))
-	input.DevicePolicy.Enabled = true
+	input.DevicePolicy.Enabled = false // Legacy clients cannot disable the default.
 	payload, _ := json.Marshal(input)
 	if _, err := applyControlConfig(path, input.Revision, payload); err != nil {
 		t.Fatal(err)
@@ -2316,6 +2302,51 @@ func TestControlConfigCanInitializeDevicePolicyFile(t *testing.T) {
 	}
 	if _, err := os.Stat(updated.DevicePolicy.File); err != nil {
 		t.Fatal(err)
+	}
+	if !controlConfigFrom(updated, fileDigest(path)).DevicePolicy.Enabled {
+		t.Fatal("saved control config still reports device policy disabled")
+	}
+}
+
+func TestControlConfigPreservesExistingDefaultPolicy(t *testing.T) {
+	for _, rejectSave := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reject=%v", rejectSave), func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := config.Default()
+			cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+			path := filepath.Join(dir, "config.yaml")
+			original := []byte(config.Render(cfg))
+			if err := os.WriteFile(path, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			policyPath := filepath.Join(dir, "data", "device-policy.json")
+			if _, err := device.CreateEmptyPolicyFile(policyPath); err != nil {
+				t.Fatal(err)
+			}
+			saved := []byte(`{"devices":[],"profiles":[{"id":"saved","default_policies":["DIRECT"]}],"templates":[],"rule_sets":[]}`)
+			if err := os.WriteFile(policyPath, saved, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			input := controlConfigFrom(cfg, fileDigest(path))
+			if rejectSave {
+				input.Gateway.LANPrefixLen = 31
+			}
+			payload, _ := json.Marshal(input)
+			_, err := applyControlConfig(path, input.Revision, payload)
+			if (err != nil) != rejectSave {
+				t.Fatalf("save error=%v, reject=%v", err, rejectSave)
+			}
+			actual, err := os.ReadFile(policyPath)
+			if err != nil || !bytes.Equal(actual, saved) {
+				t.Fatalf("existing policy changed: %s, %v", actual, err)
+			}
+			if rejectSave {
+				actual, _ := os.ReadFile(path)
+				if !bytes.Equal(actual, original) {
+					t.Fatal("rejected save changed the config")
+				}
+			}
+		})
 	}
 }
 

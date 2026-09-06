@@ -133,8 +133,8 @@ macOS BPF packet broker 和本项目补丁构建的 mihomo 用户态数据面共
 配置固定 IPv4 租约；旁路由模式只需主路由侧保持稳定的静态 IPv4，MAC 可留空，并可从
 当前经过 Mac 的流量与 ARP 邻居观察辅助登记。切换到 DHCP 模式时，GUI 会要求确认当前
 可观察到的 MAC；仍无 MAC 的登记会保留，但设备专属策略暂停，补全 MAC 后恢复。当前拓扑中
-身份信息充分的设备会生成各自的 mihomo selector group 和 `SRC-IP-CIDR` 规则。可选 JSON
-策略文件让每台设备要么跟随网关规则，要么在
+身份信息充分的设备会生成各自的 mihomo selector group 和 `SRC-IP-CIDR` 规则。安装版默认
+启用每设备策略，Web GUI 始终保留该能力；JSON 策略文件让每台设备要么跟随网关规则，要么在
 全局规则之前走设备专属 selector；它也支持 `REJECT` 这类设备专属动作，以及按
 域名/IP/协议/端口/rule-provider 叠加的规则覆盖。dedicated 模式下，本地/私有目标
 保持直连。Mac 本机的规则 / 全局 / 直连开关不改变这些下游规则；详见

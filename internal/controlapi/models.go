@@ -229,6 +229,8 @@ type LocalSystemProxyConfigInput struct {
 }
 
 type DevicePolicyConfigInput struct {
+	// Enabled reports whether a policy file is configured. The field is kept
+	// for schema compatibility; network saves always enable device policy.
 	Enabled       bool     `json:"enabled"`
 	ProtectedIPv4 []string `json:"protected_ipv4"`
 }

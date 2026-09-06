@@ -14,6 +14,7 @@ func main() {
 	root := flag.String("root", "/Library/Application Support/OpenSurge", "installed root-owned data directory")
 	output := flag.String("output", "", "destination config; defaults to <root>/config.yaml")
 	validatePackageSource := flag.Bool("validate-package-source", false, "validate that a config is self-contained for packaging")
+	enableDevicePolicy := flag.Bool("enable-device-policy", false, "enable device policy in an existing installed configuration")
 	flag.Parse()
 	if *source == "" {
 		fatal("--source is required")
@@ -27,6 +28,12 @@ func main() {
 	}
 	if os.Geteuid() != 0 {
 		fatal("opensurge-install-config must run as root")
+	}
+	if *enableDevicePolicy {
+		if err := installconfig.EnableDevicePolicy(*source); err != nil {
+			fatal(err.Error())
+		}
+		return
 	}
 	if *output == "" {
 		*output = filepath.Join(*root, "config.yaml")

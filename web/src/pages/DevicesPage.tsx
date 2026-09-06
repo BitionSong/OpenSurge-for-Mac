@@ -299,7 +299,7 @@ export function DevicesPage({ overview, onChanged, onNavigate, onDirtyChange, on
       {data?.drift && !dirty
         ? <PendingReloadBar data={data} running={overview?.status.gateway === 'running'} onReload={() => setReloadOpen(true)} onDashboard={() => onNavigate('dashboard')} />
         : <div className={`sticky-save ${dirty ? 'has-changes' : 'is-saved'}`}><div><strong>{t(dirty ? '有未保存的设备修改' : '设备配置已保存')}</strong><small>{dirty ? t('保存只更新 desired；运行中还需重载') : `revision ${document.revision.slice(0, 10)}`}</small></div><button className="primary" type="button" disabled={!dirty || saving || rebinding} onClick={() => void save()}>{t(saving ? '正在验证并保存…' : '保存设备配置')}</button></div>}
-    </> : <section className="section"><Empty text={t('当前 gateway config 尚未启用设备策略；请先在网络设置中启用。')} /></section>}
+    </> : <section className="section"><Empty text={t('请先在网络设置中保存一次配置，设备管理会自动完成初始化。')} /><button type="button" onClick={() => onNavigate('network')}>{t('前往网络设置')}</button></section>}
 
     {reloadOpen && <ReloadDialog busy={reloading} routerBypassRenewalNames={routerBypassRenewalNames} openSurgeRenewalNames={openSurgeRenewalNames} onCancel={() => setReloadOpen(false)} onConfirm={() => void reload()} />}
     {rebindRequest && <RebindDialog request={rebindRequest} busy={rebinding} running={overview?.status.gateway === 'running'} includesDraft={dirty} onCancel={() => setRebindRequest(null)} onConfirm={() => void applyObservedIPv4()} />}

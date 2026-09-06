@@ -18,8 +18,8 @@ dhcp:
   bypass_gateway: ""
   bypass_dns: ""
 
-# Optional JSON control-plane file for fixed device leases and per-device
-# mihomo policy overlays. Leave empty unless device policy is enabled.
+# The installer initializes its managed device-policy file automatically.
+# Keep the package seed self-contained; standalone CLI configs can set a path.
 device_policy:
   file: ""
 
