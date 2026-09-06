@@ -348,7 +348,7 @@ function deviceViews(desired: PolicyDevice[], applied: CompiledDevice[], changed
     if (outOfLAN.has(device.id)) return { desired: device, applied: running, state: 'out_of_lan' }
     if (topology !== 'same_lan' && !device.mac.trim()) return { desired: device, state: 'paused' }
     if (!running) return { desired: device, state: 'pending' }
-    const same = running.mac.toLowerCase() === device.mac.toLowerCase() && running.ipv4 === device.ipv4 && running.profile === device.profile && appliedEgressMode(running) === desiredEgressMode(device) && appliedGatewayTarget(running) === desiredGatewayTarget(device)
+    const same = running.mac.toLowerCase() === device.mac.toLowerCase() && running.ipv4 === device.ipv4 && running.profile === device.profile && (running.configured_egress_mode ?? appliedEgressMode(running)) === desiredEgressMode(device) && appliedGatewayTarget(running) === desiredGatewayTarget(device)
     return { desired: device, applied: running, state: same && !changed.has(device.id) ? 'applied' : 'updated' }
   })
   for (const device of appliedByID.values()) views.push({ applied: device, state: 'removing' })
@@ -369,6 +369,7 @@ function DeviceCard({ view, running, topology, lanPrefix, routerBypass, routerBy
   const runningTarget = appliedGatewayTarget(applied)
   const desiredRouteMode: DeviceRouteMode | undefined = desiredTarget === 'upstream_router' ? 'upstream_router' : desiredMode
   const runningRouteMode: DeviceRouteMode | undefined = runningTarget === 'upstream_router' ? 'upstream_router' : runningMode
+  const configuredRouteMode = runningTarget === 'upstream_router' ? 'upstream_router' : applied?.configured_egress_mode ?? runningMode
   const identity = applied ? deviceIdentity(applied, topology, leases, observed) : null
   const entries = Object.entries(applied?.groups ?? {})
   const defaultEntry = entries.find(([slot]) => slot === 'default')
@@ -402,7 +403,8 @@ function DeviceCard({ view, running, topology, lanPrefix, routerBypass, routerBy
     {runningTarget !== 'upstream_router' && runningMode === 'inherit_global' && (identityBlocked ? <div className="runtime-route identity-blocked"><span><strong>{t(identity?.state === 'address_changed' ? '当前 IP 尚未绑定' : '当前身份存在冲突')}</strong><small>{t('已应用配置仍对应 {{ip}}', { ip: applied!.ipv4 })}</small></span><span className="effect-badge restart">{t('待修复')}</span></div> : <div className="runtime-route following"><span><strong>{t('当前运行')}</strong><small>{t(identity?.state === 'waiting' ? '跟随网关规则 · 等待设备接入' : '跟随网关规则')}</small></span><span className="effect-badge live">{t(identity?.state === 'waiting' ? '已预设' : '已应用')}</span></div>)}
     {runningTarget !== 'upstream_router' && (runningMode === 'dedicated' || runningMode === 'legacy_fallback') && <div className={`default-slot ${runningMode === 'legacy_fallback' ? 'legacy' : ''}`}>{defaultEntry ? <DeviceOutletControl identity={identity} device={applied!.id} slot={defaultEntry[0]} groupName={defaultEntry[1]} groups={groups} title={t(runningMode === 'dedicated' ? '独立出口' : '兼容兜底出口')} ariaLabel={t('{{id}} {{outlet}} 当前摘要', { id: device.id, outlet: t(runningMode === 'dedicated' ? '独立出口' : '兼容兜底出口') })} healthByName={healthByName} testing={healthTesting} onTest={onHealthTest} onChanged={onChanged} /> : <button className="outlet-summary unavailable" type="button" disabled><span className="outlet-summary-copy"><small>{t(runningMode === 'dedicated' ? '独立出口' : '兼容兜底出口')}</small><strong>{t('重载后可用')}</strong></span></button>}</div>}
     {!runningRouteMode && desiredRouteMode && view.state !== 'paused' && view.state !== 'out_of_lan' && <div className="runtime-route"><span><strong>{t('重载后应用')}</strong><small>{routeModeLabel(desiredRouteMode)}</small></span></div>}
-    {runningRouteMode && desiredRouteMode && runningRouteMode !== desiredRouteMode && <small className="draft-mode-delta">{t('草稿将改为“{{desired}}”；保存并重载前仍按“{{running}}”运行。', { desired: routeModeLabel(desiredRouteMode), running: routeModeLabel(runningRouteMode) })}</small>}
+    {runningRouteMode && desiredRouteMode && configuredRouteMode !== desiredRouteMode && <small className="draft-mode-delta">{t('草稿将改为“{{desired}}”；保存并重载前仍按“{{running}}”运行。', { desired: routeModeLabel(desiredRouteMode), running: routeModeLabel(runningRouteMode) })}</small>}
+    <PolicyAdjustmentNotices device={applied} />
     {ruleEntries.length > 0 && <div className="rule-slots"><button className="rule-slots-toggle" type="button" aria-expanded={rulesOpen} onClick={() => setRulesOpen(value => !value)}>{t('规则出口（{{count}}）', { count: ruleEntries.length })}<span>{t(rulesOpen ? '收起' : '展开')}</span></button>{rulesOpen && ruleEntries.map(([slot, groupName]) => <div className="rule-outlet-summary" key={slot}><DeviceOutletControl identity={identity} device={applied!.id} slot={slot} groupName={groupName} groups={groups} title={slot} ariaLabel={t('{{id}} {{slot}} 出口当前摘要', { id: device.id, slot })} healthByName={healthByName} testing={healthTesting} onTest={onHealthTest} onChanged={onChanged} /></div>)}</div>}
     {applied && <ConnectionRefreshControl ariaLabel={t('刷新 {{name}} 连接', { name: view.desired ? displayDeviceName(view.desired) : applied.id })} disabled={!running || runningTarget === 'upstream_router' || !refreshReady} disabledReason={t(!running ? '启动网关后可以刷新此设备的连接。' : runningTarget === 'upstream_router' ? '此设备直连主路由，没有由 OpenSurge 管理的连接。' : '确认设备当前身份后可以刷新连接。')} refresh={() => api.refreshDeviceConnections(applied.id)} onRefreshed={onChanged} />}
     {view.desired && <div className="device-card-actions">
@@ -413,6 +415,25 @@ function DeviceCard({ view, running, topology, lanPrefix, routerBypass, routerBy
       </span>
     </div>}
   </article>
+}
+
+function PolicyAdjustmentNotices({ device }: { device?: CompiledDevice }) {
+  if (!device?.policy_adjustments?.length) return null
+  return <div className="notice warn" role="status">
+    <strong>{t('部分出口已不在当前配置中')}</strong>
+    {device.policy_adjustments.map(adjustment => {
+      const message = adjustment.effect === 'inherit_global'
+        ? '设备默认出口 {{targets}} 不存在，当前跟随网关规则。'
+        : adjustment.effect === 'skip_rule'
+          ? '设备分流 {{slot}} 的出口 {{targets}} 不存在，当前已跳过这条分流。'
+          : '{{slot}} 已忽略失效候选 {{targets}}，保留当前有效出口。'
+      return <p key={adjustment.slot}>{t(message, {
+        slot: adjustment.slot === 'default' ? t('设备默认出口') : adjustment.slot,
+        targets: adjustment.missing_targets.join('、'),
+      })}</p>
+    })}
+    <small>{t('原始设置已保留；出口恢复后，下次启动或重载会重新应用。')}</small>
+  </div>
 }
 
 function DeviceOutletControl({ identity, device, slot, groupName, groups, title, ariaLabel, healthByName, testing, onTest, onChanged }: { identity: DeviceIdentity | null; device: string; slot: string; groupName: string; groups: ProxyGroup[]; title: string; ariaLabel: string; healthByName: Map<string, ProxyHealthEntry>; testing: Set<string>; onTest: (names: string[]) => Promise<void>; onChanged: () => Promise<void> }) {

@@ -97,6 +97,35 @@ describe('DevicesPage', () => {
 
   afterEach(() => { cleanup(); vi.clearAllMocks(); activateLanguage('zh-Hans') })
 
+  it('shows applied egress fallback and skipped ruleset and template routes without marking settings as unsaved', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', name: 'Alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['Gone'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true, drift: false,
+      applied_devices: [{ ...policy.devices[0], egress_mode: 'inherit_global', configured_egress_mode: 'dedicated', groups: {}, policy_adjustments: [
+        { slot: 'default', effect: 'inherit_global', missing_targets: ['Gone'] },
+        { slot: 'ruleset-route', effect: 'skip_rule', missing_targets: ['Missing-Ruleset-Exit'] },
+        { slot: 'template-route', effect: 'skip_rule', missing_targets: ['Missing-Template-Exit'] },
+        { slot: 'valid-route', effect: 'filter_candidates', missing_targets: ['Unused-Exit'] },
+      ] }],
+    }))
+    renderPage()
+    expect(await screen.findByText('设备默认出口 Gone 不存在，当前跟随网关规则。')).toBeTruthy()
+    expect(screen.getByText('设备分流 ruleset-route 的出口 Missing-Ruleset-Exit 不存在，当前已跳过这条分流。')).toBeTruthy()
+    expect(screen.getByText('设备分流 template-route 的出口 Missing-Template-Exit 不存在，当前已跳过这条分流。')).toBeTruthy()
+    expect(screen.getByText('valid-route 已忽略失效候选 Unused-Exit，保留当前有效出口。')).toBeTruthy()
+    expect(screen.getByText('原始设置已保留；出口恢复后，下次启动或重载会重新应用。')).toBeTruthy()
+    const card = screen.getByRole('button', { name: /alice-policy\s*Alice/ }).closest('article')!
+    expect(within(card).getAllByText('已应用').length).toBeGreaterThan(0)
+    expect(within(card).queryByText('待重载')).toBeNull()
+    expect(within(card).queryByText(/草稿将改为/)).toBeNull()
+    expect(api.saveDevicePolicy).not.toHaveBeenCalled()
+  })
+
   it('refreshes only Mac-local connections from the Mac card', async () => {
     const { onChanged } = renderPage()
 

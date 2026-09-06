@@ -103,7 +103,9 @@ make policy-control-test
 也不需要 sudo。它用 imported profile fixture 验证 `policies`、`policy-select`、
 `connections`、`providers`、`provider-update` 和聚合 `snapshot` 能通过 live
 external-controller API 工作，并会重启 mihomo 证明 `profile.store-selected` 可以
-恢复选中的策略。它还验证本机/私网 mixed-port 目标保持 `DIRECT`、专用
+恢复选中的策略。它还通过真实核心的缓存选择、来源删除/恢复、配置校验和进程重启，
+验证设备默认出口与规则集/模版绑定的失效回退、有效候选保留、原始设置保留和恢复。
+这些断言不代替下游 TUN 流量验证。它还验证本机/私网 mixed-port 目标保持 `DIRECT`、专用
 local-routing 控制器协调三种模式、HTTP-only Global 的 UDP fail-closed，以及普通
 policy 接口不泄露内部组。它适合策略组控制、file/HTTP provider 状态读取和刷新、
 机器可读 CLI、mihomo API wrapper 和 `profile.store-selected` 相关改动；不要用它
@@ -394,6 +396,16 @@ App 共用的 `DirectRunner.StartPolicyWorkspace`。门槛要求最终校验阶�
 准备态进程与记录退出、工作目录和原生节点选择保留，然后验证 DIRECT/Provider
 两种 TUN 流量及停止清理。普通 `make test` 跳过该 root 用例；它不证明原生 App UI
 或真实 Tailnet Exit Node 公网出口。CLI 持久化配置路径仍由原 imported-egress 门槛覆盖。
+
+准备态的出口失效回归可单独运行：
+
+```sh
+OMG_PREPARED_MIHOMO_BINARY="$PWD/runtime/tools/bin/mihomo" \
+  go test ./internal/controlapi -run 'TestPolicyWorkspaceMissingDeviceEgressRealCore$' -count=1
+```
+
+它验证规则集和模版出口删除后的连续预览、默认出口回退与原选择恢复，只启动随机
+loopback controller 的准备态核心，不接管 TUN、DHCP 或 pf，不能替代上面的接管门槛。
 
 ## Mac 本机模式隔离门槛
 

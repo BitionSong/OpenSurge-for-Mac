@@ -155,6 +155,9 @@ func newTemplateData(cfg config.Config) (templateData, error) {
 		imported = &loaded
 		dnsResolverFields = loaded.dnsResolverFields
 	}
+	if err := resolveDevicePolicy(&cfg, imported); err != nil {
+		return templateData{}, err
+	}
 	policySections, err := renderPolicySections(cfg, imported)
 	if err != nil {
 		return templateData{}, err

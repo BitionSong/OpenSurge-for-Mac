@@ -512,5 +512,72 @@ assert_file_contains "$WORK_DIR/snapshot.json" '"name": "provider-updated"'
 assert_file_contains "$WORK_DIR/snapshot.json" '"name": "remote-provider"'
 assert_file_contains "$WORK_DIR/snapshot.json" '"name": "remote-provider-updated"'
 
+section "missing device outbounds preserve defaults and route bindings"
+stop_mihomo
+cat >"$PROFILE" <<'EOF'
+proxy-groups:
+  - name: VanishingExit
+    type: select
+    proxies: [DIRECT]
+  - name: SurvivingExit
+    type: select
+    proxies: [DIRECT]
+rules: ['MATCH,DIRECT']
+EOF
+cp "$PROFILE" "$WORK_DIR/profile-with-device-exits.yaml"
+cat >"$DEVICE_POLICY" <<'EOF'
+{
+  "profiles": [{"id":"integration-egress","default_policies":["DIRECT","VanishingExit","SurvivingExit"],"rules":[
+    {"id":"template","match":{"template":"media"},"action":"VanishingExit"},
+    {"id":"ruleset","match":{"rule_sets":["media"]},"policies":["DIRECT","VanishingExit"]},
+    {"id":"valid","match":{"domains":["blocked.example"]},"action":"REJECT"}
+  ]}],
+  "devices": [
+    {"id":"integration-dedicated","mac":"aa:bb:cc:dd:ee:01","ipv4":"192.168.50.101","profile":"integration-egress","egress_mode":"dedicated"},
+    {"id":"integration-retained","mac":"aa:bb:cc:dd:ee:02","ipv4":"192.168.50.102","profile":"integration-egress","egress_mode":"dedicated"}
+  ],
+  "rule_sets":[{"id":"media","behavior":"domain","payload":["media.example"]}],
+  "templates":[{"id":"media","rule_sets":["media"]}]
+}
+EOF
+cp "$DEVICE_POLICY" "$WORK_DIR/device-policy-original.json"
+"$OMG_BIN" validate-mihomo --config "$CONFIG" --format json
+start_mihomo "device exits before source change"
+"$OMG_BIN" policy-select --config "$CONFIG" --group device/integration-dedicated/default --policy VanishingExit --format json >"$WORK_DIR/device-missing-selected.json"
+"$OMG_BIN" policy-select --config "$CONFIG" --group device/integration-dedicated/ruleset --policy VanishingExit --format json >"$WORK_DIR/ruleset-missing-selected.json"
+"$OMG_BIN" policy-select --config "$CONFIG" --group device/integration-retained/default --policy SurvivingExit --format json >"$WORK_DIR/device-retained-selected.json"
+stop_mihomo
+cat >"$PROFILE" <<'EOF'
+proxy-groups:
+  - name: SurvivingExit
+    type: select
+    proxies: [DIRECT]
+rules: ['MATCH,DIRECT']
+EOF
+"$OMG_BIN" validate-mihomo --config "$CONFIG" --format json >"$WORK_DIR/missing-egress-validation.json"
+if grep -Fq 'VanishingExit' "$MIHOMO_CONFIG" ||
+   grep -Fq 'device/integration-dedicated/default' "$MIHOMO_CONFIG" ||
+   grep -Fq 'device/integration-dedicated/ruleset' "$MIHOMO_CONFIG"; then
+  echo "missing selected device or ruleset egress was still rendered" >&2
+  exit 1
+fi
+assert_file_contains "$MIHOMO_CONFIG" 'DOMAIN-SUFFIX,blocked.example'
+assert_file_contains "$MIHOMO_CONFIG" 'device/integration-retained/ruleset'
+start_mihomo "missing device exits fall back without blocking the core"
+"$OMG_BIN" policies --config "$CONFIG" --format json >"$WORK_DIR/missing-egress-live.json"
+assert_file_contains "$WORK_DIR/missing-egress-live.json" '"name": "device/integration-retained/default"'
+grep -A 2 -F '"name": "device/integration-retained/default"' "$WORK_DIR/missing-egress-live.json" | grep -Fq '"selected": "SurvivingExit"'
+cmp "$DEVICE_POLICY" "$WORK_DIR/device-policy-original.json"
+stop_mihomo
+cp "$WORK_DIR/profile-with-device-exits.yaml" "$PROFILE"
+"$OMG_BIN" validate-mihomo --config "$CONFIG" --format json >"$WORK_DIR/restored-egress-validation.json"
+assert_file_contains "$MIHOMO_CONFIG" 'device/integration-dedicated/default'
+assert_file_contains "$MIHOMO_CONFIG" 'device/integration-dedicated/ruleset'
+start_mihomo "restored source reactivates original device and rule-set selections"
+"$OMG_BIN" policies --config "$CONFIG" --format json >"$WORK_DIR/restored-egress-live.json"
+grep -A 2 -F '"name": "device/integration-dedicated/default"' "$WORK_DIR/restored-egress-live.json" | grep -Fq '"selected": "VanishingExit"'
+grep -A 2 -F '"name": "device/integration-dedicated/ruleset"' "$WORK_DIR/restored-egress-live.json" | grep -Fq '"selected": "VanishingExit"'
+cmp "$DEVICE_POLICY" "$WORK_DIR/device-policy-original.json"
+
 section "done"
 printf 'policy-control integration passed\n'

@@ -114,7 +114,26 @@ Mac 本机 source-scoped 模式规则排在最前，但下游设备源地址不�
 
 imported profile 使用 YAML AST 收集 proxy/group/provider 名称。生成的 `device/` group 和
 `open-surge-ruleset-` provider namespace 不能与 imported 内容冲突；default candidate、rule
-candidate 与 action 也必须引用已有目标或显式内置目标。
+candidate 与 action 的有效运行结果只能引用已有目标或显式内置目标。
+
+配置来源变化导致旧出口消失时，`device.PolicyResolution` 根据最终合成配置的 target
+inventory 和历史 selector 选择派生有效策略。默认出口的当前选择消失或候选全部消失时
+回退 `inherit_global`；设备规则的固定/当前出口消失时跳过规则及其 `REJECT` 兜底；
+仅未选中候选消失时过滤候选并保留有效选择。规则集、模版和直接条件规则共用编译分支，
+不会删除共享规则内容，也不影响其他设备、DHCP reservation 或 IPv6 身份映射。
+
+原始 Policy、canonical JSON 和 digest 保留。applied bundle 保存 resolution inventory 与
+selection context，读取快照时按该上下文重编译，不能根据后续订阅重算或恢复失效 selector。
+`CompiledDevice.egress_mode` 表示实际模式；回退时 `configured_egress_mode` 保留原模式，
+`policy_adjustments` 为 GUI 提供 default/rule slot、缺失名称和实际处理结果，不能误报为
+未保存的草稿差异。来源恢复后在下次启动/重载重新解析原策略。
+
+历史选择优先来自运行中/准备态核心；已跳过的 selector 从 applied bundle 或准备态记录中
+保留原选择，避免后续预览读取因 live group 缺席而重新启用它。停止态只读 pinned Mihomo 1.19.30 的 bbolt
+`cache.db` / `selected` bucket，使用相同版本 bbolt 依赖和有界锁等待。禁止复制运行中
+数据库、增加第二个 writer、清缓存或启动额外核心读取选择。临时校验目录必须保留原
+cache 路径。首次使用且没有缓存时使用第一候选；缓存无法读取且没有可信选择时，受影响
+selector 保守回退/跳过。节点离线或协议不支持不是名称失效，不改变现有 UDP 规则。
 
 导入 section 的原始 YAML 文本会保留。追加生成的 selector、rule-provider 与规则时，必须
 沿用该 section 已有顶层 item 的缩进；订阅常见的 4 空格缩进不能与 OpenSurge 默认的 2

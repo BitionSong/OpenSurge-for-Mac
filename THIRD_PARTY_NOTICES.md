@@ -42,6 +42,14 @@ places this notice and the referenced license texts under
 - License texts: [`third_party/licenses/yaml-v3-LICENSE`](third_party/licenses/yaml-v3-LICENSE)
   and [`third_party/licenses/Apache-2.0.txt`](third_party/licenses/Apache-2.0.txt)
 
+## github.com/metacubex/bbolt
+
+- Version: `v0.0.0-20260706163408-d4ec34ad7c48`, matching the pinned Mihomo cache implementation
+- Use: read-only recovery of device selector choices from the core's cache
+- License: MIT
+- Upstream: <https://github.com/metacubex/bbolt/tree/d4ec34ad7c48>
+- License text: [`third_party/licenses/bbolt-MIT.txt`](third_party/licenses/bbolt-MIT.txt)
+
 ## React, React DOM, and scheduler
 
 - Versions: React `19.2.7`, React DOM `19.2.7`, scheduler `0.27.0`

@@ -17,6 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"open-mihomo-gateway/internal/config"
+	"open-mihomo-gateway/internal/device"
 	"open-mihomo-gateway/internal/process"
 	"open-mihomo-gateway/internal/runtime"
 )
@@ -28,14 +29,15 @@ var ErrGatewayOwnsEngine = errors.New("gateway runtime exists; prepared engine i
 // PreparedState is a private ownership record, not a public API response. The
 // controller secret must never be included in a Web GUI response or diagnostic.
 type PreparedState struct {
-	PID                int       `json:"pid"`
-	ProcessFingerprint string    `json:"process_fingerprint"`
-	BootSessionID      string    `json:"boot_session_id"`
-	StartedAt          time.Time `json:"started_at"`
-	ConfigDigest       string    `json:"config_digest"`
-	ConfigDirectory    string    `json:"config_directory"`
-	APIAddr            string    `json:"api_addr"`
-	Secret             string    `json:"secret"`
+	PID                    int                      `json:"pid"`
+	ProcessFingerprint     string                   `json:"process_fingerprint"`
+	BootSessionID          string                   `json:"boot_session_id"`
+	StartedAt              time.Time                `json:"started_at"`
+	ConfigDigest           string                   `json:"config_digest"`
+	ConfigDirectory        string                   `json:"config_directory"`
+	APIAddr                string                   `json:"api_addr"`
+	Secret                 string                   `json:"secret"`
+	DevicePolicyResolution *device.PolicyResolution `json:"device_policy_resolution,omitempty"`
 }
 
 type preparedDeps struct {
@@ -175,6 +177,9 @@ func prepareLocked(ctx context.Context, cfg config.Config, renderedFinal string,
 	state := PreparedState{
 		BootSessionID: boot.ID, StartedAt: time.Now().UTC(), ConfigDigest: wantDigest,
 		ConfigDirectory: directory, APIAddr: apiAddr, Secret: secret,
+	}
+	if cfg.DevicePolicy.Bundle != nil {
+		state.DevicePolicyResolution = cfg.DevicePolicy.Bundle.Resolution
 	}
 	// Journal intent before fork. If the Helper dies in the small interval
 	// before the child's fingerprint is saved, an incomplete current-boot

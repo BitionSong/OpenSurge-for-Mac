@@ -244,6 +244,9 @@ func policyWorkspaceProfilePath(configPath, digest string) string {
 }
 
 func workspaceCandidate(configPath string, cfg config.Config, input PolicyWorkspaceInput) (config.Config, *policyWorkspaceBase, error) {
+	if err := config.PrepareDevicePolicy(&cfg); err != nil {
+		return cfg, nil, err
+	}
 	document := mihomo.DefaultProfileOverlayDocument()
 	if len(strings.TrimSpace(string(input.Overlay))) > 0 {
 		var err error
@@ -427,6 +430,9 @@ func runPolicyWorkspace(ctx context.Context, configPath string, input PolicyWork
 			response.Mode = "prepared"
 			candidate, _, err := workspaceCandidate(configPath, cfg, input)
 			if err != nil {
+				return err
+			}
+			if err := mihomo.PrepareDevicePolicy(&candidate); err != nil {
 				return err
 			}
 			final, err := mihomo.RenderConfig(candidate)

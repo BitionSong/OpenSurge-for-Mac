@@ -165,7 +165,7 @@ func TestRenderConfigWithManagedTailscaleTargetsAndExitNode(t *testing.T) {
 	)
 }
 
-func TestRenderConfigExplainsTailscaleExitNodeStillSelected(t *testing.T) {
+func TestRenderConfigFallsBackWhenTailscaleExitNodeWasRemoved(t *testing.T) {
 	bundle, err := device.CompilePolicyBundle(device.PolicySet{
 		Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home", EgressMode: device.EgressModeDedicated}},
 		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{config.TailscaleProxyName}}},
@@ -176,9 +176,12 @@ func TestRenderConfigExplainsTailscaleExitNodeStillSelected(t *testing.T) {
 	cfg := config.Default()
 	cfg.DevicePolicy.Bundle = &bundle
 
-	_, err = RenderConfig(cfg)
-	if err == nil || !strings.Contains(err.Error(), "device route still selects the Tailscale Exit Node") {
-		t.Fatalf("RenderConfig() error = %v", err)
+	rendered, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered, "device/phone/default") || strings.Contains(rendered, config.TailscaleProxyName) {
+		t.Fatalf("removed Tailscale exit still emitted: %s", rendered)
 	}
 }
 
@@ -828,7 +831,7 @@ func TestRenderConfigRejectsImportedRuleAfterTerminalMatchWhenDevicePolicyEnable
 	}
 }
 
-func TestRenderConfigRejectsImportedPolicyNamespaceCollisionsAndUnknownTargets(t *testing.T) {
+func TestRenderConfigRejectsImportedPolicyNamespaceCollisions(t *testing.T) {
 	tests := []struct {
 		name    string
 		profile string
@@ -846,15 +849,6 @@ rules:
 `,
 			policy: `{"profiles":[{"id":"home","default_policies":["DIRECT"]}],"devices":[{"id":"phone","mac":"aa:bb:cc:dd:ee:01","ipv4":"192.168.50.101","profile":"home"}]}`,
 			want:   "occupies reserved device/ namespace",
-		},
-		{
-			name: "unknown policy target",
-			profile: `proxies: []
-rules:
-  - MATCH,DIRECT
-`,
-			policy: `{"profiles":[{"id":"home","default_policies":["Missing"]}],"devices":[{"id":"phone","mac":"aa:bb:cc:dd:ee:01","ipv4":"192.168.50.101","profile":"home"}]}`,
-			want:   "unknown imported proxy or group \"Missing\"",
 		},
 		{
 			name: "generated provider collision",

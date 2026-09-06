@@ -331,6 +331,12 @@ func (m Manager) startWithCommit(ctx context.Context, commit func() error) error
 	if err := config.Validate(m.cfg); err != nil {
 		return err
 	}
+	// Capture choices while the prepared controller can still report them,
+	// including source-free overlays whose cache directory differs from the
+	// original managed config. The lifecycle lock freezes this handoff.
+	if err := mihomo.PrepareDevicePolicy(&m.cfg); err != nil {
+		return err
+	}
 	// Prepared and gateway engines share cache.db and the managed tsnet
 	// identity. This happens under the cross-process lock, including CLI start.
 	if err := m.stopPreparedEngine(deps); err != nil {
@@ -799,11 +805,11 @@ func (m Manager) validateReloadCandidate(ctx context.Context) error {
 	defer os.RemoveAll(temp)
 
 	candidateConfig := m.cfg
-	candidateConfig.Runtime.Dir = temp
-	candidateConfig.Mihomo.Config = filepath.Join(temp, "mihomo.yaml")
 	if err := config.PrepareDevicePolicy(&candidateConfig); err != nil {
 		return err
 	}
+	candidateConfig.Runtime.Dir = temp
+	candidateConfig.Mihomo.Config = filepath.Join(temp, "mihomo.yaml")
 	if err := config.Validate(candidateConfig); err != nil {
 		return err
 	}

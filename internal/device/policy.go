@@ -131,14 +131,16 @@ type RuleProvider struct {
 }
 
 type CompiledDevice struct {
-	ID            string            `json:"id"`
-	MAC           string            `json:"mac"`
-	IPv4          string            `json:"ipv4"`
-	Profile       string            `json:"profile"`
-	GatewayTarget string            `json:"gateway_target"`
-	EgressMode    string            `json:"egress_mode"`
-	IPv6Blocked   bool              `json:"ipv6_blocked,omitempty"`
-	Groups        map[string]string `json:"groups"` // slot (default or rule id) -> mihomo group name
+	ID                   string             `json:"id"`
+	MAC                  string             `json:"mac"`
+	IPv4                 string             `json:"ipv4"`
+	Profile              string             `json:"profile"`
+	GatewayTarget        string             `json:"gateway_target"`
+	EgressMode           string             `json:"egress_mode"`
+	ConfiguredEgressMode string             `json:"configured_egress_mode,omitempty"`
+	PolicyAdjustments    []PolicyAdjustment `json:"policy_adjustments,omitempty"`
+	IPv6Blocked          bool               `json:"ipv6_blocked,omitempty"`
+	Groups               map[string]string  `json:"groups"` // slot (default or rule id) -> mihomo group name
 }
 
 type CompiledPolicy struct {
@@ -425,6 +427,10 @@ func CompilePolicySet(set PolicySet) (CompiledPolicy, error) {
 // device. The declarative PolicySet remains unchanged and can become active
 // again after a MAC is supplied or the gateway returns to same_lan.
 func CompilePolicySetForIPOnlyMode(set PolicySet, ipOnlyDevicesActive bool) (CompiledPolicy, error) {
+	return compilePolicySet(set, ipOnlyDevicesActive, nil)
+}
+
+func compilePolicySet(set PolicySet, ipOnlyDevicesActive bool, resolution *PolicyResolution) (CompiledPolicy, error) {
 	if err := ValidatePolicySet(set); err != nil {
 		return CompiledPolicy{}, err
 	}
@@ -475,21 +481,41 @@ func CompilePolicySetForIPOnlyMode(set PolicySet, ipOnlyDevicesActive bool) (Com
 
 		defaultGroup := DeviceGroupName(device.ID, "default")
 		if device.EgressMode != EgressModeInheritGlobal {
-			device.Groups["default"] = defaultGroup
-			compiled.SelectorGroups = append(compiled.SelectorGroups, SelectorGroup{Name: defaultGroup, Policies: append([]string(nil), profile.DefaultPolicies...)})
-			compiled.SelectorTargets = append(compiled.SelectorTargets, profile.DefaultPolicies...)
+			policies, adjustment := resolution.resolveSelector(device.ID, "default", profile.DefaultPolicies)
+			if adjustment != nil {
+				device.PolicyAdjustments = append(device.PolicyAdjustments, *adjustment)
+			}
+			if len(policies) == 0 {
+				device.ConfiguredEgressMode = device.EgressMode
+				device.EgressMode = EgressModeInheritGlobal
+			} else {
+				device.Groups["default"] = defaultGroup
+				compiled.SelectorGroups = append(compiled.SelectorGroups, SelectorGroup{Name: defaultGroup, Policies: policies})
+				compiled.SelectorTargets = append(compiled.SelectorTargets, policies...)
+			}
 		}
 
 		for _, rule := range profile.Rules {
 			action := rule.Action
 			unsupported := resolveUnsupported(rule.OnUnsupported, profile.OnUnsupported)
 			if len(rule.Policies) > 0 {
+				policies, adjustment := resolution.resolveSelector(device.ID, rule.ID, rule.Policies)
+				if adjustment != nil {
+					device.PolicyAdjustments = append(device.PolicyAdjustments, *adjustment)
+				}
+				if len(policies) == 0 {
+					continue
+				}
 				group := DeviceGroupName(device.ID, rule.ID)
 				device.Groups[rule.ID] = group
-				compiled.SelectorGroups = append(compiled.SelectorGroups, SelectorGroup{Name: group, Policies: append([]string(nil), rule.Policies...)})
-				compiled.SelectorTargets = append(compiled.SelectorTargets, rule.Policies...)
+				compiled.SelectorGroups = append(compiled.SelectorGroups, SelectorGroup{Name: group, Policies: policies})
+				compiled.SelectorTargets = append(compiled.SelectorTargets, policies...)
 				action = group
 			} else {
+				if !resolution.targetAvailable(action) {
+					device.PolicyAdjustments = append(device.PolicyAdjustments, PolicyAdjustment{Slot: rule.ID, Effect: PolicyEffectSkipRule, MissingTargets: []string{action}})
+					continue
+				}
 				compiled.ActionTargets = append(compiled.ActionTargets, action)
 			}
 			variants, referenced, err := ruleVariants(rule.Match, ruleSets, templates)

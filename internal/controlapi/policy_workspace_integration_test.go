@@ -116,6 +116,77 @@ func TestPolicyWorkspaceOverlayOnlyRealCore(t *testing.T) {
 	}
 }
 
+func TestPolicyWorkspaceMissingDeviceEgressRealCore(t *testing.T) {
+	binary := os.Getenv("OMG_PREPARED_MIHOMO_BINARY")
+	if binary == "" {
+		t.Skip("set OMG_PREPARED_MIHOMO_BINARY for the real prepared-core egress fallback gate")
+	}
+	binary, err := filepath.Abs(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.DHCP.Enabled = false
+	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+	cfg.Mihomo.Binary, cfg.Mihomo.Config = binary, filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	cfg.DevicePolicy.File = filepath.Join(dir, "devices.json")
+	path := filepath.Join(dir, "config.yaml")
+	policy := `{"devices":[{"id":"phone","mac":"aa:bb:cc:dd:ee:01","ipv4":"192.168.50.101","profile":"home","egress_mode":"dedicated"}],"profiles":[{"id":"home","default_policies":["Surviving","Vanishing"],"rules":[{"id":"ruleset","match":{"rule_sets":["media"]},"policies":["Surviving","Vanishing"]},{"id":"template","match":{"template":"media"},"action":"Vanishing"}]}],"rule_sets":[{"id":"media","behavior":"domain","payload":["media.example"]}],"templates":[{"id":"media","rule_sets":["media"]}]}`
+	if err := writeAtomic(cfg.DevicePolicy.File, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := mihomo.StopPrepared(cfg); err != nil {
+			t.Errorf("stop prepared core: %v", err)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	full := "schema-version: 1\nenabled: true\nproxy-groups:\n  add:\n    - {name: Surviving, type: select, proxies: [DIRECT]}\n    - {name: Vanishing, type: select, proxies: [DIRECT]}\n"
+	input := PolicyWorkspaceInput{Request: PolicyWorkspaceRequest{Action: "read"}, Revision: fileDigest(path), ExpectedGatewayState: policyWorkspaceGatewayStopped, Overlay: []byte(full)}
+	if _, err := runPolicyWorkspace(ctx, path, input); err != nil {
+		t.Fatal(err)
+	}
+	for _, slot := range []string{"default", "ruleset"} {
+		input.Request = PolicyWorkspaceRequest{Action: "select", Group: "device/phone/" + slot, Policy: "Vanishing"}
+		if _, err := runPolicyWorkspace(ctx, path, input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	input.Request = PolicyWorkspaceRequest{Action: "read"}
+	input.Overlay = []byte(strings.ReplaceAll(full, "    - {name: Vanishing, type: select, proxies: [DIRECT]}\n", ""))
+	for range 3 {
+		response, err := runPolicyWorkspace(ctx, path, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, slot := range []string{"default", "ruleset"} {
+			if group := findWorkspaceGroup(response.Groups, "device/phone/"+slot); group != nil {
+				t.Fatalf("omitted selector reactivated on preview: %+v", group)
+			}
+		}
+	}
+	input.Overlay = []byte(full)
+	response, err := runPolicyWorkspace(ctx, path, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, slot := range []string{"default", "ruleset"} {
+		group := findWorkspaceGroup(response.Groups, "device/phone/"+slot)
+		if group == nil || group.Selected != "Vanishing" {
+			t.Fatalf("restored %s selection = %+v", slot, group)
+		}
+	}
+	after, err := os.ReadFile(cfg.DevicePolicy.File)
+	if err != nil || string(after) != policy {
+		t.Fatal("workspace rewrote original device settings")
+	}
+}
+
 // This gate exercises the Web GUI's no-Policies-visit startup transaction up
 // to (but deliberately excluding) gateway.Manager network takeover. A real
 // mihomo binary must accept the source-free candidate before it is persisted

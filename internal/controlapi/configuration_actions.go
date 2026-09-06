@@ -33,6 +33,9 @@ func defaultLockedProfileApplyDeps() profileApplyDeps {
 	return profileApplyDeps{
 		geteuid: os.Geteuid,
 		validate: func(cfg config.Config) error {
+			if err := config.PrepareDevicePolicy(&cfg); err != nil {
+				return err
+			}
 			temp, err := os.MkdirTemp(cfg.Runtime.Dir, ".profile-validation-*")
 			if err != nil {
 				return err
@@ -551,6 +554,9 @@ func applyDevicePolicy(ctx context.Context, configPath, revision string, payload
 	validation := cfg
 	validation.DevicePolicy.File = validationPolicy
 	validation.DevicePolicy.Bundle = &bundle
+	if err := config.PrepareDevicePolicy(&validation); err != nil {
+		return "", err
+	}
 	validation.Runtime.Dir = temp
 	validation.Mihomo.Config = filepath.Join(temp, "mihomo.yaml")
 	gateway.ReportProgress(ctx, "validating_config")

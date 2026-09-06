@@ -29,6 +29,9 @@ type DevicePolicyConfig struct {
 	File          string
 	ProtectedIPv4 []string
 	Bundle        *device.PolicyBundle
+	// SelectionCachePath stays bound to the original core work directory when
+	// a candidate is rendered in a temporary validation directory. Not persisted.
+	SelectionCachePath string
 }
 
 type GatewayConfig struct {

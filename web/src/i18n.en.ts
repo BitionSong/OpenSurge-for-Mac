@@ -1,4 +1,10 @@
 export const englishMessages: Record<string, string> = {
+  '部分出口已不在当前配置中': 'Some outbounds are missing from the current configuration',
+  '设备默认出口 {{targets}} 不存在，当前跟随网关规则。': 'Device default outbound {{targets}} is missing. Currently following gateway rules.',
+  '设备分流 {{slot}} 的出口 {{targets}} 不存在，当前已跳过这条分流。': 'Outbound {{targets}} for device route {{slot}} is missing. This route is currently skipped.',
+  '{{slot}} 已忽略失效候选 {{targets}}，保留当前有效出口。': '{{slot}} ignores missing candidates {{targets}} and keeps the current available outbound.',
+  '设备默认出口': 'Device default outbound',
+  '原始设置已保留；出口恢复后，下次启动或重载会重新应用。': 'Original settings are preserved and will apply again on the next start or reload after the outbound returns.',
   '操作结果尚未确认，请勿重复执行；可在全局进度卡重新查询状态。': 'The operation outcome is not yet confirmed. Do not repeat it; check its status in the progress card.',
   '正在提交操作': 'Submitting operation',
   '等待网关服务响应': 'Waiting for the gateway service',

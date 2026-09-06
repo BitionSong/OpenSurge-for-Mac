@@ -275,7 +275,8 @@ export type SourceSnapshotFile = {
 export type DeviceEgressMode = 'inherit_global' | 'dedicated'
 export type AppliedDeviceEgressMode = DeviceEgressMode | 'legacy_fallback'
 export type DeviceGatewayTarget = 'opensurge' | 'upstream_router'
-export type CompiledDevice = { id: string; mac: string; ipv4: string; profile: string; gateway_target?: DeviceGatewayTarget | ''; egress_mode?: AppliedDeviceEgressMode | ''; ipv6_blocked?: boolean; groups: Record<string, string> }
+export type PolicyAdjustment = { slot: string; effect: 'inherit_global' | 'skip_rule' | 'filter_candidates'; missing_targets: string[]; selected?: string }
+export type CompiledDevice = { id: string; mac: string; ipv4: string; profile: string; gateway_target?: DeviceGatewayTarget | ''; egress_mode?: AppliedDeviceEgressMode | ''; configured_egress_mode?: AppliedDeviceEgressMode; policy_adjustments?: PolicyAdjustment[]; ipv6_blocked?: boolean; groups: Record<string, string> }
 export type ObservedDevice = { ip: string; mac?: string; active_connections: number; neighbor_observed: boolean }
 export type DevicesResponse = {
   desired_digest?: string

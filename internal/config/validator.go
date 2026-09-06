@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -290,6 +291,13 @@ func bytesCompareIPv4(left, right net.IP) int {
 func PrepareDevicePolicy(cfg *Config) error {
 	if strings.TrimSpace(cfg.DevicePolicy.File) == "" {
 		return nil
+	}
+	if cfg.DevicePolicy.SelectionCachePath == "" {
+		directory := filepath.Dir(cfg.Mihomo.Config)
+		if cfg.Mihomo.ProfileMode == MihomoProfileModeImported && cfg.Mihomo.Profile != "" {
+			directory = filepath.Dir(cfg.Mihomo.Profile)
+		}
+		cfg.DevicePolicy.SelectionCachePath = filepath.Join(directory, "cache.db")
 	}
 	scope, err := cfg.LANScope()
 	if err != nil {
