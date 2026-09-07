@@ -15,10 +15,10 @@ places this notice and the referenced license texts under
   `patches/mihomo`. The listener reuses mihomo's existing gVisor/sing-tun data
   plane for the OpenSurge downstream IPv6 packet broker.
 - Source archive SHA-256:
-  `bf3a188a83475000df235178edf61cd70fda22b884b19a539d0cfd9b89a51e6a`
+  `971dd4533e4e2c3dad7473e8115200da8c0d7471b4b61da54da896345c5b3850`
 - Upstream: <https://github.com/MetaCubeX/mihomo>
 - Corresponding source:
-  <https://github.com/MetaCubeX/mihomo/tree/5184081ac327394d9e15fa5d5f9f4a61e723fd94>
+  <https://github.com/MetaCubeX/mihomo/tree/ac017cdd246ce8bd547653d927e7bf77d7ee73d5>
 - License text: [`LICENSE`](LICENSE)
 
 ## dnsmasq
