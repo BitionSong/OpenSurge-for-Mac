@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ControlConfig, GatewayPlan, Overview, Source } from './types'
+import type { ControlConfig, GatewayPlan, Overview, ProfileOverlay, Source } from './types'
 
 vi.mock('./api', () => ({
   authenticationRequiredEvent: 'opensurge:authentication-required',
@@ -10,6 +10,7 @@ vi.mock('./api', () => ({
     constructor(public status: number, public code: string, message: string) { super(message) }
   },
   waitForOperation: vi.fn(async () => ({ id: 'gateway-operation', kind: 'start', state: 'succeeded' })),
+  watchOperations: vi.fn(() => () => {}),
   api: {
     overview: vi.fn(),
     config: vi.fn(async () => ({
@@ -30,6 +31,7 @@ vi.mock('./api', () => ({
     saveConfig: vi.fn(),
     gateway: vi.fn(),
     setSleepPrevention: vi.fn(),
+    setUIPreferences: vi.fn(async (preferences: { language: 'system' | 'zh-Hans' | 'en' }) => ({ schema_version: 1, ...preferences })),
     operation: vi.fn(),
     gatewayPlan: vi.fn(async () => ({
       schema_version: 1,
@@ -55,6 +57,55 @@ vi.mock('./api', () => ({
     validateClient: vi.fn(),
     skipClientValidation: vi.fn(),
     sources: vi.fn(async () => ({ revision: 'config-revision', sources: [] })),
+	tailscale: vi.fn(async () => ({
+      schema_version: 1,
+      revision: 'config-revision',
+      settings: {
+        enabled: false,
+        display_name: 'Tailnet',
+        hostname: 'opensurge-mac',
+        control_url: 'https://controlplane.tailscale.com',
+        accept_routes: false,
+        magic_dns_suffixes: [],
+        peer_cidrs: [],
+        subnet_routes: [],
+        allow_mac: true,
+        allow_all_devices: false,
+        allowed_devices: [],
+        exit_node: '',
+        exit_node_allow_lan_access: false,
+      },
+      auth_key_present: false,
+      identity_present: false,
+      gateway_active: false,
+      runtime_state: 'disabled',
+      selectable_exit: false,
+		warnings: [],
+	})),
+	tailscaleDiscovery: vi.fn(async () => ({ schema_version: 1, available: false, magic_dns: false, peers: [] })),
+	saveTailscale: vi.fn(),
+	forgetTailscaleIdentity: vi.fn(),
+	profileOverlay: vi.fn(async () => ({
+      schema_version: 1,
+      revision: 'overlay-revision',
+      yaml: 'schema-version: 1\nenabled: false\n',
+      document: {
+        schema_version: 1,
+        enabled: false,
+        rules: { prepend: [], append_before_match: [] },
+        proxies: { add: [], replace: [] },
+        proxy_providers: { add: {}, replace: {} },
+        proxy_groups: { add: [], replace: [], patch: [] },
+        rule_providers: { add: {}, replace: {} },
+        dns: { merge: {}, append: {} },
+      },
+      desired: true,
+      applied: false,
+      validation: '附加配置未启用',
+    })),
+	saveProfileOverlayDocument: vi.fn(),
+	saveProfileOverlayYAML: vi.fn(),
+	sourcePreview: vi.fn(),
     importURL: vi.fn(),
     importFile: vi.fn(),
     refreshSource: vi.fn(),
@@ -65,6 +116,7 @@ vi.mock('./api', () => ({
     devices: vi.fn(async () => ({ devices: [], leases: [], drift: false, applied: false })),
     deviceTraffic: vi.fn(async () => ({ schema_version: 1, revision: 'r', sampled_at: '2026-07-13T00:00:00Z', scope: 'active_sessions', gateway_local: { ip: '192.168.1.20', mac: '', online: false, active_connections: 0, upload: 0, download: 0, upload_rate: 0, download_rate: 0, identity_source: 'gateway_local', transport: 'tun' }, devices: [], totals: { devices: 0, active_connections: 0, upload: 0, download: 0, upload_rate: 0, download_rate: 0 }, gateway_rates: { upload: 0, download: 0 }, unidentified_device_connections: 0, unclassified_connections: 0, unmatched_connections: 0 })),
     policies: vi.fn(async () => ({ groups: [] })),
+    policyWorkspace: vi.fn(async () => ({ schema_version: 1, mode: 'prepared', revision: 'workspace-1', groups: [], health: { schema_version: 1, test_url: 'https://www.gstatic.com/generate_204', proxies: [] } })),
     selectPolicy: vi.fn(),
     localRouting: vi.fn(async () => ({ schema_version: 1, mode: 'rule', available_modes: ['rule', 'direct'], udp_behavior: 'rules', transports: ['tun', 'loopback_explicit_proxy'], new_connections_only: true, consistent: true })),
     setLocalRouting: vi.fn(),
@@ -106,6 +158,28 @@ const overview: Overview = {
     },
   },
   sleep_prevention: { enabled: false, active: false },
+}
+
+function overlayForApp(overrides: Partial<ProfileOverlay> = {}): ProfileOverlay {
+  return {
+    schema_version: 1,
+    revision: 'overlay-revision',
+    yaml: 'schema-version: 1\nenabled: false\n',
+    document: {
+      schema_version: 1,
+      enabled: false,
+      rules: { prepend: [], append_before_match: [] },
+      proxies: { add: [], replace: [] },
+      proxy_providers: { add: {}, replace: {} },
+      proxy_groups: { add: [], replace: [], patch: [] },
+      rule_providers: { add: {}, replace: {} },
+      dns: { merge: {}, append: {} },
+    },
+    desired: true,
+    applied: false,
+    validation: '附加配置结构有效',
+    ...overrides,
+  }
 }
 
 function configFor(mode: ControlConfig['gateway']['mode']): ControlConfig {
@@ -166,6 +240,8 @@ describe('OpenSurge app shell', () => {
     scrollTo.mockReset()
     vi.mocked(api.overview).mockResolvedValue(overview)
     vi.mocked(api.config).mockResolvedValue(configFor('same_wifi_dhcp'))
+    vi.mocked(api.sources).mockResolvedValue({ revision: 'config-revision', sources: [] })
+    vi.mocked(api.profileOverlay).mockResolvedValue(overlayForApp())
     vi.mocked(api.deviceTraffic).mockResolvedValue({ schema_version: 1, revision: 'r', sampled_at: '2026-07-13T00:00:00Z', scope: 'active_sessions', gateway_local: { ip: '192.168.1.20', mac: '', online: false, active_connections: 0, upload: 0, download: 0, upload_rate: 0, download_rate: 0, identity_source: 'gateway_local', transport: 'tun' }, devices: [], totals: { devices: 0, active_connections: 0, upload: 0, download: 0, upload_rate: 0, download_rate: 0 }, gateway_rates: { upload: 0, download: 0 }, unidentified_device_connections: 0, unclassified_connections: 0, unmatched_connections: 0 })
   })
   afterEach(() => { cleanup(); vi.clearAllMocks(); vi.unstubAllGlobals() })
@@ -186,6 +262,19 @@ describe('OpenSurge app shell', () => {
     expect(screen.getByText('请点击 macOS 菜单栏中的 OpenSurge 图标，然后选择“打开 OpenSurge 面板”。')).toBeTruthy()
     expect(screen.queryByRole('button', { name: '重试' })).toBeNull()
     await waitFor(() => expect(close).toHaveBeenCalled())
+  })
+
+  it('changes the shared interface language from the polished Web GUI selector', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: '全屋网关，一眼可见' })
+
+    const selector = screen.getByRole('combobox', { name: '选择 OpenSurge Web GUI 和菜单栏使用的语言' })
+    await userEvent.selectOptions(selector, 'en')
+
+    await screen.findByRole('heading', { name: 'Your whole-home gateway at a glance' })
+    expect(api.setUIPreferences).toHaveBeenCalledWith({ language: 'en' })
+    expect(document.documentElement.lang).toBe('en')
+    expect(window.localStorage.getItem('opensurge-ui-language')).toBe('en')
   })
 
   it('does not present a saved recovery card as an unfinished network recovery', async () => {
@@ -382,6 +471,8 @@ describe('OpenSurge app shell', () => {
     vi.mocked(api.overview).mockResolvedValue(overviewFor('same_lan', 'stopped'))
     vi.mocked(api.config).mockResolvedValue(configFor('same_lan'))
     vi.mocked(api.gateway).mockResolvedValue({ id: 'start-same-lan', kind: 'start', state: 'running' })
+    let completeStart!: () => void
+    vi.mocked(waitForOperation).mockImplementationOnce(() => new Promise(resolve => { completeStart = () => resolve({ id: 'start-same-lan', kind: 'start', state: 'succeeded' }) }))
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<App />)
 
@@ -400,6 +491,9 @@ describe('OpenSurge app shell', () => {
     expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('路由器 DHCP 不会被关闭'))
     expect(api.gateway).toHaveBeenCalledWith('start')
     expect(waitForOperation).toHaveBeenCalledWith('start-same-lan')
+    expect((screen.getByRole('button', { name: '保存网络配置' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByRole('button', { name: '正在保存…' })).toBeNull()
+    await act(async () => completeStart())
     expect(await screen.findByText('旁路由模式已启动。')).toBeTruthy()
     expect(screen.getByText('启动网关成功')).toBeTruthy()
   })
@@ -822,15 +916,34 @@ describe('OpenSurge app shell', () => {
     const systemProxy = await screen.findByRole('checkbox', { name: '同时启用 macOS HTTP/HTTPS 系统代理' })
     expect(systemProxy.hasAttribute('disabled')).toBe(false)
     expect(screen.getByText(/SafeDNS、DNS Proxy、内容过滤/)).toBeTruthy()
-    expect(screen.getAllByText('已关闭').length).toBeGreaterThanOrEqual(2)
+    expect(screen.getAllByText('已关闭').length).toBeGreaterThanOrEqual(1)
     await userEvent.click(systemProxy)
     expect(systemProxy.closest('label')?.classList.contains('is-on')).toBe(true)
-    const devicePolicy = screen.getByRole('checkbox', { name: '启用每设备策略' })
-    await userEvent.click(devicePolicy)
-    expect(devicePolicy.closest('label')?.classList.contains('is-on')).toBe(true)
-    expect(screen.getAllByText('已开启').length).toBeGreaterThanOrEqual(2)
+    expect(screen.queryByRole('checkbox', { name: '启用每设备策略' })).toBeNull()
+    expect(screen.queryByText('device_policy.file')).toBeNull()
     await userEvent.click(screen.getByRole('button', { name: '保存网络配置' }))
     await waitFor(() => expect(api.saveConfig).toHaveBeenCalledWith(expect.objectContaining({ local_system_proxy: { enabled: true }, device_policy: { enabled: true, protected_ipv4: [] } })))
+  })
+
+  it('always enables device policy when saving a legacy config and keeps protected addresses editable', async () => {
+    vi.mocked(api.saveConfig).mockImplementation(async config => ({ ...config, revision: 'updated-revision' }))
+    render(<App />)
+    await userEvent.click(await screen.findByRole('button', { name: '网络设置' }))
+    const protectedAddresses = await screen.findByLabelText('受保护的 IPv4')
+    expect(protectedAddresses.hasAttribute('disabled')).toBe(false)
+    expect(screen.queryByRole('checkbox', { name: '启用每设备策略' })).toBeNull()
+    await userEvent.type(protectedAddresses, '192.168.1.2, 192.168.1.3')
+    await userEvent.click(screen.getByRole('button', { name: '保存网络配置' }))
+    await waitFor(() => expect(api.saveConfig).toHaveBeenCalledWith(expect.objectContaining({ device_policy: { enabled: true, protected_ipv4: ['192.168.1.2', '192.168.1.3'] } })))
+  })
+
+  it('guides a legacy device configuration to network settings without a policy toggle', async () => {
+    render(<App />)
+    await userEvent.click(await screen.findByRole('button', { name: '设备' }))
+    expect(await screen.findByText('请先在网络设置中保存一次配置，设备管理会自动完成初始化。')).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: '前往网络设置' }))
+    expect(await screen.findByRole('button', { name: '保存网络配置' })).toBeTruthy()
+    expect(screen.queryByRole('checkbox', { name: '启用每设备策略' })).toBeNull()
   })
 
   it('keeps Mihomo and DNS controls in a collapsed advanced group and saves fake-IP persistence', async () => {
@@ -1138,6 +1251,43 @@ describe('OpenSurge app shell', () => {
     expect(await screen.findByRole('button', { name: '正在导入并校验…' })).toBeTruthy()
   })
 
+  it('imports one YAML file by dropping it onto the existing local source area', async () => {
+    vi.mocked(api.importFile).mockImplementationOnce(() => new Promise<Source>(() => {}))
+    render(<App />)
+    await screen.findByRole('heading', { name: '全屋网关，一眼可见' })
+    await userEvent.click(screen.getByRole('button', { name: '代理与规则源' }))
+
+    const input = screen.getByLabelText('本地 mihomo YAML')
+    const dropzone = input.closest('label')
+    if (!dropzone) throw new Error('missing local YAML dropzone')
+    const sourceLibrary = document.querySelector('.source-library')
+    const overlayPanel = document.querySelector('.profile-overlay-panel')
+    expect(sourceLibrary && overlayPanel && Boolean(sourceLibrary.compareDocumentPosition(overlayPanel) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
+    const file = new File(['proxies: []\nrules:\n  - MATCH,DIRECT\n'], 'home.yaml', { type: 'text/yaml' })
+
+    fireEvent.dragEnter(dropzone, { dataTransfer: { files: [file] } })
+    expect(dropzone.classList.contains('drag-active')).toBe(true)
+    expect(screen.getByText('松开即可导入')).toBeTruthy()
+    fireEvent.drop(dropzone, { dataTransfer: { files: [file] } })
+
+    expect(dropzone.classList.contains('drag-active')).toBe(false)
+    expect(api.importFile).toHaveBeenCalledWith(file)
+    expect(await screen.findByText('正在读取并校验…')).toBeTruthy()
+  })
+
+  it('rejects a non-YAML file dropped onto the local source area', async () => {
+    render(<App />)
+    await screen.findByRole('heading', { name: '全屋网关，一眼可见' })
+    await userEvent.click(screen.getByRole('button', { name: '代理与规则源' }))
+
+    const dropzone = screen.getByLabelText('本地 mihomo YAML').closest('label')
+    if (!dropzone) throw new Error('missing local YAML dropzone')
+    fireEvent.drop(dropzone, { dataTransfer: { files: [new File(['hello'], 'notes.txt', { type: 'text/plain' })] } })
+
+    expect(await screen.findByText('只能导入 .yaml 或 .yml 文件。')).toBeTruthy()
+    expect(api.importFile).not.toHaveBeenCalled()
+  })
+
   it('renders an invalid Base64 source draft when API collections are null', async () => {
     const source = {
       id: 'base64', name: 'Base64 nodes', kind: 'mihomo_profile', origin: 'https://example.com/subscription', digest: 'invalid', size: 24,
@@ -1235,6 +1385,56 @@ describe('OpenSurge app shell', () => {
     resolveApply({ ...source, desired: true, applied: true })
     expect(await screen.findByText('订阅已应用，网关已使用新的运行配置。')).toBeTruthy()
     expect(screen.getByText('应用并重载网关成功')).toBeTruthy()
+  })
+
+  it('allows a pending global overlay to be applied to a stopped desired source', async () => {
+    const source: Source = {
+      id: 'home', name: 'Home', kind: 'mihomo_profile', origin: 'file:home.yaml', digest: 'next', size: 100,
+      valid: true, validation: 'valid', desired: true, applied: false, versions: [], imported_at: '2026-08-24T00:00:00Z',
+      diff: { proxies_added: [], proxies_removed: [], groups_added: [], groups_removed: [], proxy_providers_added: [], proxy_providers_removed: [], rule_providers_added: [], rule_providers_removed: [], rule_count_delta: 0 },
+      inventory: { proxies: ['edge'], proxy_providers: [], proxy_groups: ['Main'], rule_providers: [], rule_count: 1, terminal_match: true, warnings: [] },
+      overlay_compatible: true,
+      overlay_validation: 'compatible',
+    }
+    vi.mocked(api.sources).mockResolvedValue({ revision: 'config-revision', sources: [source] })
+    vi.mocked(api.profileOverlay).mockResolvedValue(overlayForApp({
+      desired: false,
+      document: { ...overlayForApp().document, enabled: true },
+    }))
+
+    render(<App />)
+    await screen.findByRole('heading', { name: '全屋网关，一眼可见' })
+    await userEvent.click(screen.getByRole('button', { name: '代理与规则源' }))
+
+    const applyButton = await screen.findByRole('button', { name: '保存附加配置到下次启动' })
+    expect((applyButton as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.getByText('附加配置待应用')).toBeTruthy()
+  })
+
+  it('offers applied overlay proxies as device outlet candidates', async () => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...configFor('same_wifi_dhcp'),
+      device_policy: { enabled: true, protected_ipv4: [] },
+    })
+    vi.mocked(api.devicePolicy).mockResolvedValue({ schema_version: 1, revision: 'policy-r', policy: { devices: [], profiles: [], templates: [], rule_sets: [] } })
+    vi.mocked(api.profileOverlay).mockResolvedValue(overlayForApp({ applied: true, document: { ...overlayForApp().document, enabled: true } }))
+    vi.mocked(api.sources).mockResolvedValue({
+      revision: 'config-revision',
+      sources: [{
+        id: 'home', name: 'Home', kind: 'mihomo_profile', origin: 'file:home.yaml', digest: 'source', size: 100,
+        valid: true, validation: 'valid', desired: true, applied: true, versions: [], imported_at: '2026-08-24T00:00:00Z',
+        diff: { proxies_added: [], proxies_removed: [], groups_added: [], groups_removed: [], proxy_providers_added: [], proxy_providers_removed: [], rule_providers_added: [], rule_providers_removed: [], rule_count_delta: 0 },
+        inventory: { proxies: ['edge'], proxy_providers: [], proxy_groups: ['Main'], rule_providers: [], rule_count: 1, terminal_match: true, warnings: [] },
+        effective_inventory: { proxies: ['edge', 'Personal'], proxy_providers: [], proxy_groups: ['Main'], rule_providers: [], rule_count: 1, terminal_match: true, warnings: [] },
+      }],
+    })
+
+    render(<App />)
+    await screen.findByRole('heading', { name: '全屋网关，一眼可见' })
+    await userEvent.click(screen.getByRole('button', { name: '设备' }))
+    await userEvent.click(await screen.findByRole('radio', { name: /独立设备出口/ }))
+
+    await waitFor(() => expect(document.querySelector('datalist option[value="Personal"]')).toBeTruthy())
   })
 
   it('edits templates in the structured device policy editor', async () => {

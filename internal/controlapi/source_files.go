@@ -111,29 +111,53 @@ func managedSourceSnapshotPath(storeDir string, source Source) (string, error) {
 }
 
 func validatedSourceSnapshotPath(storeDir string, source Source) (string, error) {
+	_, path, err := readValidatedSourceSnapshot(storeDir, source)
+	return path, err
+}
+
+// readValidatedSourceSnapshot verifies and reads the same opened file. Keeping
+// the fstat, permission check, bounded read, and digest check on one descriptor
+// prevents a managed snapshot from being swapped between validation and the
+// composition used by preview or apply.
+func readValidatedSourceSnapshot(storeDir string, source Source) ([]byte, string, error) {
 	path, err := managedSourceSnapshotPath(storeDir, source)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
-		return "", fmt.Errorf("read managed source snapshot: %w", err)
+		return nil, "", fmt.Errorf("read managed source snapshot: %w", err)
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("managed source snapshot is not a regular file")
+		return nil, "", fmt.Errorf("managed source snapshot is not a regular file")
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return "", fmt.Errorf("managed source snapshot must not grant group or other access")
-	}
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("read managed source snapshot: %w", err)
+		return nil, "", fmt.Errorf("open managed source snapshot: %w", err)
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, "", fmt.Errorf("stat managed source snapshot: %w", err)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		return nil, "", fmt.Errorf("managed source snapshot changed while it was being opened")
+	}
+	if openedInfo.Mode().Perm()&0o077 != 0 {
+		return nil, "", fmt.Errorf("managed source snapshot must not grant group or other access")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxSourceSize+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("read managed source snapshot: %w", err)
+	}
+	if len(data) > maxSourceSize {
+		return nil, "", fmt.Errorf("managed source snapshot exceeds %d bytes", maxSourceSize)
 	}
 	digest := sha256.Sum256(data)
 	if hex.EncodeToString(digest[:]) != source.Digest {
-		return "", fmt.Errorf("managed source snapshot content no longer matches its recorded digest; refresh or re-import the source")
+		return nil, "", fmt.Errorf("managed source snapshot content no longer matches its recorded digest; refresh or re-import the source")
 	}
-	return path, nil
+	return data, path, nil
 }
 
 func validHexValue(value string, length int) bool {

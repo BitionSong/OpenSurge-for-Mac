@@ -18,13 +18,14 @@ import (
 // CanonicalJSON and Digest identify the exact declarative source, while
 // Compiled contains the shared DHCP and mihomo representation derived from it.
 type PolicyBundle struct {
-	SchemaVersion       int             `json:"schema_version"`
-	Digest              string          `json:"digest"`
-	CanonicalJSON       json.RawMessage `json:"canonical_json"`
-	Policy              PolicySet       `json:"policy"`
-	Compiled            CompiledPolicy  `json:"compiled"`
-	IPOnlyDevicesActive bool            `json:"ip_only_devices_active,omitempty"`
-	ActiveLAN           string          `json:"active_lan,omitempty"`
+	SchemaVersion       int               `json:"schema_version"`
+	Digest              string            `json:"digest"`
+	CanonicalJSON       json.RawMessage   `json:"canonical_json"`
+	Policy              PolicySet         `json:"policy"`
+	Compiled            CompiledPolicy    `json:"compiled"`
+	IPOnlyDevicesActive bool              `json:"ip_only_devices_active,omitempty"`
+	ActiveLAN           string            `json:"active_lan,omitempty"`
+	Resolution          *PolicyResolution `json:"resolution,omitempty"`
 }
 
 func LoadPolicyBundle(path string) (PolicyBundle, error) {
@@ -129,7 +130,7 @@ func LoadPolicyBundleSnapshot(path string) (PolicyBundle, error) {
 		}
 		active = activePolicySetForNetwork(bundle.Policy, network)
 	}
-	compiled, err := CompilePolicySetForIPOnlyMode(active, bundle.IPOnlyDevicesActive)
+	compiled, err := compilePolicySet(active, bundle.IPOnlyDevicesActive, bundle.Resolution)
 	if err != nil {
 		return PolicyBundle{}, fmt.Errorf("compile applied device policy bundle: %w", err)
 	}

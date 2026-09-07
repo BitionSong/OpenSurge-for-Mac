@@ -187,6 +187,10 @@ func (s *Server) evaluateMihomoRecovery(ctx context.Context) {
 		s.mihomoRecovery.observeUnknown()
 		return
 	}
+	if busy, err := gateway.LifecycleOperationInProgress(cfg); err != nil || busy {
+		s.mihomoRecovery.observeUnknown()
+		return
+	}
 	status, err := s.gatewayStatus(ctx, cfg)
 	if err != nil || status.RuntimeState != "active" {
 		s.mihomoRecovery.observeUnknown()
@@ -196,6 +200,13 @@ func (s *Server) evaluateMihomoRecovery(ctx context.Context) {
 	reason := mihomoFailureReason(status)
 	if reason == "" {
 		s.mihomoRecovery.observeHealthy()
+		return
+	}
+	// Close the observation-to-action race with an external omg lifecycle
+	// command. The Manager lock remains the final guard if another operation
+	// starts after this advisory check.
+	if busy, err := gateway.LifecycleOperationInProgress(cfg); err != nil || busy {
+		s.mihomoRecovery.observeUnknown()
 		return
 	}
 
@@ -215,21 +226,13 @@ func (s *Server) evaluateMihomoRecovery(ctx context.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
-	op := Operation{
-		SchemaVersion: SchemaVersion,
-		ID:            "auto-restart-mihomo-" + randomToken(8),
-		Kind:          "restart-mihomo",
-		State:         "running",
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}
-	if err := s.store.SaveOperation(op); err != nil {
+	op := newOperation("auto-restart-mihomo-"+randomToken(8), "restart-mihomo")
+	if err := s.store.CreateOperation(op); err != nil {
 		s.lifecycleMu.Unlock()
 		s.mihomoRecovery.finishAutomatic(err)
 		return
 	}
-	go s.runOperationLocked(op, cfg.Gateway.Mode, recovery, s.mihomoRecovery.finishAutomatic)
+	go s.runOperationLocked(op, cfg.Gateway.Mode, recovery, nil, s.mihomoRecovery.finishAutomatic)
 }
 
 func mihomoFailureReason(status gateway.Status) string {

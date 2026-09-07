@@ -62,6 +62,21 @@ func TestValidateConfigWithTimeoutReportsSlowEngine(t *testing.T) {
 	}
 }
 
+func TestValidateConfigHonorsActionContext(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "mihomo")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := validateConfigContext(ctx, configValidationTimeout, binary, dir, filepath.Join(dir, "mihomo.yaml"))
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second {
+		t.Fatalf("validator ignored enclosing action deadline: elapsed=%s err=%v", time.Since(started), err)
+	}
+}
+
 func TestWaitForTUNWaitsForEnabledRuntimeState(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -200,6 +215,42 @@ func TestPatchedMihomoAcceptsIPv6PacketListenerConfig(t *testing.T) {
 	manager := New(cfg, runtime.NewPaths(cfg))
 	if err := manager.ValidateConfig(); err != nil {
 		t.Fatalf("patched Mihomo rejected OpenSurge IPv6 listener config: %v", err)
+	}
+}
+
+func TestPatchedMihomoAcceptsManagedTailscaleOutboundConfig(t *testing.T) {
+	binary := os.Getenv("OPENSURGE_TEST_PATCHED_MIHOMO")
+	if binary == "" {
+		t.Skip("OPENSURGE_TEST_PATCHED_MIHOMO is not set")
+	}
+	dir := t.TempDir()
+	authKey := filepath.Join(dir, "tailscale-auth-key")
+	if err := os.WriteFile(authKey, []byte("tskey-auth-validation-only\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Runtime.Dir = dir
+	cfg.Mihomo.Binary = binary
+	cfg.Mihomo.Config = filepath.Join(dir, "mihomo.yaml")
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.Tailscale = config.TailscaleConfig{
+		Enabled:                true,
+		DisplayName:            "Test Tailnet",
+		Hostname:               "opensurge-test",
+		ControlURL:             "https://controlplane.tailscale.com",
+		AuthKeyFile:            authKey,
+		StateDir:               filepath.Join(dir, "tailscale-state"),
+		AcceptRoutes:           true,
+		MagicDNSSuffixes:       []string{"example.ts.net"},
+		PeerCIDRs:              []string{"100.82.10.7/32"},
+		SubnetRoutes:           []string{"10.20.0.0/16"},
+		AllowMac:               true,
+		ExitNode:               "100.90.3.4",
+		ExitNodeAllowLANAccess: true,
+	}
+	manager := New(cfg, runtime.NewPaths(cfg))
+	if err := manager.ValidateConfig(); err != nil {
+		t.Fatalf("patched Mihomo rejected managed Tailscale outbound config: %v", err)
 	}
 }
 

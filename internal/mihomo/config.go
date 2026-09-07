@@ -64,6 +64,11 @@ tun:
 {{- end }}
   dns-hijack:
     - any:53
+{{- if .TUNRouteAddresses }}
+  route-address:
+{{ .TUNRouteAddresses }}
+{{- end }}
+{{- if not .TUNCustomRoutes }}
   route-exclude-address:
     - {{ .LANPrefix }}
     - 127.0.0.0/8
@@ -72,6 +77,7 @@ tun:
     - 192.168.0.0/16
     - 224.0.0.0/4
     - 255.255.255.255/32
+{{- end }}
 
 {{ end }}
 {{ if .TUNIPv6Enabled }}
@@ -111,6 +117,8 @@ type templateData struct {
 	TUNAutoRoute           bool
 	TUNAutoDetectInterface bool
 	TUNStrictRoute         bool
+	TUNRouteAddresses      string
+	TUNCustomRoutes        bool
 	IPv6Enabled            bool
 	TUNIPv6Enabled         bool
 	TUNIPv6Address         string
@@ -147,6 +155,9 @@ func newTemplateData(cfg config.Config) (templateData, error) {
 		imported = &loaded
 		dnsResolverFields = loaded.dnsResolverFields
 	}
+	if err := resolveDevicePolicy(&cfg, imported); err != nil {
+		return templateData{}, err
+	}
 	policySections, err := renderPolicySections(cfg, imported)
 	if err != nil {
 		return templateData{}, err
@@ -156,6 +167,7 @@ func newTemplateData(cfg config.Config) (templateData, error) {
 	if err != nil {
 		return templateData{}, fmt.Errorf("resolve IPv6 packet socket: %w", err)
 	}
+	tunRouteAddresses := renderTailscaleRouteAddresses(cfg, lanPrefix)
 	return templateData{
 		MihomoConfig:           cfg.Mihomo,
 		TUNEnabled:             transparent.TUNEnabled(),
@@ -164,6 +176,8 @@ func newTemplateData(cfg config.Config) (templateData, error) {
 		TUNAutoRoute:           transparent.TUNAutoRoute,
 		TUNAutoDetectInterface: transparent.TUNAutoDetectInterface,
 		TUNStrictRoute:         transparent.TUNStrictRoute,
+		TUNRouteAddresses:      tunRouteAddresses,
+		TUNCustomRoutes:        tunRouteAddresses != "",
 		IPv6Enabled:            cfg.DNS.IPv6 || transparent.TUNIPv6 != config.TUNIPv6Off,
 		TUNIPv6Enabled:         transparent.TUNIPv6 != config.TUNIPv6Off,
 		TUNIPv6Address:         config.MihomoTUNIPv6,

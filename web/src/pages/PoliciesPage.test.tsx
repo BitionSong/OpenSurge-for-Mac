@@ -1,15 +1,16 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRef, useState } from 'react'
-import type { LocalRouting, Overview, ProxyHealthSnapshot } from '../types'
+import type { LocalRouting, Overview, PolicyWorkspaceSnapshot, ProxyHealthSnapshot } from '../types'
 
 vi.mock('../api', () => ({
   api: {
     proxyHealth: vi.fn(),
     testProxyHealth: vi.fn(),
     selectPolicy: vi.fn(),
+    policyWorkspace: vi.fn(),
     localRouting: vi.fn(),
     setLocalRouting: vi.fn(),
   },
@@ -17,6 +18,7 @@ vi.mock('../api', () => ({
 
 import { api } from '../api'
 import { PoliciesPage, type PoliciesViewState } from './PoliciesPage'
+import { activateLanguage, prepareLanguage } from '../i18n'
 
 const health: ProxyHealthSnapshot = {
   schema_version: 1,
@@ -36,7 +38,9 @@ const overview = {
   ],
 } as unknown as Overview
 
-function PoliciesPageHarness({ data = overview, onChanged = async () => {} }: { data?: Overview; onChanged?: () => Promise<void> }) {
+let workspace: PolicyWorkspaceSnapshot
+
+function PoliciesPageHarness({ data = overview, onChanged = async () => {} }: { data?: Overview | null; onChanged?: () => Promise<void> }) {
   const [viewState, setViewState] = useState<PoliciesViewState>({ search: '', scope: 'global', activeGroup: null })
   return <PoliciesPage overview={data} onChanged={onChanged} viewState={viewState} onViewStateChange={patch => setViewState(current => ({ ...current, ...patch }))} restoreScrollY={null} onScrollPositionChange={() => {}} />
 }
@@ -56,6 +60,11 @@ function PoliciesSessionHarness() {
     <button type="button" onClick={() => setVisible(current => !current)}>{visible ? '离开策略页' : '返回策略页'}</button>
     {visible ? <PoliciesPage overview={data} onChanged={async () => {}} viewState={viewState} onViewStateChange={patch => setViewState(current => ({ ...current, ...patch }))} restoreScrollY={scrollPosition.current} onScrollPositionChange={scrollY => { scrollPosition.current = scrollY }} /> : null}
   </>
+}
+
+function renderSessionPage() {
+  workspace.groups.push({ name: 'Streaming', type: 'Selector', selected: 'Proxy-A', options: ['Proxy-A', 'Proxy-B'] })
+  return render(<PoliciesSessionHarness />)
 }
 
 function localRouting(mode: LocalRouting['mode'] = 'rule', selected = 'Proxy-A'): LocalRouting {
@@ -78,11 +87,18 @@ describe('PoliciesPage', () => {
     vi.mocked(api.proxyHealth).mockResolvedValue(health)
     vi.mocked(api.testProxyHealth).mockResolvedValue({ schema_version: 1, test_url: health.test_url, results: [] })
     vi.mocked(api.selectPolicy).mockResolvedValue({} as never)
+    workspace = { schema_version: 1, mode: 'running', revision: 'workspace-1', groups: structuredClone(overview.policies), health: structuredClone(health) }
+    vi.mocked(api.policyWorkspace).mockImplementation(async request => {
+      if (request.action === 'select') {
+        workspace = { ...workspace, groups: workspace.groups.map(group => group.name === request.group ? { ...group, selected: request.policy } : group) }
+      }
+      return structuredClone(workspace)
+    })
     vi.mocked(api.localRouting).mockResolvedValue(localRouting())
     vi.mocked(api.setLocalRouting).mockImplementation(async (mode, policy) => localRouting(mode, policy ?? 'Proxy-A'))
   })
 
-  afterEach(() => { cleanup(); vi.clearAllMocks(); vi.restoreAllMocks() })
+  afterEach(() => { cleanup(); vi.clearAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); activateLanguage('zh-Hans') })
 
   it('shows global node health, filters device groups, and switches selector nodes', async () => {
     const onChanged = vi.fn(async () => {})
@@ -94,7 +110,9 @@ describe('PoliciesPage', () => {
     expect(screen.getByText('超时')).toBeTruthy()
 
     await userEvent.click(screen.getByRole('button', { name: 'Main 选择 Proxy-B' }))
-    await waitFor(() => expect(api.selectPolicy).toHaveBeenCalledWith('Main', 'Proxy-B'))
+    await waitFor(() => expect(api.policyWorkspace).toHaveBeenCalledWith({ action: 'select', group: 'Main', policy: 'Proxy-B' }))
+    expect(screen.getByRole('button', { name: 'Main 选择 Proxy-B' }).getAttribute('aria-pressed')).toBe('true')
+    expect(api.selectPolicy).not.toHaveBeenCalled()
     expect(onChanged).toHaveBeenCalledOnce()
 
     await userEvent.click(screen.getByRole('button', { name: '设备策略' }))
@@ -106,7 +124,251 @@ describe('PoliciesPage', () => {
     render(<PoliciesPageHarness />)
     await screen.findAllByText('86 ms')
     await userEvent.click(screen.getByRole('button', { name: '检测当前视图' }))
-    await waitFor(() => expect(api.testProxyHealth).toHaveBeenCalledWith(['Proxy-A', 'Proxy-B']))
+    await waitFor(() => expect(api.policyWorkspace).toHaveBeenCalledWith({ action: 'test', names: ['Proxy-A', 'Proxy-B'] }))
+    expect(api.testProxyHealth).not.toHaveBeenCalled()
+  })
+
+  it('prepares and selects nodes before the gateway starts without using overview policies', async () => {
+    workspace.mode = 'prepared'
+    workspace.groups.push({ name: 'Extension', type: 'Selector', selected: 'Proxy-A', options: ['Proxy-A', 'Proxy-B'] })
+    const stopped = { ...overview, policies: [], status: { ...overview.status, gateway: 'stopped', mihomo: 'stopped' } }
+    render(<PoliciesPageHarness data={stopped} />)
+
+    expect(await screen.findByText('待启动配置')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Extension' })).toBeTruthy()
+    expect(api.policyWorkspace).toHaveBeenCalledWith({ action: 'read' })
+    expect(api.localRouting).not.toHaveBeenCalled()
+    expect(api.proxyHealth).not.toHaveBeenCalled()
+    expect(screen.getByText('启动网关后可用')).toBeTruthy()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Extension 选择 Proxy-B' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Extension 选择 Proxy-B' }).getAttribute('aria-pressed')).toBe('true'))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('tests nodes in prepared mode and adopts the returned health snapshot', async () => {
+    workspace.mode = 'prepared'
+    render(<PoliciesPageHarness data={null} />)
+    await screen.findByText('待启动配置')
+    workspace.health.proxies[0] = { ...workspace.health.proxies[0], delay_ms: 42 }
+    await userEvent.click(screen.getByRole('button', { name: '检测当前视图' }))
+
+    expect(await screen.findByText('42 ms')).toBeTruthy()
+    expect(api.policyWorkspace).toHaveBeenCalledWith({ action: 'test', names: ['Proxy-A', 'Proxy-B'] })
+  })
+
+  it('renders an empty current configuration without a stopped-core error or prompt', async () => {
+    workspace = { ...workspace, mode: 'prepared', groups: [], health: { schema_version: 1, test_url: '', proxies: [] } }
+    render(<PoliciesPageHarness data={null} />)
+
+    expect(await screen.findByText('当前配置还没有策略组；可以导入 mihomo YAML，也可以只在“全局附加配置”中添加节点与策略组。')).toBeTruthy()
+    expect((screen.getByRole('button', { name: '检测当前视图' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText('mihomo 未运行或没有可选择的策略组')).toBeNull()
+  })
+
+  it('clears the previous prepared graph when the new candidate fails and recovers on retry', async () => {
+    workspace.mode = 'prepared'
+    const page = render(<PoliciesPageHarness data={null} />)
+    await screen.findByRole('heading', { name: 'Main' })
+    vi.mocked(api.policyWorkspace).mockRejectedValueOnce(new Error('overlay target Missing does not exist'))
+    page.rerender(<PoliciesPageHarness data={{ ...overview, revision: 'changed-draft' }} />)
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('overlay target Missing does not exist'))
+    expect(screen.queryByRole('heading', { name: 'Main' })).toBeNull()
+    expect(screen.queryByText('待启动配置')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: '重试' }))
+    expect(await screen.findByRole('heading', { name: 'Main' })).toBeTruthy()
+    expect(screen.getByText('待启动配置')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('accepts null groups and health from an empty backend snapshot', async () => {
+    vi.mocked(api.policyWorkspace).mockResolvedValue({ ...workspace, mode: 'prepared', groups: null, health: null } as unknown as PolicyWorkspaceSnapshot)
+    render(<PoliciesPageHarness data={null} />)
+
+    expect(await screen.findByText('当前配置还没有策略组；可以导入 mihomo YAML，也可以只在“全局附加配置”中添加节点与策略组。')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('accepts null candidate and health arrays without inventing nodes', async () => {
+    vi.mocked(api.policyWorkspace).mockResolvedValue({ ...workspace, groups: [{ ...workspace.groups[0], options: null }], health: { ...health, proxies: null } } as unknown as PolicyWorkspaceSnapshot)
+    render(<PoliciesPageHarness data={null} />)
+
+    expect(await screen.findByRole('heading', { name: 'Main' })).toBeTruthy()
+    expect(screen.getByText('这个策略组中没有匹配的节点')).toBeTruthy()
+    expect((screen.getByRole('button', { name: '检测当前视图' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('shows a preparation failure and retries only the read action', async () => {
+    vi.mocked(api.policyWorkspace).mockRejectedValueOnce(new Error('Configuration rejected'))
+    render(<PoliciesPageHarness data={null} />)
+
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Configuration rejected'))
+    expect(screen.queryByText('当前配置还没有策略组；可以导入 mihomo YAML，也可以只在“全局附加配置”中添加节点与策略组。')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: '重试' }))
+    expect(await screen.findByRole('heading', { name: 'Main' })).toBeTruthy()
+    expect(api.policyWorkspace).toHaveBeenNthCalledWith(2, { action: 'read' })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('discards stale policy data after a failed selection and preserves the engine choice on retry', async () => {
+    render(<PoliciesPageHarness data={null} />)
+    await screen.findByRole('heading', { name: 'Main' })
+    vi.mocked(api.policyWorkspace).mockRejectedValueOnce(new Error('Selection rejected'))
+    await userEvent.click(screen.getByRole('button', { name: 'Main 选择 Proxy-B' }))
+
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Selection rejected'))
+    expect(screen.queryByRole('heading', { name: 'Main' })).toBeNull()
+    expect(api.policyWorkspace).toHaveBeenCalledTimes(2)
+    await userEvent.click(screen.getByRole('button', { name: '重试' }))
+    expect((await screen.findByRole('button', { name: 'Main 选择 Proxy-A' })).getAttribute('aria-pressed')).toBe('true')
+    expect(api.policyWorkspace).toHaveBeenLastCalledWith({ action: 'read' })
+  })
+
+  it('shows delay-test errors without replaying the test', async () => {
+    render(<PoliciesPageHarness data={null} />)
+    await screen.findByRole('heading', { name: 'Main' })
+    vi.mocked(api.policyWorkspace).mockRejectedValueOnce(new Error('Test unavailable'))
+    await userEvent.click(screen.getByRole('button', { name: '检测当前视图' }))
+
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('Test unavailable'))
+    expect((screen.getByRole('button', { name: '检测当前视图' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(api.policyWorkspace).toHaveBeenCalledTimes(2)
+  })
+
+  it('refreshes on overview revisions and ignores a late read after a selection', async () => {
+    const page = render(<PoliciesPageHarness />)
+    await screen.findByRole('heading', { name: 'Main' })
+    const oldSnapshot = structuredClone(workspace)
+    let finishRead!: (snapshot: PolicyWorkspaceSnapshot) => void
+    vi.mocked(api.policyWorkspace).mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve }))
+    page.rerender(<PoliciesPageHarness data={{ ...overview, revision: 'updated' }} />)
+    await waitFor(() => expect(api.policyWorkspace).toHaveBeenCalledTimes(2))
+
+    await userEvent.click(screen.getByRole('button', { name: 'Main 选择 Proxy-B' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Main 选择 Proxy-B' }).getAttribute('aria-pressed')).toBe('true'))
+    await act(async () => { finishRead(oldSnapshot) })
+    expect(screen.getByRole('button', { name: 'Main 选择 Proxy-B' }).getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('does not let a late failure overwrite a newer successful workspace read', async () => {
+    let failFirst!: (cause: Error) => void
+    vi.mocked(api.policyWorkspace).mockImplementationOnce(() => new Promise((_, reject) => { failFirst = reject }))
+    const page = render(<PoliciesPageHarness />)
+    expect(screen.getByRole('status').textContent).toBe('正在准备策略配置…')
+    page.rerender(<PoliciesPageHarness data={{ ...overview, revision: 'new' }} />)
+    await screen.findByRole('heading', { name: 'Main' })
+    await act(async () => { failFirst(new Error('Stale read failed')) })
+
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByText('运行中配置')).toBeTruthy()
+  })
+
+  it('polls delayed providers while the page is visible, skips overlapping reads, and stops on unmount', async () => {
+    vi.useFakeTimers()
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+    workspace.mode = 'prepared'
+    const page = render(<PoliciesPageHarness data={null} />)
+    await act(async () => {})
+    expect(api.policyWorkspace).toHaveBeenCalledTimes(1)
+    let finishRead!: (snapshot: PolicyWorkspaceSnapshot) => void
+    vi.mocked(api.policyWorkspace).mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve }))
+    await act(async () => { vi.advanceTimersByTime(5000) })
+    expect(api.policyWorkspace).toHaveBeenCalledTimes(2)
+    await act(async () => { vi.advanceTimersByTime(10000) })
+    expect(api.policyWorkspace).toHaveBeenCalledTimes(2)
+
+    workspace.groups.push({ name: 'Loaded provider', type: 'Selector', selected: 'Proxy-A', options: ['Proxy-A'] })
+    await act(async () => { finishRead(structuredClone(workspace)) })
+    expect(screen.getByRole('heading', { name: 'Loaded provider' })).toBeTruthy()
+    hidden.mockReturnValue(true)
+    await act(async () => { vi.advanceTimersByTime(5000) })
+    expect(api.policyWorkspace).toHaveBeenCalledTimes(2)
+    hidden.mockReturnValue(false)
+    page.unmount()
+    await act(async () => { vi.advanceTimersByTime(10000) })
+    expect(api.policyWorkspace).toHaveBeenCalledTimes(2)
+  })
+
+  it('serializes selections across groups and preserves both confirmed choices', async () => {
+    render(<PoliciesPageHarness data={null} />)
+    await screen.findByRole('heading', { name: 'Main' })
+    await userEvent.click(screen.getByRole('button', { name: '全部' }))
+    let finishFirst!: (snapshot: PolicyWorkspaceSnapshot) => void
+    vi.mocked(api.policyWorkspace).mockImplementationOnce(() => new Promise(resolve => { finishFirst = resolve }))
+    await userEvent.click(screen.getByRole('button', { name: 'Main 选择 Proxy-B' }))
+    await userEvent.click(screen.getByRole('button', { name: 'device/alice/default 选择 Proxy-A' }))
+    expect(api.policyWorkspace).toHaveBeenCalledTimes(2)
+
+    workspace.groups[0].selected = 'Proxy-B'
+    await act(async () => { finishFirst(structuredClone(workspace)) })
+    await waitFor(() => expect(api.policyWorkspace).toHaveBeenCalledTimes(3))
+    expect(screen.getByRole('button', { name: 'Main 选择 Proxy-B' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: 'device/alice/default 选择 Proxy-A' }).getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('does not show a late Mac runtime response after the gateway stops', async () => {
+    let finishRouting!: (routing: LocalRouting) => void
+    vi.mocked(api.localRouting).mockImplementationOnce(() => new Promise(resolve => { finishRouting = resolve }))
+    const page = render(<PoliciesPageHarness />)
+    await screen.findByRole('heading', { name: 'Main' })
+    workspace.mode = 'prepared'
+    page.rerender(<PoliciesPageHarness data={{ ...overview, status: { ...overview.status, gateway: 'stopped', mihomo: 'stopped' } }} />)
+    await screen.findByText('待启动配置')
+    await act(async () => { finishRouting(localRouting()) })
+
+    expect(screen.getByText('启动网关后可用')).toBeTruthy()
+    expect(screen.queryByLabelText('本机全局策略组 当前策略 Proxy-A')).toBeNull()
+  })
+
+  it('renders prepared configuration and errors in English', async () => {
+    await prepareLanguage('en')
+    activateLanguage('en')
+    workspace.mode = 'prepared'
+    const page = render(<PoliciesPageHarness data={null} />)
+    await screen.findByText('Prepared configuration')
+    expect(screen.getByRole('heading', { name: 'Main' })).toBeTruthy()
+    vi.mocked(api.policyWorkspace).mockRejectedValueOnce(new Error('Test unavailable'))
+    await userEvent.click(screen.getByRole('button', { name: 'Test current view' }))
+    await screen.findByRole('alert')
+
+    expect(page.container.textContent).not.toMatch(/[\u3400-\u9fff]/)
+  })
+
+  it('shows the dedicated Tailscale Exit Node group with a friendly name', async () => {
+    workspace.health = {
+      ...health,
+      proxies: [...health.proxies,
+        { name: 'open-surge/tailscale-exit', display_name: 'Home Tailnet · Exit Node', type: 'Selector', selected: 'open-surge/tailscale', provider: '', udp: true, role: 'exit_node', status: 'reachable', probeable: true },
+        { name: 'open-surge/tailscale', display_name: 'Home Tailnet', type: 'Tailscale', selected: '', provider: '', udp: true, role: 'exit_node', status: 'reachable', probeable: true },
+      ],
+    }
+    const data = {
+      ...overview,
+      policies: [...overview.policies, { name: 'open-surge/tailscale-exit', type: 'Selector', selected: 'open-surge/tailscale', options: ['open-surge/tailscale'] }],
+    } as Overview
+    workspace.groups = data.policies
+    render(<PoliciesPageHarness data={data} />)
+
+    expect(await screen.findByRole('heading', { name: 'Home Tailnet · Exit Node' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Home Tailnet · Exit Node' })).toBeTruthy()
+    expect(screen.getAllByText('Home Tailnet').length).toBeGreaterThan(0)
+  })
+
+  it('shows an injected Exit Node selected by the prepared core and lets the user change it', async () => {
+    workspace.mode = 'prepared'
+    workspace.groups = [{ name: 'AI', type: 'Selector', selected: 'open-surge/tailscale-exit', options: ['open-surge/tailscale-exit', 'Proxy-A'] }]
+    workspace.health.proxies.push({ name: 'open-surge/tailscale-exit', display_name: 'Home Tailnet · Exit Node', type: 'Selector', selected: 'open-surge/tailscale', provider: '', udp: true, role: 'exit_node', status: 'untested', probeable: true })
+    render(<PoliciesPageHarness data={null} />)
+
+    const exit = await screen.findByRole('button', { name: 'AI 选择 Home Tailnet · Exit Node' })
+    expect(exit.getAttribute('aria-pressed')).toBe('true')
+    await userEvent.click(screen.getByRole('button', { name: 'AI 选择 Proxy-A' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'AI 选择 Proxy-A' }).getAttribute('aria-pressed')).toBe('true'))
+    expect(exit.getAttribute('aria-pressed')).toBe('false')
+    expect(api.policyWorkspace).toHaveBeenCalledWith({ action: 'select', group: 'AI', policy: 'Proxy-A' })
   })
 
   it('keeps the Mac global policy group first and switches it through the local-routing API', async () => {
@@ -124,13 +386,14 @@ describe('PoliciesPage', () => {
   })
 
   it('keeps the search and active group when the page is left and mounted again', async () => {
-    render(<PoliciesSessionHarness />)
+    renderSessionPage()
 
-    const search = await screen.findByRole('searchbox', { name: '搜索策略组或节点' })
+    await screen.findByRole('heading', { name: 'Streaming' })
+    const search = screen.getByRole('searchbox', { name: '搜索策略组或节点' })
     await userEvent.click(screen.getByRole('button', { name: '全部' }))
     await userEvent.type(search, 'Streaming')
     await userEvent.click(screen.getByRole('button', { name: 'Streaming' }))
-    expect(screen.getByRole('button', { name: 'Streaming' }).getAttribute('aria-current')).toBe('location')
+    expect((await screen.findByRole('button', { name: 'Streaming' })).getAttribute('aria-current')).toBe('location')
 
     await userEvent.click(screen.getByRole('button', { name: '离开策略页' }))
     await userEvent.click(screen.getByRole('button', { name: '返回策略页' }))
@@ -159,7 +422,7 @@ describe('PoliciesPage', () => {
   })
 
   it('keeps the clicked group active while its smooth page scroll is in progress', async () => {
-    render(<PoliciesSessionHarness />)
+    renderSessionPage()
     const main = await screen.findByRole('button', { name: 'Main' })
     const mainCard = screen.getByRole('heading', { name: 'Main' }).closest('article') as HTMLElement
     const streamingCard = screen.getByRole('heading', { name: 'Streaming' }).closest('article') as HTMLElement

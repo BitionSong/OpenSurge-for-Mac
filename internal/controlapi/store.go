@@ -54,6 +54,82 @@ func (s *Store) Token() (string, error) {
 	return token, nil
 }
 
+func defaultUIPreferences() UIPreferences {
+	return UIPreferences{SchemaVersion: SchemaVersion, Language: UILanguageSystem}
+}
+
+func validUILanguage(language string) bool {
+	switch language {
+	case UILanguageSystem, UILanguageZHCHS, UILanguageEN:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Store) UIPreferences() (UIPreferences, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	preferences := defaultUIPreferences()
+	err := readJSON(filepath.Join(s.dir, "preferences.json"), &preferences)
+	if errors.Is(err, os.ErrNotExist) {
+		return defaultUIPreferences(), nil
+	}
+	if err != nil {
+		return UIPreferences{}, err
+	}
+	if !validUILanguage(preferences.Language) {
+		return UIPreferences{}, fmt.Errorf("unsupported UI language %q", preferences.Language)
+	}
+	preferences.SchemaVersion = SchemaVersion
+	return preferences, nil
+}
+
+func (s *Store) SaveUIPreferences(preferences UIPreferences) error {
+	if !validUILanguage(preferences.Language) {
+		return fmt.Errorf("unsupported UI language %q", preferences.Language)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	preferences.SchemaVersion = SchemaVersion
+	data, err := json.MarshalIndent(preferences, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeAtomic(filepath.Join(s.dir, "preferences.json"), append(data, '\n'), 0o600)
+}
+
+type tailscaleDiscoveryCache struct {
+	SavedAt   time.Time                  `json:"saved_at"`
+	Discovery TailscaleDiscoveryResponse `json:"discovery"`
+}
+
+func (s *Store) TailscaleDiscovery() (TailscaleDiscoveryResponse, time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var cache tailscaleDiscoveryCache
+	if err := readJSON(filepath.Join(s.dir, "tailscale-discovery.json"), &cache); err != nil {
+		return TailscaleDiscoveryResponse{}, time.Time{}, err
+	}
+	return cache.Discovery, cache.SavedAt, nil
+}
+
+func (s *Store) SaveTailscaleDiscovery(discovery TailscaleDiscoveryResponse, savedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	discovery.SchemaVersion = SchemaVersion
+	discovery.Cached = false
+	discovery.CachedAt = nil
+	discovery.Error = ""
+	discovery.SubnetRouteConflicts = []TailscaleSubnetRouteConflict{}
+	cache := tailscaleDiscoveryCache{SavedAt: savedAt.UTC(), Discovery: discovery}
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeAtomic(filepath.Join(s.dir, "tailscale-discovery.json"), append(data, '\n'), 0o600)
+}
+
 func (s *Store) Recovery() (RecoveryState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -148,6 +224,27 @@ func (s *Store) DiscardPreparedRecovery(topology string) error {
 func (s *Store) SaveOperation(op Operation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.saveOperationLocked(op)
+}
+
+func (s *Store) CreateOperation(op Operation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !validOperationID(op.ID) {
+		return fmt.Errorf("invalid operation id")
+	}
+	if _, err := os.Stat(filepath.Join(s.dir, "operations", op.ID+".json")); err == nil {
+		return errOperationExists
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return s.saveOperationLocked(op)
+}
+
+func (s *Store) saveOperationLocked(op Operation) error {
+	if !validOperationID(op.ID) {
+		return fmt.Errorf("invalid operation id")
+	}
 	data, err := json.MarshalIndent(op, "", "  ")
 	if err != nil {
 		return err
@@ -157,7 +254,7 @@ func (s *Store) SaveOperation(op Operation) error {
 
 func (s *Store) Operation(id string) (Operation, error) {
 	var op Operation
-	if id == "" || filepath.Base(id) != id {
+	if !validOperationID(id) {
 		return op, fmt.Errorf("invalid operation id")
 	}
 	err := readJSON(filepath.Join(s.dir, "operations", id+".json"), &op)
@@ -203,6 +300,18 @@ func (s *Store) SaveSources(sources []Source) error {
 		return err
 	}
 	return writeAtomic(filepath.Join(s.dir, "sources.json"), append(data, '\n'), 0o600)
+}
+
+func (s *Store) ProfileOverlay() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return os.ReadFile(filepath.Join(s.dir, "global-profile-overlay.yaml"))
+}
+
+func (s *Store) SaveProfileOverlay(data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return writeAtomic(filepath.Join(s.dir, "global-profile-overlay.yaml"), data, 0o600)
 }
 
 func readJSON(path string, value any) error {

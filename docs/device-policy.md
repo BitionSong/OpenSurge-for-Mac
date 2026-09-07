@@ -7,9 +7,15 @@ mode also accepts a fixed IPv4 with MAC as optional identity metadata. It
 generates an independent selector group for every active device and routes
 traffic with mihomo `SRC-IP-CIDR` rules.
 
-This feature is optional. Point `device_policy.file` at a JSON document; the
-empty [starter document](../examples/device-policy.example.json) is valid but
-does not enable any device policy.
+The installed app enables per-device policies by default, and the Web GUI has
+no disable switch. A new installation creates an empty policy file; an upgrade
+adds the path to a previously disabled configuration while preserving existing
+policy data. Network configuration saves also keep policies enabled. Register
+devices and configure their egress directly on the Devices page.
+
+For a standalone CLI configuration, point `device_policy.file` at a JSON document.
+The empty [starter document](../examples/device-policy.example.json) is valid;
+it generates no device-specific routes until devices are registered.
 
 ```yaml
 device_policy:
@@ -44,8 +50,9 @@ evidence remain required.
 
 ## Model
 
-The Web GUI rule library includes an inspectable community Claude Code example,
-but does not write it to the configuration or apply it to a device by default.
+The Web GUI rule library includes an inspectable community Claude Code example.
+The Rule Sets and Routing Templates tabs always show that catalog, but do not
+write it to the configuration or apply it to a device by default.
 Operators own all other policy content. The JSON model has four collections:
 
 - `devices`: stable identity (`id`, MAC, reserved IPv4, profile id), an optional
@@ -141,6 +148,27 @@ or reconnect before the new IPv4 Router and DNS options take effect. This
 target requires a real MAC, and the upstream router must be on the gateway LAN
 but outside the dynamic DHCP pool.
 
+When a source switch or subscription update removes a referenced outbound,
+OpenSurge derives effective routes from the final composed target inventory:
+
+- A missing selected device default, or an entirely missing candidate list,
+  temporarily falls back to `inherit_global`. Other valid device routes remain.
+- A missing fixed or selected outbound on a device route skips that route and
+  its UDP rejection fallback. This applies equally to rule-set bindings, template
+  bindings and direct domain/IP conditions. Traffic continues through later
+  device rules and the device's effective default route.
+- Missing unselected candidates are omitted from the runtime selector while the
+  current valid selection is preserved.
+
+Original settings, templates and rule sets stay stored. The device page reports
+the effective fallback, skipped routes and filtered candidates. Restoring the
+outbound reactivates the original settings on the next start or reload. A fresh
+selector uses its first configured candidate; if historical selection cannot be
+read, affected selectors conservatively fall back or skip. An existing but
+unreachable outbound, a delay-test timeout or unsupported UDP does not trigger
+this behavior. Invalid source syntax, global rules and reserved namespace
+collisions still fail validation.
+
 An inherit-only device retains its profile's `default_policies` as future
 configuration, but those unused candidates are not rendered or checked against
 the current imported profile until a dedicated/legacy device actually needs
@@ -214,9 +242,10 @@ sets; it contains no outlet and does not clone a full mihomo profile.
 
 The built-in Claude Code example in the Web GUI is based on the
 [Net.Coffee community rule page](https://ip.net.coffee/claude/site.html) and is
-explicitly labeled as non-official. Users can inspect it first. Its four rule
-sets and template are added to the configuration only after the user chooses
-"Use for device" and adds that route to the draft.
+explicitly labeled as non-official. Users can inspect it first from Rule Sets
+or Routing Templates. Its rule sets and template are added to the configuration
+only after the user edits and saves a draft, includes a rule set in a custom
+template, or chooses "Use for device" and adds that route to the draft.
 
 ## Operations
 

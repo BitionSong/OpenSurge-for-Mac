@@ -56,11 +56,15 @@ func (m Manager) ValidateConfig() error {
 // startup calls this before enabling forwarding, and Start deliberately does
 // not re-read or re-render policy input afterwards.
 func (m Manager) ValidateWrittenConfig() error {
+	return m.ValidateWrittenConfigContext(context.Background())
+}
+
+func (m Manager) ValidateWrittenConfigContext(ctx context.Context) error {
 	binary, err := resolveBinary(m.cfg.Mihomo.Binary)
 	if err != nil {
 		return err
 	}
-	return validateConfig(binary, m.configDir(), m.paths.MihomoConfig)
+	return validateConfigContext(ctx, configValidationTimeout, binary, m.configDir(), m.paths.MihomoConfig)
 }
 
 func (m Manager) Start() (int, error) {
@@ -158,8 +162,12 @@ func validateConfig(binary string, configDir string, configPath string) error {
 }
 
 func validateConfigWithTimeout(timeout time.Duration, binary string, configDir string, configPath string) error {
+	return validateConfigContext(context.Background(), timeout, binary, configDir, configPath)
+}
+
+func validateConfigContext(ctx context.Context, timeout time.Duration, binary string, configDir string, configPath string) error {
 	var output bytes.Buffer
-	if err := process.RunBufferedTimeout(timeout, &output, binary, "-d", configDir, "-t", "-f", configPath); err != nil {
+	if err := process.RunBufferedContext(ctx, timeout, &output, binary, "-d", configDir, "-t", "-f", configPath); err != nil {
 		return fmt.Errorf("mihomo config validation failed: %w: %s", err, strings.TrimSpace(output.String()))
 	}
 	return nil

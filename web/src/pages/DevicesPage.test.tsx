@@ -12,7 +12,7 @@ vi.mock('../api', () => {
     RequestError,
     waitForOperation: vi.fn(async () => ({ id: 'reload-1', kind: 'reload', state: 'succeeded' })),
     api: {
-      devices: vi.fn(), config: vi.fn(), sources: vi.fn(), devicePolicy: vi.fn(), saveDevicePolicy: vi.fn(),
+      devices: vi.fn(), config: vi.fn(), sources: vi.fn(), tailscale: vi.fn(), tailscaleDiscovery: vi.fn(), profileOverlay: vi.fn(), devicePolicy: vi.fn(), saveDevicePolicy: vi.fn(),
       selectPolicy: vi.fn(), selectDevicePolicy: vi.fn(), gateway: vi.fn(),
       localRouting: vi.fn(), setLocalRouting: vi.fn(),
       refreshLocalConnections: vi.fn(), refreshDeviceConnections: vi.fn(),
@@ -21,6 +21,7 @@ vi.mock('../api', () => {
   }
 })
 
+import { activateLanguage, prepareLanguage } from '../i18n'
 import { api, RequestError, waitForOperation } from '../api'
 import { DevicesPage } from './DevicesPage'
 
@@ -75,6 +76,8 @@ describe('DevicesPage', () => {
       device_policy: { enabled: true },
     } as never)
     vi.mocked(api.sources).mockResolvedValue({ revision: 'sources-r1', sources: [] })
+    vi.mocked(api.tailscale).mockResolvedValue({ selectable_exit: false } as never)
+    vi.mocked(api.profileOverlay).mockResolvedValue({ applied: false } as never)
     vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(basePolicy))
     vi.mocked(api.devices).mockResolvedValue(devicesResponse())
     vi.mocked(api.selectPolicy).mockResolvedValue({} as never)
@@ -92,7 +95,36 @@ describe('DevicesPage', () => {
     vi.mocked(api.saveDevicePolicy).mockImplementation(async (policy, revision) => documentFor(policy, `${revision}-next`))
   })
 
-  afterEach(() => { cleanup(); vi.clearAllMocks() })
+  afterEach(() => { cleanup(); vi.clearAllMocks(); activateLanguage('zh-Hans') })
+
+  it('shows applied egress fallback and skipped ruleset and template routes without marking settings as unsaved', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', name: 'Alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['Gone'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true, drift: false,
+      applied_devices: [{ ...policy.devices[0], egress_mode: 'inherit_global', configured_egress_mode: 'dedicated', groups: {}, policy_adjustments: [
+        { slot: 'default', effect: 'inherit_global', missing_targets: ['Gone'] },
+        { slot: 'ruleset-route', effect: 'skip_rule', missing_targets: ['Missing-Ruleset-Exit'] },
+        { slot: 'template-route', effect: 'skip_rule', missing_targets: ['Missing-Template-Exit'] },
+        { slot: 'valid-route', effect: 'filter_candidates', missing_targets: ['Unused-Exit'] },
+      ] }],
+    }))
+    renderPage()
+    expect(await screen.findByText('设备默认出口 Gone 不存在，当前跟随网关规则。')).toBeTruthy()
+    expect(screen.getByText('设备分流 ruleset-route 的出口 Missing-Ruleset-Exit 不存在，当前已跳过这条分流。')).toBeTruthy()
+    expect(screen.getByText('设备分流 template-route 的出口 Missing-Template-Exit 不存在，当前已跳过这条分流。')).toBeTruthy()
+    expect(screen.getByText('valid-route 已忽略失效候选 Unused-Exit，保留当前有效出口。')).toBeTruthy()
+    expect(screen.getByText('原始设置已保留；出口恢复后，下次启动或重载会重新应用。')).toBeTruthy()
+    const card = screen.getByRole('button', { name: /alice-policy\s*Alice/ }).closest('article')!
+    expect(within(card).getAllByText('已应用').length).toBeGreaterThan(0)
+    expect(within(card).queryByText('待重载')).toBeNull()
+    expect(within(card).queryByText(/草稿将改为/)).toBeNull()
+    expect(api.saveDevicePolicy).not.toHaveBeenCalled()
+  })
 
   it('refreshes only Mac-local connections from the Mac card', async () => {
     const { onChanged } = renderPage()
@@ -307,6 +339,24 @@ describe('DevicesPage', () => {
     await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
     await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
     expect(vi.mocked(api.saveDevicePolicy).mock.calls[0][0].devices[0].egress_mode).toBe('dedicated')
+  })
+
+  it('offers a configured Tailscale Exit Node as a friendly device outlet candidate', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.tailscale).mockResolvedValue({ selectable_exit: true, settings: { display_name: 'Home Tailnet' } } as never)
+    renderPage()
+
+    await userEvent.click(await screen.findByRole('tab', { name: /设备分流/ }))
+    const input = screen.getByLabelText('独立设备出口候选')
+    await userEvent.type(input, 'open-surge/tailscale-exit')
+    await userEvent.click(screen.getByRole('button', { name: '添加' }))
+
+    expect(screen.getByText('Home Tailnet · Exit Node')).toBeTruthy()
   })
 
   it('keeps legacy routing readable and requires an explicit migration choice', async () => {
@@ -682,6 +732,11 @@ describe('DevicesPage', () => {
     }
     vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
     renderPage()
+    expect(await screen.findByText('Claude Code 核心域名')).toBeTruthy()
+    expect(screen.getByText('Claude Code 扩展服务')).toBeTruthy()
+    expect(screen.getByText('Claude Code IP / ASN 兜底')).toBeTruthy()
+    expect(screen.getByText('NTP 通用规则')).toBeTruthy()
+    expect((document.querySelector('.sticky-save') as HTMLElement).classList.contains('is-saved')).toBe(true)
     await userEvent.click(await screen.findByRole('tab', { name: /分流模版/ }))
     expect(screen.getByText('内置示例 · 未启用')).toBeTruthy()
     expect(screen.getByRole('heading', { name: 'Claude Code' })).toBeTruthy()
@@ -739,12 +794,86 @@ describe('DevicesPage', () => {
     renderPage()
     expect(await screen.findByRole('tablist', { name: '规则库' })).toBeTruthy()
     expect(screen.getByRole('tab', { name: /规则集/ }).getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByText('Claude Code 核心域名')).toBeTruthy()
     expect(screen.queryByText('高级 / 复用机制')).toBeNull()
     await userEvent.click(screen.getByRole('tab', { name: /分流模版/ }))
     await userEvent.click(screen.getByRole('button', { name: '查看规则' }))
     expect(screen.getByText(/DOMAIN-SUFFIX,anthropic\.com/)).toBeTruthy()
     expect(screen.getByText(/IP-ASN,399358,no-resolve/)).toBeTruthy()
     expect(screen.getByText(/DST-PORT,123/)).toBeTruthy()
+  })
+
+  it('lets the operator inspect catalog rule sets without writing desired state', async () => {
+    renderPage()
+    const item = (await screen.findByText('Claude Code 核心域名')).closest('.library-item') as HTMLElement
+    expect(within(item).getByText(/内置示例 · 未启用/)).toBeTruthy()
+    expect(within(item).queryByRole('button', { name: '移除' })).toBeNull()
+    await userEvent.click(within(item).getByRole('button', { name: '查看规则' }))
+    expect(within(item).getByText(/DOMAIN-SUFFIX,anthropic\.com/)).toBeTruthy()
+    expect((document.querySelector('.sticky-save') as HTMLElement).classList.contains('is-saved')).toBe(true)
+    expect(api.saveDevicePolicy).not.toHaveBeenCalled()
+  })
+
+  it('writes a catalog rule set only after the operator saves an edit to the draft', async () => {
+    renderPage()
+    const item = (await screen.findByText('Claude Code 核心域名')).closest('.library-item') as HTMLElement
+    await userEvent.click(within(item).getByRole('button', { name: '编辑' }))
+    expect((document.querySelector('.sticky-save') as HTMLElement).classList.contains('is-saved')).toBe(true)
+    await userEvent.click(within(item).getByRole('button', { name: '保存到草稿' }))
+    expect((document.querySelector('.sticky-save') as HTMLElement).classList.contains('has-changes')).toBe(true)
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
+    expect(saved.rule_sets.map(ruleSet => ruleSet.id)).toEqual(['claude-code-domains'])
+    expect(saved.templates).toEqual([])
+  })
+
+  it('installs a catalog rule set when a device route selects it', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: /设备分流/ }))
+    await userEvent.click(screen.getByRole('button', { name: '＋ 添加设备分流' }))
+    await userEvent.click(screen.getByRole('radio', { name: '单个规则集' }))
+    await userEvent.selectOptions(screen.getByLabelText('设备分流匹配对象'), 'claude-code-domains')
+    await userEvent.click(screen.getByRole('button', { name: '添加到草稿' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
+    expect(saved.rule_sets.map(ruleSet => ruleSet.id)).toEqual(['claude-code-domains'])
+    expect(saved.templates).toEqual([])
+    expect(saved.profiles.find(profile => profile.id === 'alice-policy')?.rules).toContainEqual(expect.objectContaining({ match: { rule_sets: ['claude-code-domains'] }, action: 'DIRECT' }))
+  })
+
+  it('persists selected catalog rule sets when saving a custom template', async () => {
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: /分流模版/ }))
+    await userEvent.click(screen.getByRole('button', { name: '＋ 新建分流模版' }))
+    await userEvent.type(screen.getByLabelText('分流模版名称'), 'core-only')
+    await userEvent.click(screen.getByRole('checkbox', { name: /Claude Code 核心域名/ }))
+    await userEvent.click(screen.getByRole('button', { name: '保存到草稿' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
+    expect(saved.templates.find(template => template.id === 'core-only')?.rule_sets).toEqual(['claude-code-domains'])
+    expect(saved.rule_sets.map(ruleSet => ruleSet.id)).toEqual(['claude-code-domains'])
+  })
+
+  it('renders the catalog rule library in English without leftover CJK', async () => {
+    await prepareLanguage('en')
+    activateLanguage('en')
+    renderPage()
+    expect(await screen.findByText('Claude Code core domains')).toBeTruthy()
+    expect(screen.getByText('Claude Code extended services')).toBeTruthy()
+    const library = document.querySelector('.rule-library') as HTMLElement
+    const item = within(library).getByText('Claude Code core domains').closest('.library-item') as HTMLElement
+    await userEvent.click(within(item).getByRole('button', { name: 'View rules' }))
+    expect(within(item).getByText(/DOMAIN-SUFFIX,anthropic\.com/)).toBeTruthy()
+    expect(library.textContent).not.toMatch(/[\u3400-\u9fff]/)
   })
 
   it('uses a custom interruption warning before reload and waits for the operation', async () => {

@@ -59,7 +59,10 @@ AP、SSID 或 VLAN 时，则可以使用独立下游 LAN。三种模式均可按
 | **局域网 DHCP 接管（进阶 · 自动接入）** | 希望同一 LAN 的设备自动使用 OpenSurge | 需要按引导关闭主路由 DHCP，停止时按恢复流程重新开启 |
 | **独立下游 LAN** | 独立 AP、SSID 或 VLAN | 不改变现有 LAN 的 DHCP；Mac 为独立下游网络提供 DHCP/DNS 和网关 |
 
-- 可导入已有的 mihomo 配置或订阅，保留原有节点、代理组和规则
+- 导入已有的 mihomo 配置或订阅是可选能力；默认折叠的全局附加配置可以单独添加节点、
+  Provider、策略组、DNS 与规则。即使网关停止、没有任何导入源，也能在策略页预览最终
+  合成结果、选择节点和检测延迟，或从 Web GUI 直接启动同一份配置；刷新订阅或保存草稿
+  不会自动改变运行中的网关
 - Web GUI 实时展示每台设备的连接、上下行流量和实际出口链；菜单栏随时查看网关状态与恢复提醒。
 - 菜单栏与 Web GUI 提供默认关闭、仅本次运行有效的**合盖保持运行**开关。
 
@@ -91,6 +94,10 @@ macOS BPF packet broker 和本项目补丁构建的 mihomo 用户态数据面共
 - 启停 DHCP/DNS、mihomo、pf NAT 与 IPv4 forwarding，并带 rollback；
 - 通过 mihomo `mixed-port` 提供显式代理；
 - 通过 mihomo TUN 提供 macOS 透明代理；
+- 把 Tailscale / Headscale 作为 mihomo 的按需出站：可按 MagicDNS 后缀、Tailnet
+  peer 或明确的 subnet route 限定 Mac/下游设备访问，也可把指定 Exit Node
+  作为独立策略组加入所有用户定义的手动 `select` 组，同时保留 Mac 全局出口和设备
+  出口候选；
 - 在实验性的下游 IPv6 模式中，独立下游 LAN 与局域网 DHCP 接管通过 dnsmasq
   RA/SLAAC/RDNSS 自动接入，旁路由模式则使用手工 ULA；IPv6 流量不经过 macOS 系统
   TUN，而由 BPF packet broker 送入本项目补丁构建的 mihomo gVisor 数据面，覆盖 TCP、
@@ -107,7 +114,8 @@ macOS BPF packet broker 和本项目补丁构建的 mihomo 用户态数据面共
 
 - 把活跃会话流量归属到 DHCP 设备或同 LAN 的静态登记/当前观察设备，显示每设备
   连接数、实时上下行速率、累计字节与占主要流量的 mihomo 出口链；
-- 集中检测代理节点可达性/延迟，并从健康视图切换已应用的 Selector；
+- 网关运行时或停止时都可集中检测代理节点可达性/延迟，并从最终合成的策略视图切换
+  Selector；
 - 通过 applied mihomo mixed-port 和当前 Mac 本机模式探测固定真实服务目录，展示
   三轮中位延迟、命中规则与实际出口链；
 - 查看与切换策略组、查看 imported proxy/rule provider 状态、查看当前连接；
@@ -125,8 +133,8 @@ macOS BPF packet broker 和本项目补丁构建的 mihomo 用户态数据面共
 配置固定 IPv4 租约；旁路由模式只需主路由侧保持稳定的静态 IPv4，MAC 可留空，并可从
 当前经过 Mac 的流量与 ARP 邻居观察辅助登记。切换到 DHCP 模式时，GUI 会要求确认当前
 可观察到的 MAC；仍无 MAC 的登记会保留，但设备专属策略暂停，补全 MAC 后恢复。当前拓扑中
-身份信息充分的设备会生成各自的 mihomo selector group 和 `SRC-IP-CIDR` 规则。可选 JSON
-策略文件让每台设备要么跟随网关规则，要么在
+身份信息充分的设备会生成各自的 mihomo selector group 和 `SRC-IP-CIDR` 规则。安装版默认
+启用每设备策略，Web GUI 始终保留该能力；JSON 策略文件让每台设备要么跟随网关规则，要么在
 全局规则之前走设备专属 selector；它也支持 `REJECT` 这类设备专属动作，以及按
 域名/IP/协议/端口/rule-provider 叠加的规则覆盖。dedicated 模式下，本地/私有目标
 保持直连。Mac 本机的规则 / 全局 / 直连开关不改变这些下游规则；详见
@@ -136,6 +144,40 @@ Web GUI 的规则库把规则集、不带出口的分流模版和每台设备的
 其中提供一份可查看的 Claude Code 社区规则示例，但不会默认应用到任何设备；其他策略内容由操作者提供，空 starter
 文件也是合法配置。JSON 模型、优先级、CLI 命令和验证边界见
 [每设备策略覆盖](docs/device-policy.zh-CN.md)。
+
+### Tailscale 出站
+
+Web GUI 的“代理与规则源”页面可以管理一个 OpenSurge 托管的 Tailscale
+outbound。Auth Key 只写入权限受限的独立文件，配置和 API 响应不会回显；
+本地 `state-dir` 保留节点身份，所以停用后再启用不需创建新设备。“忘记本地
+身份”是单独动作，只能在 Tailscale 已停用且网关已停止时执行；它不会从
+Tailscale / Headscale 管理后台删除节点。
+
+卡片内的折叠设置会只读检测本机 Tailscale App，把当前 Tailnet 的 MagicDNS 后缀、peer
+精确地址、在线状态、已接受的私网路由和可用 Exit Node 显示为待确认建议；不会
+自动保存或扩大访问范围。成功发现会保存不含密钥的受限缓存；本机 App 断开后仍可
+继续配置，界面会标明信息来源和检测/缓存时间，不把快照描述成实时状态。若本机
+Tailscale App 已通过自己的 `utun` 接管同一条
+子网路由，界面会在运行中网关重载前指出具体路由和接口，并要求先关闭 App 的
+“接受子网路由”或断开连接；OpenSurge 不会自动修改另一个 App。首次注册仍需要
+单独的 Auth Key，界面可直接打开官方 Keys 页面，并提示使用一次性、非 Ephemeral
+的 key。本机 App 与 OpenSurge 托管
+节点不共享登录身份或 state；检测失败时仍可使用折叠的高级手动配置。
+
+Tailnet 访问和 Exit Node 是两种不同角色：
+
+- Tailnet-only 只在明确的 MagicDNS 后缀、peer IP/CIDR 或已接受的远端子网命中时
+  选择 Tailscale，目标不可达时不回退 `DIRECT`；
+- 只有配置了明确 Exit Node 才会生成 `open-surge/tailscale-exit` 独立策略组；
+  它会成为 Mac 全局出口、每设备 Selector，以及所有用户定义手动 `type: select` 组的
+  可选成员，但不会加入自动测速/故障转移/负载均衡组；
+- 远端 subnet route 必须逐条确认，与 OpenSurge LAN 重叠时会拒绝保存；
+- mihomo 按 outbound 首次请求启动 Tailscale 节点；OpenSurge 会在网关启动、
+  重载和 mihomo 恢复后主动预热，但第一次业务访问仍可能需要重试。界面仍显示
+  “按需连接”，且不会用公网 `generate_204` 误判 Tailnet-only 节点。
+
+当前边界是 outbound-only：OpenSurge 不向 Tailnet 发布本地 LAN，也不用这个节点
+提供入站服务。
 
 ## Web GUI 与菜单栏 App
 
@@ -262,6 +304,14 @@ profile 会贡献 `proxies`、`proxy-providers`、`proxy-groups`、`rule-provide
 专用 DNS 的代理节点域名继续正确解析，同时不允许 profile 替换网关 DNS 监听或
 TUN DNS 契约。
 
+导入 profile 不是使用高级配置的前置条件。Web GUI 的“全局附加配置”可以在 managed
+最小 profile 上独立增加节点、Provider、手动策略组与规则。网关停止时，“策略”页会通过
+一个不接管 TUN、DHCP/DNS、PF 或 forwarding 的准备态 mihomo 展示最终配置，并允许选择
+节点与测速；也可以不访问策略页，直接从 Web GUI 启动，服务端会先合成并用真实
+`mihomo -t` 校验，成功后保存并启动同一个候选配置。预览、选择与测速不会提交 desired
+配置；运行中保存附加配置草稿也不改变实际流量。仅附加配置的草稿在下次 App 启动时采用；
+`sudo omg start` 继续使用已持久化的配置，不读取 Web 草稿。
+
 ```yaml
 mihomo:
   profile_mode: "imported"
@@ -271,7 +321,10 @@ mihomo:
 
 相对形式的 `mihomo.profile` 会基于 OpenSurge 配置文件所在目录解析。导入的
 `proxy-providers` 和 `rule-providers` 内部如果有相对 `path:`，会基于被导入的
-mihomo profile 所在目录解析。OpenSurge 会渲染 `profile.store-selected: true`，
+mihomo profile 所在目录解析。HTTP 与 file Provider 都保留原有路径语义；绝对路径、
+URL 形式和未指定路径不由 OpenSurge 重新命名，缓存仍由 mihomo 按原规则处理。
+新合成配置使用现有受信任的工作目录，不按配置摘要切换缓存或 Tailscale 状态目录。
+OpenSurge 会渲染 `profile.store-selected: true`，
 让 mihomo 可以跨重启保存策略组选择；默认的 `mihomo.store_fake_ip: true` 会生成
 `profile.store-fake-ip: true`，在 apply/restart 后恢复已有 fake-IP 映射。网关停止时可在
 Web GUI 的“高级 Mihomo / DNS 设置”中关闭该行为，但长驻进程缓存的旧 fake-IP 可能因此
@@ -366,6 +419,9 @@ sudo go run ./cmd/omg stop --config examples/config.example.yaml --format json
 
 补充说明：
 
+- 原始 `sudo omg start` 只启动已经写入 root 配置的 desired graph，不读取某个登录用户
+  Control Store 中的全局附加配置草稿；Web GUI 策略页只用于预览、选择与测速。要提交草稿，
+  请通过 App 的“启动网关”或已有来源应用流程，校验通过后才更新 desired；
 - `policy-select` 会读取 live mihomo 策略组，并在发送切换请求前拒绝未知 group 或
   policy；
 - `provider-update --provider <name>` 会请求 mihomo 刷新指定 proxy provider，并返回
@@ -494,6 +550,15 @@ CONNECT proxy，证明 `policy-select` 可以把 TUN 出口路径在 `DIRECT` �
 选择不同的 TUN 出口，并验证设备级域名 `REJECT` 生效。域名/协议规则编译、模板和
 HTTP/MRS rule-provider 配置由单元测试覆盖；不需要为每条操作者规则运行 Lab。
 
+修改 Tailscale 目标/来源规则、MagicDNS、managed tsnet 配置或本机 Tailscale 发现时，
+使用 `make lab-test-tailscale`。它用独立 Lima Tailnet peer 验证精确 peer IP 的
+TCP/UDP、完整 MagicDNS 名称、Control API 自动发现、单设备允许和其他设备
+fail-closed，并从 peer 观察到的来源地址排除 Mac 原生 Tailscale 路由造成的假阳性。
+首次运行需要为 peer 与 OpenSurge managed 节点提供仓库外、权限为 `0600` 的 Auth Key
+文件；两枚 one-off key 或由两个变量共用的一枚 reusable、非 Ephemeral key 都可以。
+身份持久化后的普通复跑不再需要 key。该门槛不证明 subnet router、Exit Node、
+Headscale 或真实远端 LAN。
+
 修改下游 IPv6 RA/SLAAC、BPF broker、patched Mihomo packet listener、IPv6 设备身份
 或停止撤销时，按拓扑使用 `make lab-test-ipv6-userspace`、
 `make lab-test-ipv6-same-wifi` 和 `make lab-test-ipv6-same-lan`。自动 RA 门槛要求两台
@@ -548,6 +613,7 @@ make lab-test-tun
 make lab-test-tun-imported-profile
 make lab-test-tun-imported-egress
 make lab-test-tun-device-policy
+make lab-test-tailscale
 make lab-test-ipv6-userspace
 make lab-test-ipv6-same-wifi
 make lab-test-ipv6-same-lan

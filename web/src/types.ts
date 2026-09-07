@@ -48,11 +48,13 @@ export type LocalRouting = {
 }
 export type ProxyHealthEntry = {
   name: string
+  display_name?: string
+  role?: 'tailnet' | 'exit_node'
   type: string
   selected?: string
   provider?: string
   udp: boolean
-  status: 'untested' | 'reachable' | 'unreachable' | 'timeout' | 'error' | 'not_applicable'
+  status: 'untested' | 'reachable' | 'unreachable' | 'timeout' | 'error' | 'not_applicable' | 'available_on_demand'
   delay_ms?: number
   tested_at?: string
   probeable: boolean
@@ -64,6 +66,18 @@ export type ProxyHealthTestResponse = {
   test_url: string
   results: Array<{ name: string; status: ProxyHealthEntry['status']; delay_ms?: number; tested_at: string; test_url: string; error?: string }>
 }
+export type PolicyWorkspaceRequest =
+  | { action: 'read' }
+  | { action: 'select'; group: string; policy: string }
+  | { action: 'test'; names: string[] }
+export type PolicyWorkspaceSnapshot = {
+  schema_version: number
+  mode: 'prepared' | 'running'
+  revision: string
+  groups: ProxyGroup[]
+  health: ProxyHealthSnapshot
+  results?: ProxyHealthTestResponse['results']
+}
 export type ProviderProxy = { name: string; type: string; alive: boolean }
 export type ProxyProvider = { name: string; type: string; vehicle_type: string; updated_at?: string; proxy_count: number; proxies: ProviderProxy[] }
 export type RuleProvider = { name: string; type: string; vehicle_type: string; behavior?: string; updated_at?: string; rule_count: number }
@@ -73,7 +87,11 @@ export type NetworkInterfacesResponse = { schema_version: number; interfaces: Ne
 export type NetworkDefaults = { schema_version: number; mode: 'same_lan' | 'same_wifi_dhcp'; snapshot: NetworkSnapshot; gateway_ipv4: string; lan_prefix_len?: number; dhcp_range_start?: string; dhcp_range_end?: string; bypass_gateway?: string; bypass_dns: string[]; warnings: string[]; blockers: string[] }
 export type Recovery = { stage: string; topology?: string; required: boolean; updated_at?: string; recovery_notes?: string; network_snapshot?: NetworkSnapshot; client_validation_skipped?: boolean }
 export type GatewayPlan = { schema_version: number; revision: string; topology: string; snapshot: NetworkSnapshot; protected_ipv4: string[]; dhcp_servers: string[]; warnings: string[]; blockers: string[] }
-export type Operation = { id: string; kind: string; state: string; error?: string }
+export type Operation = {
+  id: string; kind: string; state: string; error?: string
+  phase?: string; phase_started_at?: string; notices?: string[]
+  created_at?: string; updated_at?: string
+}
 export type MihomoRecoveryStatus = { state: 'idle' | 'observing' | 'recovering' | 'failed'; reason?: 'process_missing' | 'controller_refused'; error?: string }
 export type SleepPreventionStatus = { enabled: boolean; active: boolean; error?: string }
 export type ControlConfig = {
@@ -85,6 +103,62 @@ export type ControlConfig = {
   transparent: { mode: 'off' | 'tun'; strict_route: boolean; tun_ipv6: 'off' | 'auto' | 'always'; ipv6_shared_l2_ready?: boolean }
   local_system_proxy: { enabled: boolean }
   device_policy: { enabled: boolean; protected_ipv4: string[] }
+}
+
+export type TailscaleSettings = {
+  enabled: boolean
+  display_name: string
+  hostname: string
+  control_url: string
+  accept_routes: boolean
+  magic_dns_suffixes: string[]
+  peer_cidrs: string[]
+  subnet_routes: string[]
+  allow_mac: boolean
+  allow_all_devices: boolean
+  allowed_devices: string[]
+  exit_node: string
+  exit_node_allow_lan_access: boolean
+}
+
+export type TailscaleUpdate = TailscaleSettings & { auth_key?: string }
+
+export type TailscaleResponse = {
+  schema_version: number
+  revision: string
+  settings: TailscaleSettings
+  auth_key_present: boolean
+  identity_present: boolean
+  gateway_active: boolean
+  runtime_state: 'disabled' | 'pending_gateway_start' | 'available_on_demand'
+  selectable_exit: boolean
+  warnings: string[]
+}
+
+export type TailscaleDiscoveredNode = {
+  id: string
+  name: string
+  dns_name?: string
+  tailscale_ips: string[]
+  online: boolean
+  exit_node: boolean
+  exit_node_option: boolean
+  subnet_routes: string[]
+}
+
+export type TailscaleDiscoveryResponse = {
+  schema_version: number
+  available: boolean
+  cached?: boolean
+  cached_at?: string
+  backend_state?: string
+  tailnet_name?: string
+  magic_dns: boolean
+  magic_dns_suffix?: string
+  self?: TailscaleDiscoveredNode
+  peers: TailscaleDiscoveredNode[]
+  subnet_route_conflicts?: Array<{ route: string; interface: string; peer_id?: string; peer_name?: string }>
+  error?: string
 }
 
 export type Overview = {
@@ -108,7 +182,11 @@ export type Overview = {
   recovery: Recovery
   mihomo_recovery?: MihomoRecoveryStatus
   sleep_prevention?: SleepPreventionStatus
+  ui_preferences?: UIPreferences
 }
+
+export type RequestedLanguage = 'system' | 'zh-Hans' | 'en'
+export type UIPreferences = { schema_version: number; language: RequestedLanguage }
 
 export type Source = {
   id: string
@@ -134,6 +212,56 @@ export type Source = {
     terminal_match: boolean
     warnings: string[]
   }
+  effective_digest?: string
+  effective_inventory?: SourceInventory
+  overlay_compatible?: boolean
+  overlay_validation?: string
+}
+
+export type SourceInventory = {
+  proxies: string[]
+  proxy_providers: string[]
+  proxy_groups: string[]
+  rule_providers: string[]
+  rule_count: number
+  terminal_match: boolean
+  warnings: string[]
+}
+
+export type ProfileOverlayRuleOps = { prepend: string[]; append_before_match: string[] }
+export type ProfileOverlaySequenceOps = { add: Array<Record<string, unknown>>; replace: Array<Record<string, unknown>> }
+export type ProfileOverlayMappingOps = { add: Record<string, Record<string, unknown>>; replace: Record<string, Record<string, unknown>> }
+export type ProfileOverlayGroupPatch = { name: string; append_proxies: string[]; append_use: string[] }
+export type ProfileOverlayDocument = {
+  schema_version: number
+  enabled: boolean
+  rules: ProfileOverlayRuleOps
+  proxies: ProfileOverlaySequenceOps
+  proxy_providers: ProfileOverlayMappingOps
+  proxy_groups: ProfileOverlaySequenceOps & { patch: ProfileOverlayGroupPatch[] }
+  rule_providers: ProfileOverlayMappingOps
+  dns: { merge: Record<string, unknown>; append: Record<string, unknown[]> }
+}
+export type ProfileOverlay = {
+  schema_version: number
+  revision: string
+  yaml: string
+  document: ProfileOverlayDocument
+  desired: boolean
+  applied: boolean
+  validation: string
+}
+export type ProfileOverlayPreview = {
+  schema_version: number
+  source_id: string
+  source_yaml: string
+  overlay_yaml: string
+  effective_profile_yaml: string
+  final_mihomo_yaml: string
+  original_inventory: SourceInventory
+  effective_inventory: SourceInventory
+  diff: Source['diff']
+  validation: string
 }
 
 export type SourceSnapshotFile = {
@@ -147,7 +275,8 @@ export type SourceSnapshotFile = {
 export type DeviceEgressMode = 'inherit_global' | 'dedicated'
 export type AppliedDeviceEgressMode = DeviceEgressMode | 'legacy_fallback'
 export type DeviceGatewayTarget = 'opensurge' | 'upstream_router'
-export type CompiledDevice = { id: string; mac: string; ipv4: string; profile: string; gateway_target?: DeviceGatewayTarget | ''; egress_mode?: AppliedDeviceEgressMode | ''; ipv6_blocked?: boolean; groups: Record<string, string> }
+export type PolicyAdjustment = { slot: string; effect: 'inherit_global' | 'skip_rule' | 'filter_candidates'; missing_targets: string[]; selected?: string }
+export type CompiledDevice = { id: string; mac: string; ipv4: string; profile: string; gateway_target?: DeviceGatewayTarget | ''; egress_mode?: AppliedDeviceEgressMode | ''; configured_egress_mode?: AppliedDeviceEgressMode; policy_adjustments?: PolicyAdjustment[]; ipv6_blocked?: boolean; groups: Record<string, string> }
 export type ObservedDevice = { ip: string; mac?: string; active_connections: number; neighbor_observed: boolean }
 export type DevicesResponse = {
   desired_digest?: string

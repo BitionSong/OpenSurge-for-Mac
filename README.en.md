@@ -57,7 +57,9 @@ gateway or DNS changes.
 | **Isolated downstream LAN** | A separate AP, SSID, or VLAN | Existing-LAN DHCP stays unchanged; the Mac provides DHCP/DNS and the gateway for the isolated downstream network |
 
 - Import an existing mihomo subscription. OpenSurge takes ownership only of
-  gateway-critical fields without replacing its nodes or rules.
+  gateway-critical fields, and a separate global overlay draft keeps custom
+  proxies, providers, group extensions, and rules across subscription refreshes
+  without changing the running gateway automatically.
 - Use the Web GUI and menu bar app to see which devices are active, how much
   traffic they are moving, and which egress chain they use.
 - Temporarily keep the Mac running with its lid closed from either UI. The
@@ -96,6 +98,9 @@ common local-network, TUN, and device configuration questions, see the
 - Start and stop DHCP/DNS, mihomo, pf NAT, and IPv4 forwarding with rollback.
 - Provide explicit proxying through mihomo `mixed-port`.
 - Provide transparent proxying through mihomo TUN on macOS.
+- Use Tailscale or Headscale as an on-demand mihomo outbound for explicit
+  MagicDNS suffixes, Tailnet peers, accepted subnet routes, or an optional
+  per-device Exit Node.
 - In experimental downstream IPv6 mode, isolated-LAN and whole-LAN DHCP
   takeover use dnsmasq RA/SLAAC/RDNSS for automatic onboarding, while
   bypass-router mode uses manual ULAs. IPv6 traffic does not enter a macOS
@@ -139,7 +144,8 @@ One mihomo process can apply independent policies to registered LAN devices.
 DHCP takeover mode gives each device a MAC-backed fixed IPv4 lease. Same-LAN
 manual-gateway mode instead uses an IPv4 kept stable by the main router and can
 assist registration with current traffic plus ARP-neighbor observations. Both
-topologies emit per-device mihomo selector groups and `SRC-IP-CIDR` rules. The optional JSON
+topologies emit per-device mihomo selector groups and `SRC-IP-CIDR` rules. The installed app
+enables per-device policies by default, and the Web GUI keeps them enabled. The JSON
 policy file lets each device either follow gateway rules or take a
 dedicated device selector before global rules. It also supports direct
 device-specific actions such as `REJECT` and domain/IP/protocol/port/rule-provider
@@ -153,6 +159,40 @@ an inspectable community Claude Code example, but does not apply that example
 to any device by default. Operators supply all other policy content; the empty
 starter file remains valid. See [per-device policy overlays](docs/device-policy.md)
 for the JSON model, precedence, CLI commands, and validation boundary.
+
+### Tailscale outbound
+
+The **Proxy and rule sources** page can manage one OpenSurge-owned Tailscale
+outbound. The Auth Key is write-only and stored in a separate `0600` file;
+the persistent `state-dir` keeps the same local Tailnet identity across reloads
+and temporary disable/enable cycles. Forgetting that local identity is a
+separate action available only while Tailscale and the gateway are stopped,
+and does not remove the device from the Tailscale or Headscale admin console.
+
+The inline, collapsible setup panel reads the local Tailscale app in
+discovery-only mode and shows
+the current Tailnet's MagicDNS suffix, exact peer addresses, online state,
+accepted private routes, and eligible Exit Nodes as suggestions that require
+confirmation. It never saves or broadens access automatically. A successful
+discovery stores a restricted cache without credentials, so configuration can
+continue after the local app disconnects. The panel labels the information
+source and check/cache time instead of presenting a snapshot as live state. Initial
+registration still requires a separate Auth Key; the panel links to the
+official Keys page and recommends a one-off, non-Ephemeral key. The local app
+and the OpenSurge-managed node do not share login identity or state, and the
+advanced manual configuration remains available when discovery is unavailable.
+
+Tailnet-only access is destination-scoped and fails closed. It never becomes a
+general device egress. Only an outbound with an explicit Exit Node appears in
+per-device outlet selectors. Remote subnet routes must be confirmed explicitly
+and are rejected when they overlap the OpenSurge LAN. Mihomo starts its
+Tailscale node lazily on the outbound's first request. OpenSurge sends a
+best-effort warm-up after gateway start, reload, and mihomo recovery, but the
+first application request may still need a retry. Tailnet-only status remains
+on-demand instead of being tested against a public `generate_204` URL.
+
+This integration is outbound-only: OpenSurge does not advertise its local LAN,
+act as a subnet router, or expose inbound services through the managed node.
 
 ## Web GUI and menu bar app
 
@@ -568,6 +608,17 @@ egress paths, and enforce a device-level domain `REJECT`. Domain/protocol rule
 compilation, templates, and HTTP/MRS rule-provider configuration are covered by
 unit tests; they do not require one Lab run per operator-defined rule.
 
+Use `make lab-test-tailscale` when changing Tailscale destination/source rules,
+MagicDNS, managed-tsnet configuration, or native-app discovery. A dedicated
+Lima Tailnet peer verifies TCP/UDP to an exact peer IP, the complete MagicDNS
+name, Control API discovery, one-device authorization, and fail-closed behavior
+for the other device. The peer-observed source address also rules out a false
+positive through the Mac's native Tailscale route. The first run needs external
+mode-`0600` auth-key files for the peer and managed node: either two one-off keys
+or one reusable, non-Ephemeral key shared by both file variables. Persisted
+identities make ordinary reruns keyless. This bounded gate does not prove a
+subnet router, Exit Node, Headscale, or a real remote LAN.
+
 When changing downstream RA/SLAAC, the BPF broker, the patched Mihomo packet
 listener, IPv6 device identity, or withdrawal on stop, run the topology gates:
 `make lab-test-ipv6-userspace`, `make lab-test-ipv6-same-wifi`, and
@@ -631,6 +682,7 @@ make lab-test-tun
 make lab-test-tun-imported-profile
 make lab-test-tun-imported-egress
 make lab-test-tun-device-policy
+make lab-test-tailscale
 make lab-test-ipv6-userspace
 make lab-test-ipv6-same-wifi
 make lab-test-ipv6-same-lan

@@ -44,6 +44,7 @@ type Overview struct {
 	Recovery             RecoveryState            `json:"recovery"`
 	MihomoRecovery       MihomoRecoveryStatus     `json:"mihomo_recovery"`
 	SleepPrevention      SleepPreventionStatus    `json:"sleep_prevention"`
+	UIPreferences        UIPreferences            `json:"ui_preferences"`
 }
 
 type DoctorRunStatus struct {
@@ -81,6 +82,18 @@ type MenuBarStatus struct {
 	ErrorCode       string                `json:"error_code,omitempty"`
 	MihomoRecovery  MihomoRecoveryStatus  `json:"mihomo_recovery"`
 	SleepPrevention SleepPreventionStatus `json:"sleep_prevention"`
+	UIPreferences   UIPreferences         `json:"ui_preferences"`
+}
+
+const (
+	UILanguageSystem = "system"
+	UILanguageZHCHS  = "zh-Hans"
+	UILanguageEN     = "en"
+)
+
+type UIPreferences struct {
+	SchemaVersion int    `json:"schema_version"`
+	Language      string `json:"language"`
 }
 
 type MihomoRecoveryStatus struct {
@@ -216,8 +229,78 @@ type LocalSystemProxyConfigInput struct {
 }
 
 type DevicePolicyConfigInput struct {
+	// Enabled reports whether a policy file is configured. The field is kept
+	// for schema compatibility; network saves always enable device policy.
 	Enabled       bool     `json:"enabled"`
 	ProtectedIPv4 []string `json:"protected_ipv4"`
+}
+
+type TailscaleSettings struct {
+	Enabled                bool     `json:"enabled"`
+	DisplayName            string   `json:"display_name"`
+	Hostname               string   `json:"hostname"`
+	ControlURL             string   `json:"control_url"`
+	AcceptRoutes           bool     `json:"accept_routes"`
+	MagicDNSSuffixes       []string `json:"magic_dns_suffixes"`
+	PeerCIDRs              []string `json:"peer_cidrs"`
+	SubnetRoutes           []string `json:"subnet_routes"`
+	AllowMac               bool     `json:"allow_mac"`
+	AllowAllDevices        bool     `json:"allow_all_devices"`
+	AllowedDevices         []string `json:"allowed_devices"`
+	ExitNode               string   `json:"exit_node"`
+	ExitNodeAllowLANAccess bool     `json:"exit_node_allow_lan_access"`
+}
+
+type TailscaleUpdateRequest struct {
+	TailscaleSettings
+	// AuthKey is write-only. It is accepted only when replacing the stored key
+	// and is never included in GET or PUT responses.
+	AuthKey string `json:"auth_key,omitempty"`
+}
+
+type TailscaleResponse struct {
+	SchemaVersion   int               `json:"schema_version"`
+	Revision        string            `json:"revision"`
+	Settings        TailscaleSettings `json:"settings"`
+	AuthKeyPresent  bool              `json:"auth_key_present"`
+	IdentityPresent bool              `json:"identity_present"`
+	GatewayActive   bool              `json:"gateway_active"`
+	RuntimeState    string            `json:"runtime_state"`
+	SelectableExit  bool              `json:"selectable_exit"`
+	Warnings        []string          `json:"warnings"`
+}
+
+type TailscaleDiscoveredNode struct {
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	DNSName        string   `json:"dns_name,omitempty"`
+	TailscaleIPs   []string `json:"tailscale_ips"`
+	Online         bool     `json:"online"`
+	ExitNode       bool     `json:"exit_node"`
+	ExitNodeOption bool     `json:"exit_node_option"`
+	SubnetRoutes   []string `json:"subnet_routes"`
+}
+
+type TailscaleDiscoveryResponse struct {
+	SchemaVersion        int                            `json:"schema_version"`
+	Available            bool                           `json:"available"`
+	Cached               bool                           `json:"cached,omitempty"`
+	CachedAt             *time.Time                     `json:"cached_at,omitempty"`
+	BackendState         string                         `json:"backend_state,omitempty"`
+	TailnetName          string                         `json:"tailnet_name,omitempty"`
+	MagicDNS             bool                           `json:"magic_dns"`
+	MagicDNSSuffix       string                         `json:"magic_dns_suffix,omitempty"`
+	Self                 *TailscaleDiscoveredNode       `json:"self,omitempty"`
+	Peers                []TailscaleDiscoveredNode      `json:"peers"`
+	SubnetRouteConflicts []TailscaleSubnetRouteConflict `json:"subnet_route_conflicts"`
+	Error                string                         `json:"error,omitempty"`
+}
+
+type TailscaleSubnetRouteConflict struct {
+	Route     string `json:"route"`
+	Interface string `json:"interface"`
+	PeerID    string `json:"peer_id,omitempty"`
+	PeerName  string `json:"peer_name,omitempty"`
 }
 
 const (
@@ -250,13 +333,16 @@ type ClientAcceptanceRequest struct {
 }
 
 type Operation struct {
-	SchemaVersion int       `json:"schema_version"`
-	ID            string    `json:"id"`
-	Kind          string    `json:"kind"`
-	State         string    `json:"state"`
-	Error         string    `json:"error,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	SchemaVersion  int       `json:"schema_version"`
+	ID             string    `json:"id"`
+	Kind           string    `json:"kind"`
+	State          string    `json:"state"`
+	Error          string    `json:"error,omitempty"`
+	Phase          string    `json:"phase,omitempty"`
+	PhaseStartedAt time.Time `json:"phase_started_at,omitempty"`
+	Notices        []string  `json:"notices,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type Source struct {
@@ -278,6 +364,10 @@ type Source struct {
 	Applied             bool            `json:"applied"`
 	Versions            []SourceVersion `json:"versions"`
 	Diff                SourceDiff      `json:"diff"`
+	EffectiveDigest     string          `json:"effective_digest,omitempty"`
+	EffectiveInventory  Inventory       `json:"effective_inventory"`
+	OverlayCompatible   bool            `json:"overlay_compatible"`
+	OverlayValidation   string          `json:"overlay_validation,omitempty"`
 }
 
 type SourceSnapshotFile struct {
@@ -327,6 +417,34 @@ type SourceImportRequest struct {
 	Name string `json:"name"`
 	Kind string `json:"kind"`
 	URL  string `json:"url"`
+}
+
+type ProfileOverlayResponse struct {
+	SchemaVersion int                           `json:"schema_version"`
+	Revision      string                        `json:"revision"`
+	YAML          string                        `json:"yaml"`
+	Document      mihomo.ProfileOverlayDocument `json:"document"`
+	Desired       bool                          `json:"desired"`
+	Applied       bool                          `json:"applied"`
+	Validation    string                        `json:"validation"`
+}
+
+type ProfileOverlaySaveRequest struct {
+	YAML     *string                        `json:"yaml,omitempty"`
+	Document *mihomo.ProfileOverlayDocument `json:"document,omitempty"`
+}
+
+type ProfileOverlayPreview struct {
+	SchemaVersion        int        `json:"schema_version"`
+	SourceID             string     `json:"source_id"`
+	SourceYAML           string     `json:"source_yaml"`
+	OverlayYAML          string     `json:"overlay_yaml"`
+	EffectiveProfileYAML string     `json:"effective_profile_yaml"`
+	FinalMihomoYAML      string     `json:"final_mihomo_yaml"`
+	OriginalInventory    Inventory  `json:"original_inventory"`
+	EffectiveInventory   Inventory  `json:"effective_inventory"`
+	Diff                 SourceDiff `json:"diff"`
+	Validation           string     `json:"validation"`
 }
 
 type SelectionRequest struct {
@@ -456,6 +574,7 @@ type StateEvent struct {
 	Drift                bool                  `json:"drift"`
 	Recovery             RecoveryState         `json:"recovery"`
 	SleepPrevention      SleepPreventionStatus `json:"sleep_prevention"`
+	UIPreferences        UIPreferences         `json:"ui_preferences"`
 	At                   time.Time             `json:"at"`
 }
 

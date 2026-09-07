@@ -103,7 +103,9 @@ make policy-control-test
 也不需要 sudo。它用 imported profile fixture 验证 `policies`、`policy-select`、
 `connections`、`providers`、`provider-update` 和聚合 `snapshot` 能通过 live
 external-controller API 工作，并会重启 mihomo 证明 `profile.store-selected` 可以
-恢复选中的策略。它还验证本机/私网 mixed-port 目标保持 `DIRECT`、专用
+恢复选中的策略。它还通过真实核心的缓存选择、来源删除/恢复、配置校验和进程重启，
+验证设备默认出口与规则集/模版绑定的失效回退、有效候选保留、原始设置保留和恢复。
+这些断言不代替下游 TUN 流量验证。它还验证本机/私网 mixed-port 目标保持 `DIRECT`、专用
 local-routing 控制器协调三种模式、HTTP-only Global 的 UDP fail-closed，以及普通
 policy 接口不泄露内部组。它适合策略组控制、file/HTTP provider 状态读取和刷新、
 机器可读 CLI、mihomo API wrapper 和 `profile.store-selected` 相关改动；不要用它
@@ -189,7 +191,7 @@ DHCP/DNS 并通过 Mac 网关出站。它不替代 `make lab-test` / `make lab-t
 
 当前进度快照来自 `docs/agent-wiki/sources/validation/real-device-smoke.md`。
 截至 2026-07-06 CST，本轮已经验证 explicit/off runner、TUN runner 和最小
-proxy egress runner 可以在物理下游 LAN 启动，真实 Pixel 手机可以获得
+proxy egress runner 可以在物理下游 LAN 启动，真实 Android 终端可以获得
 `192.168.50.100-200` 范围租约且 router/DNS 为 `192.168.50.1`。手机侧无代理
 直连 HTTPS/NAT、显式 `192.168.50.1:17890` HTTP proxy HTTPS、TUN 模式下无
 显式代理 HTTPS，以及本机受控 upstream proxy 命中 `open-surge-egress` 均已完成
@@ -291,7 +293,7 @@ DoH/Private Relay、UDP/QUIC、imported profile 或策略组切换。Android 镜
 而不是把人工浏览器页面成功当成完整自动化证据。
 
 same-LAN 的真实代理出口可以先用最小 `upstream_proxy` 切片验证，不必先导入完整
-订阅。2026-07-09 已用 `api.ipify.org`、Pixel 测试手机和 LAN HTTP 代理完成这一
+订阅。2026-07-09 已用 `api.ipify.org`、下游测试终端和 LAN HTTP 代理完成这一
 层：Android 默认路由经 Mac、Android 显式代理为空、`dnsmasq.log` 看到 Android 源
 IP 查询 `api.ipify.org`、`mihomo.log` 显示
 `Domain(api.ipify.org) using open-surge-egress[same-lan-http-egress]`，Android
@@ -387,6 +389,24 @@ Lab 中的受控 CONNECT proxy 必须把上游 DNS 查询和 TCP socket 都绑�
 interface。否则 proxy 自己的连接会再次进入正在测试的 TUN，或者把 mihomo fake-IP
 错误地发到物理接口，产生递归或 TLS timeout，而不是有效的出口切换证据。
 
+策略准备态与 App 候选启动的真实接管使用 `make lab-test-policy-workspace`。
+它复用 imported-egress Lab 的 HTTP Provider、受控 CONNECT proxy 和两台客户端，
+把夹具转为仅全局附加配置，检查预览与选择不写 desired 或基础恢复记录，再调用
+App 共用的 `DirectRunner.StartPolicyWorkspace`。门槛要求最终校验阶段仅一次、
+准备态进程与记录退出、工作目录和原生节点选择保留，然后验证 DIRECT/Provider
+两种 TUN 流量及停止清理。普通 `make test` 跳过该 root 用例；它不证明原生 App UI
+或真实 Tailnet Exit Node 公网出口。CLI 持久化配置路径仍由原 imported-egress 门槛覆盖。
+
+准备态的出口失效回归可单独运行：
+
+```sh
+OMG_PREPARED_MIHOMO_BINARY="$PWD/runtime/tools/bin/mihomo" \
+  go test ./internal/controlapi -run 'TestPolicyWorkspaceMissingDeviceEgressRealCore$' -count=1
+```
+
+它验证规则集和模版出口删除后的连续预览、默认出口回退与原选择恢复，只启动随机
+loopback controller 的准备态核心，不接管 TUN、DHCP 或 pf，不能替代上面的接管门槛。
+
 ## Mac 本机模式隔离门槛
 
 运行：
@@ -408,6 +428,15 @@ make lab-test-tun-local-routing
 该门槛同时要求 `mihomo.log` 中本机 TUN source 为 `198.18.0.1`，下游仍保留自己的
 LAN IPv4。`make test`、`make web-test` 或 `make policy-control-test` 都不能替代这条
 真实 host-network/TUN 隔离证据。
+
+该门槛同时启用 `dns.ipv6: true`。无原生上游 IPv6 时，它向 TEST-NET-1
+发送受控 fake-AAAA TCP 与 QUIC 探针，证明流量以 `DEFAULT-TUN`、
+`fdfe:dcba:9876::1` 命中 `open-surge/mac-mode-*`：Rule 继续到导入规则，
+Direct 命中 `DIRECT`，Global 的 TCP 走所选出口而 HTTP-only UDP 明确命中
+`REJECT`。生成配置还必须只包含
+`DEFAULT-TUN + fdfe:dcba:9876::1/128`，不得扩大到 fake-IP `/64`、
+下游 `/64`、`fc00::/7` 或 `opensurge-ipv6`。再结合下游 IPv6 门槛中
+`opensurge-ipv6` / `IN-USER` 仍保持设备策略的证据，才能完成本机与下游隔离结论。
 
 ## 每设备策略门槛
 
@@ -463,6 +492,48 @@ make same-wifi-dhcp-verify-device-policy-recovery
 要求主动 OFFER、Mac DHCP `server_identifier`、恢复的默认路由和两台客户端 HTTPS。
 截至本实现落地时该 gate 尚未在本轮真机运行；因此 same-WiFi per-device 只能标记为
 Experimental / cooperative IPv4，不能借用 virtual lab 的通过记录宣称已验收。
+
+## Tailscale 出站门槛
+
+运行：
+
+```sh
+OMG_LAB_TAILSCALE_PEER_AUTH_KEY_FILE=/private/path/peer.key \
+OMG_LAB_TAILSCALE_OPEN_SURGE_AUTH_KEY_FILE=/private/path/managed.key \
+make lab-test-tailscale
+```
+
+首次设置包含 peer VM 与 managed tsnet 两次独立注册：one-off key 需要两个仓库外、
+mode `0600` 的文件；reusable、非 Ephemeral key 可以让两个变量指向同一个文件。
+身份持久化后，后续运行不再需要相应 key；reusable key 主要服务于销毁状态后的自动
+重建。这个门槛只在 Mac 原生 Tailscale App
+`BackendState=Running` 且没有启用 Exit Node 时继续，并要求：
+
+- 独立 `omg-lab-ts-peer` 只有 Lima NAT/control NIC，没有 `omg0`，默认路由不经过
+  `tailscale0`；
+- Control API 从本机 App 自动发现该 peer、布尔型在线提示和 MagicDNS 后缀；在线字段
+  只作为 advisory 元数据，实际可达性由后续 TCP/UDP fixture 判定；
+- 第一台下游 VM 对 peer 精确 IPv4 的 TCP/UDP request-response，以及完整 MagicDNS
+  名称的 TCP，都命中 `open-surge/tailscale`；
+- 第二台下游 VM 对相同 peer IP/MagicDNS 的 TCP/UDP 都命中 `REJECT`，不能 fall
+  through 到 `DIRECT` 后借用 Mac 原生 Tailscale route；
+- peer fixture 只观察到授权请求，且这些请求来自同一个 managed Tailnet 地址，不能
+  等于 Mac 原生 App 的 Tailnet IPv4；
+- 网关启动前 peer 的现有 route 必须选择 `utun`，含 Auth Key 的 `mihomo.yaml` 在
+  root 写入前后都必须保持 mode `0600`；
+- 停止网关后清除 runtime state；artifact 不包含 Auth Key、完整 Mihomo 配置、原始
+  Mihomo/fixture log、Tailnet 地址或 tsnet state。
+
+这条门槛允许宣称 peer IPv4、MagicDNS、TCP/UDP、来源授权和未授权 fail-closed 已在
+真实 Tailnet + macOS TUN 路径验证。它不允许宣称 subnet router、Exit Node 公网出口、
+Headscale、真实远端 LAN 或全部 NAT traversal/DERP 组合已验证。Lima peer underlay
+通过 Mac 当前普通上游是允许的；判定应用路径依赖 peer 观察到的 managed source 与
+Mihomo action log，不依赖 underlay 出口 IP。
+
+实际远端 LAN 的端口测试见
+[Tailscale 4via6 子网 smoke](../../sources/validation/tailscale-4via6-subnet-smoke.md)。
+该记录区分 Mac 本机、下游手机和远端路由器证据；同一 Mac 兼任 Exit Node 与
+Subnet Router 时，精确子网路由成功不等于公网默认出口或所有下游设备已验证。
 
 ## same-WiFi 上游断链恢复门槛
 

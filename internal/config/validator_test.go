@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -381,6 +382,8 @@ func TestValidateAcceptsImportedMihomoProfile(t *testing.T) {
 	cfg := Default()
 	cfg.Mihomo.ProfileMode = MihomoProfileModeImported
 	cfg.Mihomo.Profile = "./profiles/home.yaml"
+	cfg.Mihomo.ProfileSourceDigest = strings.Repeat("a", 64)
+	cfg.Mihomo.ProfileOverlayDigest = strings.Repeat("b", 64)
 
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("Validate() error = %v", err)
@@ -408,11 +411,36 @@ func TestValidateRejectsInvalidMihomoProfileConfig(t *testing.T) {
 			want: "mihomo.profile requires",
 		},
 		{
+			name: "managed composition digest",
+			edit: func(cfg *Config) {
+				cfg.Mihomo.ProfileSourceDigest = strings.Repeat("a", 64)
+			},
+			want: "composition digests require",
+		},
+		{
 			name: "imported missing profile path",
 			edit: func(cfg *Config) {
 				cfg.Mihomo.ProfileMode = MihomoProfileModeImported
 			},
 			want: "mihomo.profile is required",
+		},
+		{
+			name: "uppercase source digest",
+			edit: func(cfg *Config) {
+				cfg.Mihomo.ProfileMode = MihomoProfileModeImported
+				cfg.Mihomo.Profile = "./profiles/home.yaml"
+				cfg.Mihomo.ProfileSourceDigest = strings.Repeat("A", 64)
+			},
+			want: "profile_source_digest must be a lowercase SHA-256 digest",
+		},
+		{
+			name: "short overlay digest",
+			edit: func(cfg *Config) {
+				cfg.Mihomo.ProfileMode = MihomoProfileModeImported
+				cfg.Mihomo.Profile = "./profiles/home.yaml"
+				cfg.Mihomo.ProfileOverlayDigest = "abcd"
+			},
+			want: "profile_overlay_digest must be a lowercase SHA-256 digest",
 		},
 		{
 			name: "imported with upstream proxy smoke",
@@ -553,5 +581,94 @@ func TestValidateDownstreamIPv6TakeoverContract(t *testing.T) {
 				t.Fatalf("Validate(%s shared-L2 IPv6) error = %v", mode, err)
 			}
 		})
+	}
+}
+
+func TestValidateTailscaleTargetsAndRouteConflicts(t *testing.T) {
+	valid := Default()
+	valid.Tailscale.Enabled = true
+	valid.Tailscale.DisplayName = "Home Tailnet"
+	valid.Tailscale.Hostname = "opensurge-home"
+	valid.Tailscale.ControlURL = "https://controlplane.tailscale.com"
+	valid.Tailscale.AuthKeyFile = "/tmp/tailscale-auth-key"
+	valid.Tailscale.StateDir = "/tmp/tailscale-state"
+	valid.Tailscale.AcceptRoutes = true
+	valid.Tailscale.MagicDNSSuffixes = []string{"home.example.ts.net"}
+	valid.Tailscale.PeerCIDRs = []string{"100.82.10.7/32"}
+	valid.Tailscale.SubnetRoutes = []string{"10.20.0.0/16"}
+	if err := Validate(valid); err != nil {
+		t.Fatalf("Validate(valid Tailscale) error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{"LAN overlap", func(cfg *Config) { cfg.Tailscale.SubnetRoutes = []string{"192.168.50.0/24"} }, "overlaps the OpenSurge LAN"},
+		{"route not accepted", func(cfg *Config) { cfg.Tailscale.AcceptRoutes = false }, "requires tailscale.accept_routes"},
+		{"public subnet route", func(cfg *Config) { cfg.Tailscale.SubnetRoutes = []string{"203.0.113.0/24"} }, "must be a private"},
+		{"wildcard suffix", func(cfg *Config) { cfg.Tailscale.MagicDNSSuffixes = []string{"*.example.ts.net"} }, "without wildcard"},
+		{"noncanonical CIDR", func(cfg *Config) { cfg.Tailscale.PeerCIDRs = []string{"100.82.10.7/24"} }, "canonical IP CIDR"},
+		{"broad Tailnet IPv4 capture", func(cfg *Config) { cfg.Tailscale.PeerCIDRs = []string{"100.64.0.0/10"} }, "one exact Tailscale peer"},
+		{"broad Tailnet IPv6 capture", func(cfg *Config) { cfg.Tailscale.PeerCIDRs = []string{"fd7a:115c:a1e0::/48"} }, "one exact Tailscale peer"},
+		{"LAN access without exit", func(cfg *Config) { cfg.Tailscale.ExitNodeAllowLANAccess = true }, "requires tailscale.exit_node"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid
+			tt.edit(&cfg)
+			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateTailscaleDeviceAccessUsesCurrentLAN(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.Mode = GatewayModeSameWiFiDHCP
+	cfg.Transparent.Mode = TransparentModeTUN
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.AllowedDevices = []string{"phone"}
+	cfg.DevicePolicy.File = "already-loaded.json"
+	scope, err := cfg.LANScope()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := device.CompilePolicyBundleForLAN(device.PolicySet{
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home"}},
+	}, scope, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DevicePolicy.Bundle = &bundle
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate(active device) error = %v", err)
+	}
+
+	cfg.Gateway.LANIP = "192.168.60.1"
+	cfg.DHCP.RangeStart = "192.168.60.100"
+	cfg.DHCP.RangeEnd = "192.168.60.200"
+	cfg.DNS.Listen = cfg.Gateway.LANIP
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), `unknown or inactive device "phone"`) {
+		t.Fatalf("Validate(device outside new LAN) error = %v", err)
+	}
+	if bundle.ActiveLAN != "192.168.50.0/24" || len(bundle.Compiled.Devices) != 1 {
+		t.Fatal("validation mutated the caller's policy snapshot")
+	}
+}
+
+func TestValidateRuntimeDoesNotLoadTailscaleDevicePolicy(t *testing.T) {
+	cfg := Default()
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.AllowAllDevices = true
+	cfg.DevicePolicy.File = filepath.Join(t.TempDir(), "missing-policy.json")
+	if err := ValidateRuntime(cfg); err != nil {
+		t.Fatalf("ValidateRuntime() must not depend on the desired policy file: %v", err)
+	}
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), cfg.DevicePolicy.File) {
+		t.Fatalf("Validate() must report the missing policy file: %v", err)
 	}
 }

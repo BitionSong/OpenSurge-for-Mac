@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { t } from '../i18n'
 
 type PolicyGroupNavProps = {
   groups: string[]
   activeGroup: string | null
   onNavigate: (group: string) => void
+  displayName?: (group: string) => string
 }
 
 function prefersReducedMotion() {
   return typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
 }
 
-export function PolicyGroupNav({ groups, activeGroup, onNavigate }: PolicyGroupNavProps) {
+const identityGroupName = (group: string) => group
+
+export function PolicyGroupNav({ groups, activeGroup, onNavigate, displayName = identityGroupName }: PolicyGroupNavProps) {
   const scrollerRef = useRef<HTMLElement | null>(null)
   const buttonRefs = useRef(new Map<string, HTMLButtonElement>())
   const [canScrollLeft, setCanScrollLeft] = useState(false)
@@ -94,21 +98,21 @@ export function PolicyGroupNav({ groups, activeGroup, onNavigate }: PolicyGroupN
   if (!groups.length) return null
 
   return <div className="policy-group-nav-shell">
-    <button className="policy-group-nav-step" type="button" aria-label="向左浏览策略组" disabled={!canScrollLeft} onClick={() => scrollNavigation(-1)}><span aria-hidden="true">‹</span></button>
+    <button className="policy-group-nav-step" type="button" aria-label={t('向左浏览策略组')} disabled={!canScrollLeft} onClick={() => scrollNavigation(-1)}><span aria-hidden="true">‹</span></button>
     <div className={`policy-group-nav-viewport ${canScrollLeft ? 'can-scroll-left' : ''} ${canScrollRight ? 'can-scroll-right' : ''}`}>
-      <nav className="policy-group-nav" aria-label="策略组快速导航" ref={scrollerRef} onScroll={updateScrollEdges}>
+      <nav className="policy-group-nav" aria-label={t('策略组快速导航')} ref={scrollerRef} onScroll={updateScrollEdges}>
         {groups.map((group, index) => <button
           type="button"
           key={group}
           ref={node => { if (node) buttonRefs.current.set(group, node); else buttonRefs.current.delete(group) }}
-          title={group}
+          title={displayName(group) === group ? group : `${displayName(group)} · ${group}`}
           aria-current={group === activeGroup ? 'location' : undefined}
           tabIndex={group === activeGroup || (!activeGroup && index === 0) ? 0 : -1}
           onClick={() => onNavigate(group)}
           onKeyDown={event => handleKeyDown(event, index)}
-        >{group}</button>)}
+        >{displayName(group)}</button>)}
       </nav>
     </div>
-    <button className="policy-group-nav-step" type="button" aria-label="向右浏览策略组" disabled={!canScrollRight} onClick={() => scrollNavigation(1)}><span aria-hidden="true">›</span></button>
+    <button className="policy-group-nav-step" type="button" aria-label={t('向右浏览策略组')} disabled={!canScrollRight} onClick={() => scrollNavigation(1)}><span aria-hidden="true">›</span></button>
   </div>
 }

@@ -9,6 +9,21 @@ Go gateway、device、mihomo 和 runtime 包中。
 客户端、drift 和恢复状态，并通过一次性 bootstrap URL 打开 Web GUI。唯一独立动作是
 与网关状态无关的临时“合盖保持运行”开关；不要借此把菜单栏演变成第二套网关控制面。
 
+界面语言同样保持单一设置入口：Web GUI 的侧栏提供“跟随系统 / 简体中文 / English”，
+菜单栏面板不再增加第二个选择器。默认值是 `system`；用户没有选择过语言时，Web 按浏览器
+第一语言、菜单栏按 `Locale.preferredLanguages` 的第一项决定显示语言，所有 `zh-*` 偏好
+使用简体中文，其他语言回退到 English。Web 通过受认证的
+`GET/PUT /api/v1/ui-preferences` 保存 `system | zh-Hans | en`，Control Service 将该偏好以
+`0600` 写入用户数据目录的 `preferences.json`，并在 overview、menubar 与 state event 中
+返回同一值。浏览器 localStorage 只用于避免首屏闪烁，不是第二份权威偏好；菜单栏通过现有
+状态轮询最终同步 Web 的选择，在取得第一份状态前仍按本机语言显示。网络模式的三张拓扑图
+使用 React 内联 SVG，共享主题色并通过同一文案目录翻译 `<title>`、`<desc>` 与图内标签，
+不要恢复成明暗主题各一套、无法随语言变化的静态 SVG。
+新增或合并的 Web GUI 页面必须把所有面向用户的中文传入统一 `t()`
+目录，不能只翻译导航和旧页面。`make web-test` 中的 `check-i18n.mjs`
+是覆盖门槛；新功能的英文组件测试还应展开主要对话框/预览，断言可见
+内容不再包含 CJK 字符，避免仅首屏看起来已翻译。
+
 睡眠开关默认关闭、不写 preference，只由 Control Service 内存中的 lease 表示本次运行
 意图。菜单栏与 Web GUI 都调用 `PUT /api/v1/sleep-prevention`；Control Service 保持到 root
 Helper 的长连接，连接 EOF、完整退出或服务崩溃都会释放。普通 `caffeinate` 的 idle sleep
@@ -64,6 +79,32 @@ Web GUI 总览页的“启动网关”与“停止网关”只导航到 `network
 gateway start/stop API。真实生命周期动作留在网络页，使 topology、plan blocker、DHCP
 接管与恢复状态在用户确认前保持可见。“启动网关”只切换页面，不改变当前滚动位置；
 “停止网关”切换页面后滚动到页面底部，完整露出恢复状态机的当前操作按钮。
+
+策略页不再依赖网关已经启动。运行中读取真实运行 core；停止时由 root Helper 通过长连接
+lease 维持一个仅开放随机、带 secret 的 loopback Controller 的 prepared mihomo。页面从同一
+workspace API 获取最终策略组、选择与健康状态，因此 Provider、全局附加节点和 Tailscale
+Exit Node 都以最终合成结果出现，选择写入与下一次网关共用的 mihomo cache。prepared core
+不能开启 mixed/SOCKS/HTTP 业务端口、DNS listener、TUN、DHCP、pf、forwarding 或 IPv6
+packet ingress；Control Service 退出/断连、Helper 重启以及真实 gateway start/stop 都必须
+回收或交接它，且不能根据未验证 PID 杀进程。
+
+没有导入 mihomo YAML 也是策略页的一等状态。启用的全局附加配置以 OpenSurge 的 managed
+最小 profile 为基底，可以独立添加节点、`select` 组与规则。停止态策略页的 read/select/test
+只生成准备态产物并使用原有选择/测速缓存，不修改 desired 或基础恢复记录。用户可以不打开策略页，
+直接从 Web GUI 启动；Control Service 会把服务器端读取的同一来源/附加配置快照交给 Helper，
+Helper 在一个跨进程 lifecycle lock 内合成候选，由 Manager 解析最终网络参数、渲染并执行
+一次真实 `mihomo -t`，成功后才提交 desired 并接管网络；失败不能退回旧配置启动。策略页因此是可选的预览、选择与测速入口，
+不是启动前置步骤。来源、附加配置或 Tailscale 任一为空都必须返回正常的空/部分策略快照，
+而不是崩溃。运行中仍只展示 applied core，不能因为轮询策略页而把尚未显式应用的草稿热重载
+进当前网关。`sudo omg start` 只启动已经持久化的 root-owned desired 配置，不读取用户 Control
+Store 中的 Web 草稿。仅附加配置的运行中草稿通过下一次 App 启动采用。
+候选错误必须显示具体原因并清除旧成功快照；Provider 首次加载尚无节点属于正常空状态。
+
+workspace 请求同时携带 Control Service 捕获的 gateway running/stopped 状态。Helper 在跨进程
+lifecycle lock 内重新读取 state；若 CLI 或另一客户端已经完成 start/stop，本次 read/select/test
+或 start 必须返回刷新/重试，而不能跨状态复用快照。HTTP/file Provider 沿用既有相对、绝对
+和缺省路径解释，不做通用缓存重命名。新合成产物、选择缓存与 Tailscale 身份共用固定的
+受信任工作目录；composition base metadata 位于 runtime 控制目录，并只随显式提交更新。
 
 网络页对 `same_wifi_dhcp` 保留带恢复证据的完整状态机；`same_lan` 与 `isolated_lan`
 使用独立“网关运行控制”卡片直接调用 start/stop operation。未保存配置必须阻止启动，
@@ -143,6 +184,23 @@ OFFER 探测不可用，认证后的 Web GUI 提供带断网警告和显式人�
 如果用户明确选择长期保持静态 IPv4，网关成功停止后也可跳过路由器 DHCP 探测与 Mac
 自动 DHCP 恢复，直接进入 `complete_static`。该动作不调用 `ProbeDHCP` 或 `SetDHCP`，必须
 保留持久化说明，并提示其他客户端需要有效静态配置或另一个 DHCP 服务器。
+
+初次启动、停止、重载、Mihomo 恢复，以及设备策略/来源/Tailscale 配置应用，复用全局
+operation 进度卡。客户端提交即显示等待状态，后续 `phase`、`phase_started_at`、
+`notices` 来自 Go 生命周期实际边界；只显示阶段与耗时，不模拟百分比。进度卡在页面
+切换后继续显示，刷新时只恢复未完成操作，不重新弹出旧成功记录。网络页的 DHCP 接管
+client acceptance 不会被“启动完成”替代。
+
+Helper 请求可选 `watch_progress`：新 Helper 先发送带 `progress` 的 JSON 帧，最后仍
+返回原有结果；旧客户端不请求该字段时只收到最终帧，新客户端也兼容旧 Helper 的单帧
+响应。进度写入超时后停止观察，不能因为 UI 断开而阻塞网络清理。同步配置 API 仍保持
+原请求/响应契约，可用 `X-OpenSurge-Operation-ID` 关联进行中的记录；该字段不是重放
+授权，重复 ID 拒绝，ID 仅允许 1–128 个字母、数字、连字符或下划线。
+
+同一操作共享状态轮询；读取失败可重试 GET，但不得自动重试原 POST/PUT。浏览器断连
+或等待超时应显示“结果尚未确认”，保留原 ID 供重新查询和诊断，不将其当作网关已停止、
+已失败或应该重新启动。认证失效继续遵守停止轮询与 SSE 的既有边界。
+
 订阅完整 URL 存在用户应用支持目录的独立 `credentials/sources.json`，目录权限为 `0700`、
 文件权限为 `0600`；公开 sources JSON 只保留脱敏 origin，API、日志和诊断不得返回刷新
 凭据。升级只尝试一次从旧 `com.opensurge.sources` Keychain 项迁移，并无论成功或失败都
