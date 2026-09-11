@@ -5,6 +5,13 @@ OpenSurge 的完整 GUI 是 `web/` 中的 React 应用，菜单栏 App 是
 launcher。两者都只访问 `cmd/opensurge-control` 提供的 loopback API；业务规则继续位于
 Go gateway、device、mihomo 和 runtime 包中。
 
+原生应用图标由 `apps/menubar/Resources/OpenSurgeAppIcon.png` 经
+`scripts/build-menubar-app.sh` 等比生成各档 `.icns` 资源。1024 × 1024 源图已包含
+透明留白：白色底板主体宽约 824 px、每侧留白约 100 px；构建时不要再次补同样的边距。
+此比例用于传统 `.icns` 的视觉对齐，不是所有 macOS 图标格式的通用尺寸契约。
+未来采用 Icon Composer 时应按其模板重新校准并验证系统实际渲染。菜单栏状态项使用
+独立的 `OpenSurgeMenuBarIcon.png`，显示尺寸为 18 × 18 pt，不跟随应用图标的留白调整。
+
 菜单栏 App 不提供 start/stop 或策略切换。它只消费 `/api/v1/menubar`，显示网关、
 客户端、drift 和恢复状态，并通过一次性 bootstrap URL 打开 Web GUI。唯一独立动作是
 与网关状态无关的临时“合盖保持运行”开关；不要借此把菜单栏演变成第二套网关控制面。
