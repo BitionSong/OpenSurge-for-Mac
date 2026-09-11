@@ -40,6 +40,7 @@ func (s *Server) handleProxyHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "mihomo_unavailable", err.Error())
 		return
 	}
+	snapshot.Proxies = mihomo.VisibleProxyHealth(snapshot.Proxies)
 	writeJSON(w, http.StatusOK, ProxyHealthResponse{SchemaVersion: SchemaVersion, TestURL: snapshot.TestURL, Proxies: snapshot.Proxies})
 }
 
@@ -64,6 +65,7 @@ func (s *Server) handleProxyHealthTests(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadGateway, "mihomo_unavailable", err.Error())
 		return
 	}
+	snapshot.Proxies = mihomo.VisibleProxyHealth(snapshot.Proxies)
 	available := make(map[string]mihomo.ProxyHealth, len(snapshot.Proxies))
 	for _, proxy := range snapshot.Proxies {
 		available[proxy.Name] = proxy
@@ -84,7 +86,9 @@ func (s *Server) handleProxyHealthTests(w http.ResponseWriter, r *http.Request) 
 		go func() {
 			defer workers.Done()
 			for index := range jobs {
-				results[index] = s.measureProxyDelay(r.Context(), cfg, names[index], snapshot.TestURL, 5*time.Second)
+				proxy := available[names[index]]
+				testURL, timeout := proxyHealthProbe(proxy, snapshot.TestURL)
+				results[index] = s.measureProxyDelay(r.Context(), cfg, names[index], testURL, timeout)
 			}
 		}()
 	}
@@ -94,6 +98,13 @@ func (s *Server) handleProxyHealthTests(w http.ResponseWriter, r *http.Request) 
 	close(jobs)
 	workers.Wait()
 	writeJSON(w, http.StatusOK, ProxyHealthTestResponse{SchemaVersion: SchemaVersion, TestURL: snapshot.TestURL, Results: results})
+}
+
+func proxyHealthProbe(proxy mihomo.ProxyHealth, defaultURL string) (string, time.Duration) {
+	if proxy.Role == "exit_node" {
+		return mihomo.DefaultTailscaleExitNodeTestURL, mihomo.DefaultTailscaleExitNodeTestTimeout
+	}
+	return defaultURL, 5 * time.Second
 }
 
 func uniqueProxyNames(values []string) []string {

@@ -1,6 +1,9 @@
 gateway:
   interface: "en0"
   lan_ip: "192.168.50.1"
+  # Real prefix length of the downstream LAN. pf NAT, TUN route exclusion,
+  # DHCP range validation, and device address ownership are derived from it.
+  lan_prefix_len: 24
   upstream_interface: "en0"
 
 dhcp:
@@ -21,12 +24,14 @@ dns:
   port: 53
   # OpenSurge owns DNS even in imported mode so fake-IP and TUN stay aligned.
   upstream: "127.0.0.1#1053"
+  ipv6: false
 
 mihomo:
   binary: "./bin/mihomo"
   config: "./runtime/mihomo.yaml"
   profile_mode: "imported"
   profile: "./mihomo-profile.example.yaml"
+  store_fake_ip: true
   mixed_port: 7890
   redir_port: 0
   api_addr: "127.0.0.1:9090"
@@ -43,6 +48,13 @@ transparent:
   tun_auto_route: true
   tun_auto_detect_interface: false
   tun_strict_route: false
+  tun_ipv6: "off"
+  ipv6_shared_l2_ready: false
+  ipv6_packet_broker_binary: "opensurge-network"
+  ipv6_packet_mtu: 1500
+
+local_system_proxy:
+  enabled: false
 
 runtime:
   dir: "./runtime"

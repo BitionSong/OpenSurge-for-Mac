@@ -8,9 +8,11 @@ MIHOMO="${OPENSURGE_MIHOMO_BINARY:-$ROOT/bin/mihomo}"
 DNSMASQ="${OPENSURGE_DNSMASQ_BINARY:-$(command -v dnsmasq || true)}"
 VERSION="${OPENSURGE_VERSION:-0.1.0}"
 BUILD_NUMBER="${OPENSURGE_BUILD_NUMBER:-1}"
+RELEASE_TAG="${OPENSURGE_RELEASE_TAG:-v$VERSION}"
 APP_ARCH="${OPENSURGE_APP_ARCH:-$(uname -m)}"
 ARTIFACTS="$ROOT/artifacts/gui-installer"
 PAYLOAD="$ARTIFACTS/payload"
+PKG_SCRIPTS="$ARTIFACTS/pkg-scripts"
 APP_ROOT="$PAYLOAD/Library/Application Support/OpenSurge"
 LICENSE_ROOT="$APP_ROOT/share/licenses"
 GO_BIN="${GO_BIN:-$(command -v go || true)}"
@@ -19,6 +21,7 @@ PNPM_BIN="${PNPM_BIN:-$(command -v pnpm || true)}"
 export GOCACHE="${GOCACHE:-/private/tmp/opensurge-gui-build-cache}"
 export OPENSURGE_VERSION="$VERSION"
 export OPENSURGE_BUILD_NUMBER="$BUILD_NUMBER"
+export OPENSURGE_RELEASE_TAG="$RELEASE_TAG"
 case "$APP_ARCH" in
   arm64) GO_ARCH=arm64 ;;
   x86_64) GO_ARCH=amd64 ;;
@@ -49,7 +52,9 @@ GOOS=darwin GOARCH="$GO_ARCH" CGO_ENABLED=0 "$GO_BIN" build -trimpath -o "$ROOT/
 "$ROOT/scripts/build-menubar-app.sh"
 
 rm -rf "$ARTIFACTS"
-mkdir -p "$APP_ROOT/bin" "$APP_ROOT/share" "$LICENSE_ROOT" "$PAYLOAD/Library/PrivilegedHelperTools" "$PAYLOAD/Applications"
+mkdir -p "$APP_ROOT/bin" "$APP_ROOT/share" "$LICENSE_ROOT" "$PAYLOAD/Library/PrivilegedHelperTools" "$PAYLOAD/Applications" "$PKG_SCRIPTS"
+ditto --norsrc --noextattr "$ROOT/packaging/pkg-scripts" "$PKG_SCRIPTS"
+install -m 0755 "$ROOT/bin/omg" "$PKG_SCRIPTS/omg-recovery"
 install -m 0755 "$MIHOMO" "$APP_ROOT/bin/mihomo"
 install -m 0755 "$DNSMASQ" "$APP_ROOT/bin/dnsmasq"
 install -m 0755 "$ROOT/bin/omg" "$APP_ROOT/bin/omg"
@@ -65,6 +70,7 @@ install -m 0644 "$ROOT/LICENSE" "$LICENSE_ROOT/GPL-3.0.txt"
 install -m 0644 "$ROOT/third_party/licenses/dnsmasq-COPYING" "$LICENSE_ROOT/GPL-2.0.txt"
 install -m 0644 "$ROOT/third_party/licenses/Apache-2.0.txt" "$LICENSE_ROOT/Apache-2.0.txt"
 install -m 0644 "$ROOT/third_party/licenses/yaml-v3-LICENSE" "$LICENSE_ROOT/yaml-v3-LICENSE"
+install -m 0644 "$ROOT/third_party/licenses/bbolt-MIT.txt" "$LICENSE_ROOT/bbolt-MIT.txt"
 install -m 0644 "$ROOT/third_party/licenses/react-MIT.txt" "$LICENSE_ROOT/react-MIT.txt"
 install -m 0644 "$ROOT/THIRD_PARTY_NOTICES.md" "$LICENSE_ROOT/THIRD_PARTY_NOTICES.md"
 ditto --norsrc --noextattr "$ROOT/bin/OpenSurge.app" "$PAYLOAD/Applications/OpenSurge.app"
@@ -72,6 +78,7 @@ xattr -cr "$PAYLOAD"
 
 for executable in \
   "$PAYLOAD/Applications/OpenSurge.app/Contents/MacOS/OpenSurgeMenuBar" \
+  "$PKG_SCRIPTS/omg-recovery" \
   "$APP_ROOT/bin/omg" \
   "$APP_ROOT/bin/opensurge-install-config" \
   "$APP_ROOT/bin/opensurge-network" \
@@ -87,14 +94,14 @@ done
 
 if [[ -n "${OPENSURGE_CODESIGN_IDENTITY:-}" ]]; then
   codesign --force --options runtime --timestamp --sign "$OPENSURGE_CODESIGN_IDENTITY" "$PAYLOAD/Library/PrivilegedHelperTools/com.opensurge.helper"
-  codesign --force --options runtime --timestamp --sign "$OPENSURGE_CODESIGN_IDENTITY" "$APP_ROOT/bin/omg" "$APP_ROOT/bin/opensurge-install-config" "$APP_ROOT/share/opensurge-control"
+  codesign --force --options runtime --timestamp --sign "$OPENSURGE_CODESIGN_IDENTITY" "$PKG_SCRIPTS/omg-recovery" "$APP_ROOT/bin/omg" "$APP_ROOT/bin/opensurge-install-config" "$APP_ROOT/bin/opensurge-network" "$APP_ROOT/share/opensurge-control"
   codesign --force --deep --options runtime --timestamp --sign "$OPENSURGE_CODESIGN_IDENTITY" "$PAYLOAD/Applications/OpenSurge.app"
 fi
 
 PKG_ARGS=(
   --root "$PAYLOAD"
   --component-plist "$ROOT/packaging/gui-components.plist"
-  --scripts "$ROOT/packaging/pkg-scripts"
+  --scripts "$PKG_SCRIPTS"
   --identifier com.opensurge.installer
   --version "$VERSION"
   --install-location /

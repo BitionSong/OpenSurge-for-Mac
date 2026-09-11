@@ -3,11 +3,15 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"open-mihomo-gateway/internal/device"
+	"open-mihomo-gateway/internal/lan"
 )
 
 func Validate(cfg Config) error {
@@ -36,6 +40,16 @@ func validate(cfg Config, checkDevicePolicy bool) error {
 	if net.ParseIP(cfg.Gateway.LANIP).To4() == nil {
 		return fmt.Errorf("gateway.lan_ip must be a valid IPv4 address")
 	}
+	if cfg.Gateway.LANPrefixLen != 0 && !lan.ValidPrefixLen(cfg.Gateway.LANPrefixLen) {
+		return fmt.Errorf("gateway.lan_prefix_len must be between %d and %d", lan.MinPrefixLen, lan.MaxPrefixLen)
+	}
+	scope, err := cfg.LANScope()
+	if err != nil {
+		return err
+	}
+	if !scope.UsableHost(scope.Gateway) {
+		return fmt.Errorf("gateway.lan_ip must not be the %s network or broadcast address", scope)
+	}
 	if cfg.DHCP.Enabled {
 		if strings.TrimSpace(cfg.DHCP.Binary) == "" {
 			return fmt.Errorf("dhcp.binary is required")
@@ -49,9 +63,20 @@ func validate(cfg Config, checkDevicePolicy bool) error {
 		if strings.TrimSpace(cfg.DHCP.LeaseTime) == "" {
 			return fmt.Errorf("dhcp.lease_time is required")
 		}
+		if err := validateDHCPRangeInLAN(cfg, scope); err != nil {
+			return err
+		}
+	}
+	if err := validateOptionalBypassAddresses(cfg.DHCP); err != nil {
+		return err
 	}
 	if checkDevicePolicy {
-		if err := validateDevicePolicy(cfg); err != nil {
+		// Config edits can clear the bundle or change its LAN. All validators,
+		// including Tailscale source authorization, need the same current policy.
+		if err := PrepareDevicePolicy(&cfg); err != nil {
+			return err
+		}
+		if err := validateDevicePolicy(cfg, scope); err != nil {
 			return err
 		}
 	}
@@ -85,6 +110,9 @@ func validate(cfg Config, checkDevicePolicy bool) error {
 	if err := validateMihomoProfile(cfg); err != nil {
 		return err
 	}
+	if err := validateTailscale(cfg, scope, checkDevicePolicy); err != nil {
+		return err
+	}
 	if strings.TrimSpace(cfg.PF.AnchorName) == "" {
 		return fmt.Errorf("pf.anchor_name is required")
 	}
@@ -96,6 +124,15 @@ func validate(cfg Config, checkDevicePolicy bool) error {
 	}
 	if err := validateTransparent(cfg.Transparent); err != nil {
 		return err
+	}
+	if cfg.Transparent.IPv6Requested() && cfg.Gateway.SameLAN() && !cfg.Transparent.IPv6SharedL2Ready {
+		if cfg.Gateway.Mode == GatewayModeSameLAN {
+			return fmt.Errorf("transparent.tun_ipv6 in gateway.mode same_lan requires transparent.ipv6_shared_l2_ready: true after selected clients use the OpenSurge ULA, link-local default gateway, and DNS without a competing IPv6 default route")
+		}
+		return fmt.Errorf("transparent.tun_ipv6 in gateway.mode same_wifi_dhcp requires transparent.ipv6_shared_l2_ready: true after competing IPv6 RA/default routes have been removed from the shared LAN")
+	}
+	if cfg.LocalSystemProxy.Enabled && !cfg.Transparent.TUNEnabled() {
+		return fmt.Errorf("local_system_proxy.enabled requires transparent.mode: \"tun\"")
 	}
 	if cfg.Gateway.SameLAN() {
 		if cfg.Transparent.Mode != TransparentModeTUN {
@@ -110,9 +147,6 @@ func validate(cfg Config, checkDevicePolicy bool) error {
 	case GatewayModeSameWiFiDHCP:
 		if !cfg.DHCP.Enabled {
 			return fmt.Errorf("gateway.mode same_wifi_dhcp requires dhcp.enabled: true")
-		}
-		if err := validateDHCPRangeInLAN(cfg); err != nil {
-			return err
 		}
 	}
 	if err := validateUpstreamProxy(cfg.UpstreamProxy); err != nil {
@@ -149,7 +183,7 @@ func validateDNSUpstream(value string) error {
 	return nil
 }
 
-func validateDevicePolicy(cfg Config) error {
+func validateDevicePolicy(cfg Config, scope lan.Scope) error {
 	if strings.TrimSpace(cfg.DevicePolicy.File) == "" {
 		if len(cfg.DevicePolicy.ProtectedIPv4) > 0 {
 			return fmt.Errorf("device_policy.protected_ipv4 requires device_policy.file")
@@ -159,25 +193,129 @@ func validateDevicePolicy(cfg Config) error {
 	bundle := cfg.DevicePolicy.Bundle
 	if bundle == nil {
 		var err error
-		bundle, err = loadDevicePolicyBundle(cfg.DevicePolicy.File)
+		bundle, err = loadDevicePolicyBundle(cfg.DevicePolicy.File, scope, cfg.Gateway.Mode == GatewayModeSameLAN)
 		if err != nil {
 			return fmt.Errorf("device_policy.file: %w", err)
 		}
 	}
-	if err := device.ValidatePolicySetForLANWithProtected(bundle.Policy, cfg.Gateway.LANIP, cfg.DevicePolicy.ProtectedIPv4); err != nil {
+	activePolicy := device.ActivePolicySetForLAN(bundle.Policy, scope)
+	if err := validateRouterBypass(cfg, scope, activePolicy); err != nil {
+		return fmt.Errorf("device_policy.file: %w", err)
+	}
+	protected := append([]string(nil), cfg.DevicePolicy.ProtectedIPv4...)
+	if device.UsesUpstreamRouter(activePolicy) {
+		protected = append(protected, cfg.DHCP.BypassGateway)
+	}
+	if err := device.ValidatePolicySetForLAN(bundle.Policy, scope, protected, cfg.Gateway.Mode == GatewayModeSameLAN); err != nil {
 		return fmt.Errorf("device_policy.file: %w", err)
 	}
 	return nil
+}
+
+// ValidateDevicePolicyCandidate applies the complete topology and DHCP
+// contract to a candidate policy before the root helper writes it.
+func ValidateDevicePolicyCandidate(cfg Config, policy device.PolicySet) error {
+	scope, err := cfg.LANScope()
+	if err != nil {
+		return err
+	}
+	bundle, err := device.CompilePolicyBundleForLAN(policy, scope, cfg.Gateway.Mode == GatewayModeSameLAN)
+	if err != nil {
+		return err
+	}
+	candidate := cfg
+	if strings.TrimSpace(candidate.DevicePolicy.File) == "" {
+		candidate.DevicePolicy.File = "<candidate>"
+	}
+	candidate.DevicePolicy.Bundle = &bundle
+	return validate(candidate, true)
+}
+
+func validateOptionalBypassAddresses(cfg DHCPConfig) error {
+	if value := strings.TrimSpace(cfg.BypassGateway); value != "" && net.ParseIP(value).To4() == nil {
+		return fmt.Errorf("dhcp.bypass_gateway must be a valid IPv4 address")
+	}
+	for _, value := range cfg.BypassDNS {
+		if net.ParseIP(strings.TrimSpace(value)).To4() == nil {
+			return fmt.Errorf("dhcp.bypass_dns entry %q must be a valid IPv4 address", value)
+		}
+	}
+	return nil
+}
+
+func validateRouterBypass(cfg Config, scope lan.Scope, policy device.PolicySet) error {
+	if !device.UsesUpstreamRouter(policy) {
+		return nil
+	}
+	if cfg.Gateway.Mode != GatewayModeSameWiFiDHCP {
+		return fmt.Errorf("gateway_target %q is only available in gateway.mode same_wifi_dhcp", device.GatewayTargetUpstreamRouter)
+	}
+	gateway := net.ParseIP(strings.TrimSpace(cfg.DHCP.BypassGateway)).To4()
+	if gateway == nil {
+		return fmt.Errorf("gateway_target %q requires dhcp.bypass_gateway", device.GatewayTargetUpstreamRouter)
+	}
+	if len(cfg.DHCP.BypassDNS) == 0 {
+		return fmt.Errorf("gateway_target %q requires at least one dhcp.bypass_dns address", device.GatewayTargetUpstreamRouter)
+	}
+	// Bypassed clients keep their OpenSurge lease, so the router they are sent
+	// to has to be reachable on-link from the same LAN.
+	if !scope.Contains(gateway) {
+		return fmt.Errorf("dhcp.bypass_gateway %s must remain in gateway LAN %s", gateway, scope)
+	}
+	if !scope.UsableHost(gateway) || gateway.Equal(scope.Gateway) {
+		return fmt.Errorf("dhcp.bypass_gateway must be a usable host address different from gateway.lan_ip")
+	}
+	start := net.ParseIP(cfg.DHCP.RangeStart).To4()
+	end := net.ParseIP(cfg.DHCP.RangeEnd).To4()
+	if start != nil && end != nil && bytesCompareIPv4(gateway, start) >= 0 && bytesCompareIPv4(gateway, end) <= 0 {
+		return fmt.Errorf("dhcp.bypass_gateway must not be inside the DHCP range")
+	}
+	return nil
+}
+
+func bytesCompareIPv4(left, right net.IP) int {
+	for index := 0; index < net.IPv4len; index++ {
+		if left[index] < right[index] {
+			return -1
+		}
+		if left[index] > right[index] {
+			return 1
+		}
+	}
+	return 0
 }
 
 // PrepareDevicePolicy loads and compiles the policy exactly once for a config
 // instance. Gateway startup, DHCP rendering and mihomo rendering all consume
 // the resulting immutable bundle.
 func PrepareDevicePolicy(cfg *Config) error {
-	if strings.TrimSpace(cfg.DevicePolicy.File) == "" || cfg.DevicePolicy.Bundle != nil {
+	if strings.TrimSpace(cfg.DevicePolicy.File) == "" {
 		return nil
 	}
-	bundle, err := loadDevicePolicyBundle(cfg.DevicePolicy.File)
+	if cfg.DevicePolicy.SelectionCachePath == "" {
+		directory := filepath.Dir(cfg.Mihomo.Config)
+		if cfg.Mihomo.ProfileMode == MihomoProfileModeImported && cfg.Mihomo.Profile != "" {
+			directory = filepath.Dir(cfg.Mihomo.Profile)
+		}
+		cfg.DevicePolicy.SelectionCachePath = filepath.Join(directory, "cache.db")
+	}
+	scope, err := cfg.LANScope()
+	if err != nil {
+		return err
+	}
+	ipOnlyDevicesActive := cfg.Gateway.Mode == GatewayModeSameLAN
+	if cfg.DevicePolicy.Bundle != nil && cfg.DevicePolicy.Bundle.IPOnlyDevicesActive == ipOnlyDevicesActive && cfg.DevicePolicy.Bundle.ActiveLAN == scope.String() {
+		return nil
+	}
+	if cfg.DevicePolicy.Bundle != nil {
+		bundle, err := device.CompilePolicyBundleForLAN(cfg.DevicePolicy.Bundle.Policy, scope, ipOnlyDevicesActive)
+		if err != nil {
+			return fmt.Errorf("device_policy.file: %w", err)
+		}
+		cfg.DevicePolicy.Bundle = &bundle
+		return nil
+	}
+	bundle, err := loadDevicePolicyBundle(cfg.DevicePolicy.File, scope, ipOnlyDevicesActive)
 	if err != nil {
 		return fmt.Errorf("device_policy.file: %w", err)
 	}
@@ -185,7 +323,7 @@ func PrepareDevicePolicy(cfg *Config) error {
 	return nil
 }
 
-func loadDevicePolicyBundle(path string) (*device.PolicyBundle, error) {
+func loadDevicePolicyBundle(path string, scope lan.Scope, ipOnlyDevicesActive bool) (*device.PolicyBundle, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
@@ -193,31 +331,32 @@ func loadDevicePolicyBundle(path string) (*device.PolicyBundle, error) {
 	if info.IsDir() {
 		return nil, fmt.Errorf("must not be a directory")
 	}
-	bundle, err := device.LoadPolicyBundle(path)
+	bundle, err := device.LoadPolicyBundleForLAN(path, scope, ipOnlyDevicesActive)
 	if err != nil {
 		return nil, err
 	}
 	return &bundle, nil
 }
 
-func validateDHCPRangeInLAN(cfg Config) error {
-	lanIP := cfg.LANIP().To4()
+// validateDHCPRangeInLAN keeps the pool inside the LAN dnsmasq actually serves.
+// dnsmasq refuses a range that is not on one of its interface subnets, so this
+// applies to every DHCP-owning topology rather than only same_wifi_dhcp.
+func validateDHCPRangeInLAN(cfg Config, scope lan.Scope) error {
 	start := net.ParseIP(cfg.DHCP.RangeStart).To4()
 	end := net.ParseIP(cfg.DHCP.RangeEnd).To4()
-	if lanIP == nil || start == nil || end == nil {
-		return fmt.Errorf("same_wifi_dhcp requires IPv4 LAN and DHCP range addresses")
+	if start == nil || end == nil {
+		return fmt.Errorf("dhcp.enabled requires IPv4 dhcp.range_start and dhcp.range_end")
 	}
-	if lanIP[0] != start[0] || lanIP[1] != start[1] || lanIP[2] != start[2] ||
-		lanIP[0] != end[0] || lanIP[1] != end[1] || lanIP[2] != end[2] {
-		return fmt.Errorf("gateway.mode same_wifi_dhcp requires the DHCP range to remain in %d.%d.%d.0/24", lanIP[0], lanIP[1], lanIP[2])
+	if !scope.Contains(start) || !scope.Contains(end) {
+		return fmt.Errorf("dhcp.enabled requires the DHCP range to remain in gateway LAN %s", scope)
 	}
-	if start[3] > end[3] {
+	if bytesCompareIPv4(start, end) > 0 {
 		return fmt.Errorf("dhcp.range_start must not be after dhcp.range_end")
 	}
-	if start[3] == 0 || end[3] == 255 {
-		return fmt.Errorf("same_wifi_dhcp DHCP range must not include the network or broadcast address")
+	if !scope.UsableHost(start) || !scope.UsableHost(end) {
+		return fmt.Errorf("the DHCP range must not include the %s network or broadcast address", scope)
 	}
-	if lanIP[3] >= start[3] && lanIP[3] <= end[3] {
+	if bytesCompareIPv4(scope.Gateway, start) >= 0 && bytesCompareIPv4(scope.Gateway, end) <= 0 {
 		return fmt.Errorf("gateway.lan_ip must not be inside the DHCP range")
 	}
 	return nil
@@ -229,9 +368,18 @@ func validateMihomoProfile(cfg Config) error {
 		if strings.TrimSpace(cfg.Mihomo.Profile) != "" {
 			return fmt.Errorf("mihomo.profile requires mihomo.profile_mode: \"imported\"")
 		}
+		if cfg.Mihomo.ProfileSourceDigest != "" || cfg.Mihomo.ProfileOverlayDigest != "" {
+			return fmt.Errorf("mihomo profile composition digests require mihomo.profile_mode: \"imported\"")
+		}
 	case MihomoProfileModeImported:
 		if strings.TrimSpace(cfg.Mihomo.Profile) == "" {
 			return fmt.Errorf("mihomo.profile is required when mihomo.profile_mode is imported")
+		}
+		if cfg.Mihomo.ProfileSourceDigest != "" && !validSHA256Digest(cfg.Mihomo.ProfileSourceDigest) {
+			return fmt.Errorf("mihomo.profile_source_digest must be a lowercase SHA-256 digest")
+		}
+		if cfg.Mihomo.ProfileOverlayDigest != "" && !validSHA256Digest(cfg.Mihomo.ProfileOverlayDigest) {
+			return fmt.Errorf("mihomo.profile_overlay_digest must be a lowercase SHA-256 digest")
 		}
 		if cfg.UpstreamProxy.Enabled {
 			return fmt.Errorf("upstream_proxy.enabled cannot be true when mihomo.profile_mode is imported")
@@ -242,7 +390,35 @@ func validateMihomoProfile(cfg Config) error {
 	return nil
 }
 
+func validSHA256Digest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func validateTransparent(cfg TransparentConfig) error {
+	switch cfg.TUNIPv6 {
+	case TUNIPv6Off, TUNIPv6Auto, TUNIPv6Always:
+	default:
+		return fmt.Errorf("transparent.tun_ipv6 must be off, auto, or always")
+	}
+	if cfg.TUNIPv6 != TUNIPv6Off {
+		if cfg.Mode != TransparentModeTUN {
+			return fmt.Errorf("transparent.tun_ipv6 %s requires transparent.mode: \"tun\"", cfg.TUNIPv6)
+		}
+		if strings.TrimSpace(cfg.IPv6PacketBrokerBinary) == "" {
+			return fmt.Errorf("transparent.ipv6_packet_broker_binary is required when downstream IPv6 takeover is enabled")
+		}
+		if cfg.IPv6PacketMTU < 1280 || cfg.IPv6PacketMTU > 9000 {
+			return fmt.Errorf("transparent.ipv6_packet_mtu must be between 1280 and 9000")
+		}
+	}
 	switch cfg.Mode {
 	case TransparentModeOff:
 		return nil
@@ -268,8 +444,8 @@ func validateUpstreamProxy(cfg UpstreamProxyConfig) error {
 	if strings.TrimSpace(cfg.Name) == "" {
 		return fmt.Errorf("upstream_proxy.name is required when upstream_proxy.enabled is true")
 	}
-	if strings.TrimSpace(cfg.Name) == "open-surge-egress" {
-		return fmt.Errorf("upstream_proxy.name must differ from reserved proxy group open-surge-egress")
+	if strings.TrimSpace(cfg.Name) == "open-surge-egress" || strings.HasPrefix(strings.TrimSpace(cfg.Name), "open-surge/mac-") {
+		return fmt.Errorf("upstream_proxy.name must differ from reserved OpenSurge proxy groups")
 	}
 	if !validRuleToken(cfg.Name) {
 		return fmt.Errorf("upstream_proxy.name must not contain whitespace, commas, or control characters")
@@ -295,6 +471,140 @@ func validateUpstreamProxy(cfg UpstreamProxyConfig) error {
 		return fmt.Errorf("upstream_proxy credentials must not contain control characters")
 	}
 	return nil
+}
+
+func validateTailscale(cfg Config, scope lan.Scope, checkDevicePolicy bool) error {
+	ts := cfg.Tailscale
+	if !ts.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(ts.DisplayName) == "" || hasControlChar(ts.DisplayName) {
+		return fmt.Errorf("tailscale.display_name must be a non-empty label without control characters")
+	}
+	if len([]rune(ts.DisplayName)) > 64 {
+		return fmt.Errorf("tailscale.display_name must not exceed 64 characters")
+	}
+	if !validDNSLabel(ts.Hostname) {
+		return fmt.Errorf("tailscale.hostname must be a DNS label using letters, numbers, and hyphens")
+	}
+	if err := validateTailscaleControlURL(ts.ControlURL); err != nil {
+		return err
+	}
+	if strings.TrimSpace(ts.AuthKeyFile) == "" {
+		return fmt.Errorf("tailscale.auth_key_file is required")
+	}
+	if strings.TrimSpace(ts.StateDir) == "" {
+		return fmt.Errorf("tailscale.state_dir is required")
+	}
+	if ts.ExitNodeAllowLANAccess && strings.TrimSpace(ts.ExitNode) == "" {
+		return fmt.Errorf("tailscale.exit_node_allow_lan_access requires tailscale.exit_node")
+	}
+	if ts.ExitNode != "" && !validRuleToken(ts.ExitNode) {
+		return fmt.Errorf("tailscale.exit_node must not contain whitespace, commas, or control characters")
+	}
+	if ts.AllowAllDevices && len(ts.AllowedDevices) > 0 {
+		return fmt.Errorf("tailscale.allowed_devices must be empty when tailscale.allow_all_devices is true")
+	}
+	for _, suffix := range ts.MagicDNSSuffixes {
+		if !validDomainRule(suffix) || strings.HasPrefix(suffix, ".") || strings.Contains(suffix, "*") {
+			return fmt.Errorf("tailscale.magic_dns_suffixes entry %q must be a domain suffix without wildcard", suffix)
+		}
+	}
+	if err := validateTailscaleCIDRs("peer_cidrs", ts.PeerCIDRs, false, scope); err != nil {
+		return err
+	}
+	if err := validateTailscaleCIDRs("subnet_routes", ts.SubnetRoutes, true, scope); err != nil {
+		return err
+	}
+	if len(ts.SubnetRoutes) > 0 && !ts.AcceptRoutes {
+		return fmt.Errorf("tailscale.subnet_routes requires tailscale.accept_routes: true")
+	}
+	if !checkDevicePolicy {
+		return nil
+	}
+	if (ts.AllowAllDevices || len(ts.AllowedDevices) > 0) && cfg.DevicePolicy.Bundle == nil {
+		return fmt.Errorf("tailscale device access requires device_policy.file")
+	}
+	if cfg.DevicePolicy.Bundle != nil {
+		available := make(map[string]bool, len(cfg.DevicePolicy.Bundle.Compiled.Devices))
+		for _, managed := range cfg.DevicePolicy.Bundle.Compiled.Devices {
+			available[managed.ID] = true
+		}
+		for _, id := range ts.AllowedDevices {
+			if !validRuleToken(id) {
+				return fmt.Errorf("tailscale.allowed_devices entry %q is not a valid device ID", id)
+			}
+			if !available[id] {
+				return fmt.Errorf("tailscale.allowed_devices references unknown or inactive device %q", id)
+			}
+		}
+	}
+	return nil
+}
+
+func validateTailscaleControlURL(value string) error {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return fmt.Errorf("tailscale.control_url must be an HTTP or HTTPS URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("tailscale.control_url must not contain credentials, query, or fragment")
+	}
+	return nil
+}
+
+func validateTailscaleCIDRs(field string, values []string, privateOnly bool, scope lan.Scope) error {
+	seen := map[netip.Prefix]bool{}
+	lanPrefix, err := netip.ParsePrefix(scope.String())
+	if err != nil {
+		return err
+	}
+	for _, value := range values {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+		if err != nil || prefix != prefix.Masked() || prefix.String() != strings.TrimSpace(value) {
+			return fmt.Errorf("tailscale.%s entry %q must be a canonical IP CIDR", field, value)
+		}
+		if !prefix.Addr().IsGlobalUnicast() {
+			return fmt.Errorf("tailscale.%s entry %q must be a unicast network", field, value)
+		}
+		if field == "peer_cidrs" && tailscaleAddressSpaceNeedsExactHost(prefix) {
+			return fmt.Errorf("tailscale.peer_cidrs entry %q must identify one exact Tailscale peer (/32 for IPv4 or /128 for IPv6); broad Tailnet address-space capture is not allowed", value)
+		}
+		if privateOnly && !prefix.Addr().IsPrivate() {
+			return fmt.Errorf("tailscale.%s entry %q must be a private IPv4/ULA subnet", field, value)
+		}
+		if prefix.Addr().Is4() && prefix.Overlaps(lanPrefix) {
+			return fmt.Errorf("tailscale.%s entry %q overlaps the OpenSurge LAN %s", field, value, scope)
+		}
+		if seen[prefix] {
+			return fmt.Errorf("tailscale.%s contains duplicate CIDR %q", field, value)
+		}
+		seen[prefix] = true
+	}
+	return nil
+}
+
+func tailscaleAddressSpaceNeedsExactHost(prefix netip.Prefix) bool {
+	addressSpace := netip.MustParsePrefix("100.64.0.0/10")
+	wantBits := 32
+	if prefix.Addr().Is6() {
+		addressSpace = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+		wantBits = 128
+	}
+	return prefix.Overlaps(addressSpace) && prefix.Bits() != wantBits
+}
+
+func validDNSLabel(value string) bool {
+	if value == "" || len(value) > 63 || value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validRuleToken(value string) bool {

@@ -33,22 +33,36 @@ unless a dedicated or legacy device actually creates the default selector.
 
 Rules may combine domain, IP CIDR, TCP/UDP protocol, port, and rule-provider
 conditions. Populated condition types are ANDed, while values inside one type
-are ORed into separate mihomo rules. Small lists use inline rule-providers;
-large shared lists may use HTTP providers. HTTP MRS is valid only for domain
-and ipcidr behavior. OpenSurge ships no household templates or third-party
-rule content; templates and rule-set URLs are operator-owned data.
+are ORed into separate mihomo rules. A mutually exclusive `match.template`
+expands an ordered list of rule sets. User-facing routing templates contain no
+outlet; the per-device rule owns its fixed action or selectable candidates.
+Small lists use inline rule-providers; large shared lists may use HTTP
+providers. HTTP MRS is valid only for domain and ipcidr behavior. The Web GUI
+ships one inspectable, inactive-by-default Claude Code community snapshot as a
+learning example; all other templates and rule-set URLs are operator-owned.
 
 Order is part of the contract: device overrides precede global rules in every
 mode; a dedicated device default also precedes global rules, while an inherited
 device has no default selector. An imported profile's terminal `MATCH` stays
 last. Reject an imported profile with rules after `MATCH`.
 
-The supported identity boundary is MAC-backed IPv4 DHCP reservations plus
-`SRC-IP-CIDR`. It is not IPv6 identity or MAC matching performed inside mihomo.
-Registered addresses must stay in the gateway `/24` and cannot be its network,
-broadcast, gateway, or declared protected address. same-Wi-Fi DHCP start also
-rejects a reservation when ARP observes a different MAC at that IPv4; no ARP
-reply is only an inconclusive signal, not proof of vacancy.
+The system-TUN identity boundary is MAC-backed IPv4 DHCP reservations plus
+`SRC-IP-CIDR`. The downstream IPv6 packet path separately carries the observed
+source MAC into patched Mihomo as `IN-USER(device:<id>)`; this is routing
+identity, not anti-spoof authentication. An `upstream_router` device retains
+that mapping only for a highest-priority IPv6 `REJECT`, because its bypass is
+IPv4-only. A registered address that is on the gateway LAN cannot be its
+network, broadcast, gateway, or declared protected address. An address outside
+the LAN is dormant rather than invalid, because refusing it would leave an
+operator who moved the Mac unable to start the gateway or edit the policy that
+still lists the old devices. same-Wi-Fi DHCP
+start also rejects a reservation when ARP observes a different MAC at that
+IPv4; no ARP reply is only an inconclusive signal, not proof of vacancy.
+
+Dormancy is a compiled/applied boundary, not only a DHCP exception. The full
+desired record and digest remain stable, while runtime devices, reservations,
+Mihomo IPv4 selectors/rules, and downstream IPv6 MAC-to-InUser identity all
+exclude devices outside the configured LAN.
 
 The configured policy is desired state. One start compiles it exactly once into
 an immutable bundle, validates the final mihomo configuration before forwarding
@@ -64,9 +78,23 @@ untouched. Reload is interrupting and is not a zero-downtime hot swap.
 The Web GUI defaults ordinary device registration to `inherit_global`, exposes
 routing mode as a save-and-reload choice, and displays a live default selector
 only for an applied dedicated/legacy device. It creates a private
-`<device-id>-policy` profile. On the first main-path edit of a shared or
-template-derived profile, it copies the resolved effective content to a
-template-free private profile and changes only that device reference.
+`<device-id>-policy` profile, but treats profiles as internal persistence and
+compilation containers. Its always-expanded rule library exposes only rule
+sets, outlet-free routing templates, and per-device routes. The device-card
+edit action focuses the corresponding device route. The old standalone device
+rules and advanced-reuse cards are not rendered. On the first edit of a shared
+or legacy template-derived profile, it copies the resolved effective content
+to a private profile and changes only that device reference.
+
+In `same_lan`, a unique active observation at a different IPv4 may be offered
+as an explicit rebind only when its normalized neighbor MAC matches the applied
+device. The GUI does not silently mutate identity: it blocks routing-mode and
+applied-selector controls tied to the stale `SRC-IP-CIDR`, asks for confirmation,
+then changes only the device IPv4 and uses the normal validated save/reload path.
+Stable ID, display name, profile, rules, egress mode, and selector choices are
+preserved. Offline devices may preset selectors with an activation-boundary
+message. Ambiguous same-MAC observations, MAC conflicts, or an IPv4 owned by
+another desired device must not produce a guessed rebind.
 
 A device may also carry human-readable `name` metadata with spaces or Unicode.
 Its technical `id` remains restricted and stable because it is part of the

@@ -1,8 +1,11 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"open-mihomo-gateway/internal/device"
 )
 
 func TestValidateRejectsMihomoRedirPort(t *testing.T) {
@@ -40,6 +43,21 @@ func TestValidateAcceptsTUNTransparentMode(t *testing.T) {
 	}
 }
 
+func TestValidateLocalSystemProxyRequiresTUN(t *testing.T) {
+	cfg := Default()
+	cfg.LocalSystemProxy.Enabled = true
+
+	err := Validate(cfg)
+	if err == nil || !strings.Contains(err.Error(), `requires transparent.mode: "tun"`) {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	cfg.Transparent.Mode = TransparentModeTUN
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() with TUN error = %v", err)
+	}
+}
+
 func TestValidateAcceptsSameLANGatewayMode(t *testing.T) {
 	cfg := Default()
 	cfg.Gateway.Mode = GatewayModeSameLAN
@@ -50,6 +68,68 @@ func TestValidateAcceptsSameLANGatewayMode(t *testing.T) {
 
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestPrepareDevicePolicyPausesIPOnlyDevicesOutsideSameLAN(t *testing.T) {
+	policy := device.PolicySet{
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices:  []device.ManagedDevice{{ID: "speaker", IPv4: "192.168.50.101", Profile: "home"}},
+	}
+	bundle, err := device.CompilePolicyBundle(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Default()
+	cfg.Gateway.Mode = GatewayModeSameWiFiDHCP
+	cfg.DevicePolicy.File = "already-loaded.json"
+	cfg.DevicePolicy.Bundle = &bundle
+	if err := PrepareDevicePolicy(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DevicePolicy.Bundle.IPOnlyDevicesActive || len(cfg.DevicePolicy.Bundle.Compiled.Devices) != 0 || len(cfg.DevicePolicy.Bundle.Policy.Devices) != 1 {
+		t.Fatalf("DHCP bundle = %#v", cfg.DevicePolicy.Bundle)
+	}
+
+	cfg.Gateway.Mode = GatewayModeSameLAN
+	if err := PrepareDevicePolicy(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.DevicePolicy.Bundle.IPOnlyDevicesActive || len(cfg.DevicePolicy.Bundle.Compiled.Devices) != 1 {
+		t.Fatalf("same-LAN bundle = %#v", cfg.DevicePolicy.Bundle)
+	}
+}
+
+func TestPrepareDevicePolicyRecompilesRuntimeForConfiguredLAN(t *testing.T) {
+	policy := device.PolicySet{
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices: []device.ManagedDevice{
+			{ID: "active", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home", EgressMode: device.EgressModeDedicated},
+			{ID: "wider-lan", MAC: "aa:bb:cc:dd:ee:02", IPv4: "192.168.51.102", Profile: "home", EgressMode: device.EgressModeDedicated},
+			{ID: "dormant", MAC: "aa:bb:cc:dd:ee:03", IPv4: "192.168.60.103", Profile: "home", EgressMode: device.EgressModeDedicated},
+		},
+	}
+	bundle, err := device.CompilePolicyBundle(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Default()
+	cfg.Gateway.Mode = GatewayModeSameWiFiDHCP
+	cfg.DevicePolicy.File = "already-loaded.json"
+	cfg.DevicePolicy.Bundle = &bundle
+	if err := PrepareDevicePolicy(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DevicePolicy.Bundle.ActiveLAN != "192.168.50.0/24" || len(cfg.DevicePolicy.Bundle.Policy.Devices) != 3 || len(cfg.DevicePolicy.Bundle.Compiled.Devices) != 1 || cfg.DevicePolicy.Bundle.Compiled.Devices[0].ID != "active" {
+		t.Fatalf("/24 bundle = %#v", cfg.DevicePolicy.Bundle)
+	}
+
+	cfg.Gateway.LANPrefixLen = 22
+	if err := PrepareDevicePolicy(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DevicePolicy.Bundle.ActiveLAN != "192.168.48.0/22" || len(cfg.DevicePolicy.Bundle.Policy.Devices) != 3 || len(cfg.DevicePolicy.Bundle.Compiled.Devices) != 2 || cfg.DevicePolicy.Bundle.Compiled.Devices[1].ID != "wider-lan" {
+		t.Fatalf("/22 bundle = %#v", cfg.DevicePolicy.Bundle)
 	}
 }
 
@@ -164,6 +244,20 @@ func TestValidateSameWiFiDHCPGatewayMode(t *testing.T) {
 			},
 			want: "gateway.lan_ip must not be inside",
 		},
+		{
+			name: "accepts a range that a wider configured prefix makes local",
+			edit: func(cfg *Config) {
+				cfg.Gateway.LANPrefixLen = 22
+				cfg.DHCP.RangeStart = "192.168.2.120"
+				cfg.DHCP.RangeEnd = "192.168.2.199"
+			},
+			want: "",
+		},
+		{
+			name: "rejects a prefix length with no usable hosts",
+			edit: func(cfg *Config) { cfg.Gateway.LANPrefixLen = 31 },
+			want: "gateway.lan_prefix_len",
+		},
 	}
 
 	for _, tt := range tests {
@@ -193,6 +287,83 @@ func TestValidateSameWiFiDHCPGatewayMode(t *testing.T) {
 	}
 }
 
+func TestValidateDevicePolicyCandidateEnforcesRouterBypassTopology(t *testing.T) {
+	baseConfig := func() Config {
+		cfg := Default()
+		cfg.Gateway.Mode = GatewayModeSameWiFiDHCP
+		cfg.Gateway.Interface = "en0"
+		cfg.Gateway.UpstreamInterface = "en0"
+		cfg.Gateway.LANIP = "192.168.1.20"
+		cfg.DHCP.Enabled = true
+		cfg.DHCP.RangeStart = "192.168.1.120"
+		cfg.DHCP.RangeEnd = "192.168.1.199"
+		cfg.DHCP.BypassGateway = "192.168.1.1"
+		cfg.DHCP.BypassDNS = []string{"192.168.1.1", "1.1.1.1"}
+		cfg.DNS.Listen = cfg.Gateway.LANIP
+		cfg.Transparent.Mode = TransparentModeTUN
+		return cfg
+	}
+	policy := device.PolicySet{
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices: []device.ManagedDevice{{
+			ID: "console", MAC: "aa:bb:cc:dd:ee:05", IPv4: "192.168.1.190", Profile: "home", GatewayTarget: device.GatewayTargetUpstreamRouter,
+		}},
+	}
+
+	if err := ValidateDevicePolicyCandidate(baseConfig(), policy); err != nil {
+		t.Fatalf("valid router bypass rejected: %v", err)
+	}
+	tests := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{name: "missing gateway", edit: func(cfg *Config) { cfg.DHCP.BypassGateway = "" }, want: "requires dhcp.bypass_gateway"},
+		{name: "missing DNS", edit: func(cfg *Config) { cfg.DHCP.BypassDNS = nil }, want: "requires at least one dhcp.bypass_dns"},
+		{name: "different subnet", edit: func(cfg *Config) { cfg.DHCP.BypassGateway = "192.168.2.1" }, want: "must remain in gateway LAN"},
+		{name: "inside pool", edit: func(cfg *Config) { cfg.DHCP.BypassGateway = "192.168.1.150" }, want: "must not be inside the DHCP range"},
+		{name: "unsupported topology", edit: func(cfg *Config) { cfg.Gateway.Mode = GatewayModeSameLAN; cfg.DHCP.Enabled = false }, want: "only available in gateway.mode same_wifi_dhcp"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			tt.edit(&cfg)
+			err := ValidateDevicePolicyCandidate(cfg, policy)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ValidateDevicePolicyCandidate() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateDevicePolicyCandidateKeepsRegistrationsFromAnotherLAN(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.Mode = GatewayModeSameWiFiDHCP
+	cfg.Gateway.Interface = "en0"
+	cfg.Gateway.UpstreamInterface = "en0"
+	cfg.Gateway.LANIP = "192.168.1.20"
+	cfg.DHCP.Enabled = true
+	cfg.DHCP.RangeStart = "192.168.1.120"
+	cfg.DHCP.RangeEnd = "192.168.1.199"
+	cfg.DNS.Listen = cfg.Gateway.LANIP
+	cfg.Transparent.Mode = TransparentModeTUN
+	cfg.DevicePolicy.ProtectedIPv4 = []string{"192.168.50.253"}
+	policy := device.PolicySet{
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices: []device.ManagedDevice{
+			{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.1.101", Profile: "home"},
+			{ID: "laptop", MAC: "aa:bb:cc:dd:ee:02", IPv4: "192.168.50.101", Profile: "home", GatewayTarget: device.GatewayTargetUpstreamRouter},
+		},
+	}
+
+	// Moving the Mac to a new LAN must not lock the operator out of the
+	// configuration that still lists devices from the previous one. A dormant
+	// router-bypass device must not impose bypass requirements on the new LAN.
+	if err := ValidateDevicePolicyCandidate(cfg, policy); err != nil {
+		t.Fatalf("ValidateDevicePolicyCandidate() error = %v", err)
+	}
+}
+
 func TestValidateAcceptsUpstreamProxy(t *testing.T) {
 	cfg := Default()
 	cfg.UpstreamProxy.Enabled = true
@@ -211,6 +382,8 @@ func TestValidateAcceptsImportedMihomoProfile(t *testing.T) {
 	cfg := Default()
 	cfg.Mihomo.ProfileMode = MihomoProfileModeImported
 	cfg.Mihomo.Profile = "./profiles/home.yaml"
+	cfg.Mihomo.ProfileSourceDigest = strings.Repeat("a", 64)
+	cfg.Mihomo.ProfileOverlayDigest = strings.Repeat("b", 64)
 
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("Validate() error = %v", err)
@@ -238,11 +411,36 @@ func TestValidateRejectsInvalidMihomoProfileConfig(t *testing.T) {
 			want: "mihomo.profile requires",
 		},
 		{
+			name: "managed composition digest",
+			edit: func(cfg *Config) {
+				cfg.Mihomo.ProfileSourceDigest = strings.Repeat("a", 64)
+			},
+			want: "composition digests require",
+		},
+		{
 			name: "imported missing profile path",
 			edit: func(cfg *Config) {
 				cfg.Mihomo.ProfileMode = MihomoProfileModeImported
 			},
 			want: "mihomo.profile is required",
+		},
+		{
+			name: "uppercase source digest",
+			edit: func(cfg *Config) {
+				cfg.Mihomo.ProfileMode = MihomoProfileModeImported
+				cfg.Mihomo.Profile = "./profiles/home.yaml"
+				cfg.Mihomo.ProfileSourceDigest = strings.Repeat("A", 64)
+			},
+			want: "profile_source_digest must be a lowercase SHA-256 digest",
+		},
+		{
+			name: "short overlay digest",
+			edit: func(cfg *Config) {
+				cfg.Mihomo.ProfileMode = MihomoProfileModeImported
+				cfg.Mihomo.Profile = "./profiles/home.yaml"
+				cfg.Mihomo.ProfileOverlayDigest = "abcd"
+			},
+			want: "profile_overlay_digest must be a lowercase SHA-256 digest",
 		},
 		{
 			name: "imported with upstream proxy smoke",
@@ -305,6 +503,13 @@ func TestValidateRejectsInvalidUpstreamProxy(t *testing.T) {
 			},
 			want: "upstream_proxy.port must be between 1 and 65535",
 		},
+		{
+			name: "reserved local routing name",
+			edit: func(cfg *Config) {
+				cfg.UpstreamProxy.Name = "open-surge/mac-global"
+			},
+			want: "upstream_proxy.name must differ from reserved OpenSurge proxy groups",
+		},
 	}
 
 	for _, tt := range tests {
@@ -326,5 +531,144 @@ func TestValidateRejectsInvalidUpstreamProxy(t *testing.T) {
 				t.Fatalf("Validate() error = %q, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestValidateDownstreamIPv6TakeoverContract(t *testing.T) {
+	valid := Default()
+	valid.Transparent.Mode = TransparentModeTUN
+	valid.Transparent.TUNIPv6 = TUNIPv6Always
+	if err := Validate(valid); err != nil {
+		t.Fatalf("Validate(valid IPv6 takeover) error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{"same LAN without shared-L2 readiness", func(cfg *Config) {
+			cfg.Gateway.Mode = GatewayModeSameLAN
+			cfg.DHCP.Enabled = false
+			cfg.Gateway.UpstreamInterface = cfg.Gateway.Interface
+		}, "ipv6_shared_l2_ready"},
+		{"transparent off", func(cfg *Config) { cfg.Transparent.Mode = TransparentModeOff }, "requires transparent.mode"},
+		{"missing broker", func(cfg *Config) { cfg.Transparent.IPv6PacketBrokerBinary = "" }, "ipv6_packet_broker_binary is required"},
+		{"MTU too small", func(cfg *Config) { cfg.Transparent.IPv6PacketMTU = 1279 }, "ipv6_packet_mtu must be between"},
+		{"unknown mode", func(cfg *Config) { cfg.Transparent.TUNIPv6 = "sometimes" }, "tun_ipv6 must be off, auto, or always"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid
+			tt.edit(&cfg)
+			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+
+	for _, mode := range []string{GatewayModeSameLAN, GatewayModeSameWiFiDHCP} {
+		t.Run(mode+" with shared-L2 readiness", func(t *testing.T) {
+			cfg := valid
+			cfg.Gateway.Mode = mode
+			cfg.Gateway.UpstreamInterface = cfg.Gateway.Interface
+			cfg.Transparent.IPv6SharedL2Ready = true
+			cfg.DHCP.Enabled = mode == GatewayModeSameWiFiDHCP
+			if mode == GatewayModeSameWiFiDHCP {
+				cfg.Gateway.LANIP = "192.168.50.1"
+			}
+			if err := Validate(cfg); err != nil {
+				t.Fatalf("Validate(%s shared-L2 IPv6) error = %v", mode, err)
+			}
+		})
+	}
+}
+
+func TestValidateTailscaleTargetsAndRouteConflicts(t *testing.T) {
+	valid := Default()
+	valid.Tailscale.Enabled = true
+	valid.Tailscale.DisplayName = "Home Tailnet"
+	valid.Tailscale.Hostname = "opensurge-home"
+	valid.Tailscale.ControlURL = "https://controlplane.tailscale.com"
+	valid.Tailscale.AuthKeyFile = "/tmp/tailscale-auth-key"
+	valid.Tailscale.StateDir = "/tmp/tailscale-state"
+	valid.Tailscale.AcceptRoutes = true
+	valid.Tailscale.MagicDNSSuffixes = []string{"home.example.ts.net"}
+	valid.Tailscale.PeerCIDRs = []string{"100.82.10.7/32"}
+	valid.Tailscale.SubnetRoutes = []string{"10.20.0.0/16"}
+	if err := Validate(valid); err != nil {
+		t.Fatalf("Validate(valid Tailscale) error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{"LAN overlap", func(cfg *Config) { cfg.Tailscale.SubnetRoutes = []string{"192.168.50.0/24"} }, "overlaps the OpenSurge LAN"},
+		{"route not accepted", func(cfg *Config) { cfg.Tailscale.AcceptRoutes = false }, "requires tailscale.accept_routes"},
+		{"public subnet route", func(cfg *Config) { cfg.Tailscale.SubnetRoutes = []string{"203.0.113.0/24"} }, "must be a private"},
+		{"wildcard suffix", func(cfg *Config) { cfg.Tailscale.MagicDNSSuffixes = []string{"*.example.ts.net"} }, "without wildcard"},
+		{"noncanonical CIDR", func(cfg *Config) { cfg.Tailscale.PeerCIDRs = []string{"100.82.10.7/24"} }, "canonical IP CIDR"},
+		{"broad Tailnet IPv4 capture", func(cfg *Config) { cfg.Tailscale.PeerCIDRs = []string{"100.64.0.0/10"} }, "one exact Tailscale peer"},
+		{"broad Tailnet IPv6 capture", func(cfg *Config) { cfg.Tailscale.PeerCIDRs = []string{"fd7a:115c:a1e0::/48"} }, "one exact Tailscale peer"},
+		{"LAN access without exit", func(cfg *Config) { cfg.Tailscale.ExitNodeAllowLANAccess = true }, "requires tailscale.exit_node"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid
+			tt.edit(&cfg)
+			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateTailscaleDeviceAccessUsesCurrentLAN(t *testing.T) {
+	cfg := Default()
+	cfg.Gateway.Mode = GatewayModeSameWiFiDHCP
+	cfg.Transparent.Mode = TransparentModeTUN
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.AllowedDevices = []string{"phone"}
+	cfg.DevicePolicy.File = "already-loaded.json"
+	scope, err := cfg.LANScope()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := device.CompilePolicyBundleForLAN(device.PolicySet{
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home"}},
+	}, scope, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DevicePolicy.Bundle = &bundle
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate(active device) error = %v", err)
+	}
+
+	cfg.Gateway.LANIP = "192.168.60.1"
+	cfg.DHCP.RangeStart = "192.168.60.100"
+	cfg.DHCP.RangeEnd = "192.168.60.200"
+	cfg.DNS.Listen = cfg.Gateway.LANIP
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), `unknown or inactive device "phone"`) {
+		t.Fatalf("Validate(device outside new LAN) error = %v", err)
+	}
+	if bundle.ActiveLAN != "192.168.50.0/24" || len(bundle.Compiled.Devices) != 1 {
+		t.Fatal("validation mutated the caller's policy snapshot")
+	}
+}
+
+func TestValidateRuntimeDoesNotLoadTailscaleDevicePolicy(t *testing.T) {
+	cfg := Default()
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.AllowAllDevices = true
+	cfg.DevicePolicy.File = filepath.Join(t.TempDir(), "missing-policy.json")
+	if err := ValidateRuntime(cfg); err != nil {
+		t.Fatalf("ValidateRuntime() must not depend on the desired policy file: %v", err)
+	}
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), cfg.DevicePolicy.File) {
+		t.Fatalf("Validate() must report the missing policy file: %v", err)
 	}
 }

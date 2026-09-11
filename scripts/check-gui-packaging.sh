@@ -7,10 +7,13 @@ POSTINSTALL="$ROOT/packaging/pkg-scripts/postinstall"
 RECOVERY_STATE="$ROOT/packaging/pkg-scripts/recovery-state.sh"
 INSTALLED_PROCESSES="$ROOT/packaging/pkg-scripts/installed-processes.sh"
 RELEASE_DEPS="$ROOT/scripts/prepare-gui-release-deps.sh"
+MIHOMO_BUILD="$ROOT/scripts/build-opensurge-mihomo.sh"
 RELEASE_VERIFY="$ROOT/scripts/verify-unsigned-gui-installer.sh"
 RELEASE_WORKFLOW="$ROOT/.github/workflows/release-unsigned.yml"
 MENUBAR_PACKAGE="$ROOT/apps/menubar/Package.swift"
 MENUBAR_INFO="$ROOT/apps/menubar/Resources/Info.plist"
+MENUBAR_EN_STRINGS="$ROOT/apps/menubar/Resources/en.lproj/Localizable.strings"
+MENUBAR_ZH_STRINGS="$ROOT/apps/menubar/Resources/zh-Hans.lproj/Localizable.strings"
 GUI_COMPONENTS="$ROOT/packaging/gui-components.plist"
 APP_ICON_SOURCE="$ROOT/apps/menubar/Resources/OpenSurgeAppIcon.png"
 MENU_BAR_ICON_SOURCE="$ROOT/apps/menubar/Resources/OpenSurgeMenuBarIcon.png"
@@ -21,10 +24,10 @@ MENUBAR_CONTENT="$ROOT/apps/menubar/Sources/OpenSurgeMenuBar/MenuContentView.swi
 UNINSTALLER="$ROOT/scripts/uninstall-gui.sh"
 
 bash -n "$PREINSTALL" "$POSTINSTALL" "$RECOVERY_STATE" "$INSTALLED_PROCESSES" "$ROOT/scripts/uninstall-gui.sh" \
-  "$ROOT/scripts/build-gui-installer.sh" "$RELEASE_DEPS" "$RELEASE_VERIFY"
+  "$ROOT/scripts/build-gui-installer.sh" "$RELEASE_DEPS" "$MIHOMO_BUILD" "$RELEASE_VERIFY"
 [[ -x "$PREINSTALL" ]] || { echo "preinstall must be executable" >&2; exit 1; }
-[[ -x "$RELEASE_DEPS" && -x "$RELEASE_VERIFY" ]] || {
-  echo "release preparation and verification scripts must be executable" >&2
+[[ -x "$RELEASE_DEPS" && -x "$MIHOMO_BUILD" && -x "$RELEASE_VERIFY" ]] || {
+  echo "release preparation, patched mihomo build, and verification scripts must be executable" >&2
   exit 1
 }
 
@@ -98,27 +101,140 @@ line_of() {
 }
 
 recovery_line="$(line_of 'RECOVERY_STAGE=' "$PREINSTALL")"
-control_line="$(line_of 'bootout "gui/$UID_VALUE/com.opensurge.control"' "$PREINSTALL")"
-stop_line="$(line_of '"$ROOT/bin/omg" stop' "$PREINSTALL")"
+gui_stop_line="$(line_of 'opensurge_stop_installed_gui_processes "$UID_VALUE" "$USER_HOME"' "$PREINSTALL")"
+stop_line="$(line_of '"$RECOVERY_CLI" stop' "$PREINSTALL")"
 helper_line="$(line_of 'bootout system/com.opensurge.helper' "$PREINSTALL")"
+sleep_release_line="$(line_of 'sleep-prevention-owned' "$PREINSTALL")"
 
-[[ -n "$recovery_line" && -n "$control_line" && -n "$stop_line" && -n "$helper_line" ]] || {
+[[ -n "$recovery_line" && -n "$gui_stop_line" && -n "$stop_line" && -n "$sleep_release_line" && -n "$helper_line" ]] || {
   echo "preinstall is missing a required upgrade step" >&2
   exit 1
 }
-(( recovery_line < control_line && control_line < stop_line && stop_line < helper_line )) || {
-  echo "unsafe preinstall order: expected recovery check, control bootout, gateway stop, helper bootout" >&2
+(( recovery_line < gui_stop_line && gui_stop_line < stop_line && stop_line < sleep_release_line && sleep_release_line < helper_line )) || {
+  echo "unsafe preinstall order: expected recovery check, GUI/control stop, gateway stop, sleep release, helper bootout" >&2
   exit 1
 }
 
-grep -Fq 'opensurge_installed_gui_pids "$UID_VALUE" "$USER_HOME"' "$PREINSTALL" || {
+for cleanup in "$PREINSTALL" "$UNINSTALLER"; do
+  grep -Fq 'runtime/sleep-prevention-owned' "$cleanup" || {
+    echo "sleep prevention cleanup must use the persistent installed-runtime ownership marker: $cleanup" >&2
+    exit 1
+  }
+  grep -Fq '/usr/bin/pmset -a disablesleep 0' "$cleanup" || {
+    echo "sleep prevention cleanup must restore system sleep before removing the Helper: $cleanup" >&2
+    exit 1
+  }
+done
+
+grep -Fq 'opensurge_stop_installed_gui_processes "$UID_VALUE" "$USER_HOME"' "$PREINSTALL" || {
   echo "preinstall must stop installed OpenSurge GUI processes" >&2
+  exit 1
+}
+grep -Fq 'RECOVERY_CLI="$SCRIPT_DIR/omg-recovery"' "$PREINSTALL" || {
+  echo "preinstall must use the current package recovery CLI" >&2
   exit 1
 }
 if grep -Eq 'p(kill|grep).*-x (opensurge-control|OpenSurgeMenuBar)' "$PREINSTALL"; then
   echo "preinstall must not block on unrelated same-name developer processes" >&2
   exit 1
 fi
+
+# Reproduce the upgrade race that previously made the first install fail: the
+# menu bar starts a late bootstrap while it is being terminated, and KeepAlive
+# replaces the control PID after the first bootout. The stop helper must bootout
+# the exact service again instead of only observing the replacement forever.
+(
+  test_menu_alive=1
+  test_control_alive=1
+  test_control_registered=1
+  test_late_bootstrap=0
+  test_menu_term_count=0
+  test_control_term_count=0
+  test_control_bootout_count=0
+
+  opensurge_installed_menu_bar_pids() {
+    if [[ "$test_menu_alive" -eq 1 ]]; then
+      printf '%s\n' 101
+    fi
+  }
+  opensurge_installed_gui_pids() {
+    if [[ "$test_control_alive" -eq 1 ]]; then
+      printf '%s\n' 201
+    fi
+    if [[ "$test_menu_alive" -eq 1 ]]; then
+      printf '%s\n' 101
+    fi
+  }
+  opensurge_signal_installed_gui_pid() {
+    local signal_name="$1"
+    local pid="$2"
+    if [[ "$signal_name" == "TERM" && "$pid" == "101" ]]; then
+      test_menu_term_count=$((test_menu_term_count + 1))
+      test_menu_alive=0
+      test_late_bootstrap=1
+    elif [[ "$signal_name" == "TERM" && "$pid" == "201" ]]; then
+      test_control_term_count=$((test_control_term_count + 1))
+      if [[ "$test_control_registered" -eq 0 ]]; then
+        test_control_alive=0
+      fi
+    elif [[ "$signal_name" == "KILL" ]]; then
+      if [[ "$pid" == "101" ]]; then
+        test_menu_alive=0
+      elif [[ "$pid" == "201" && "$test_control_registered" -eq 0 ]]; then
+        test_control_alive=0
+      fi
+    fi
+  }
+  opensurge_bootout_installed_control() {
+    test_control_bootout_count=$((test_control_bootout_count + 1))
+    if [[ "$test_late_bootstrap" -eq 1 ]]; then
+      # Model a bootstrap child completing just after this bootout.
+      test_late_bootstrap=0
+      test_control_registered=1
+      test_control_alive=1
+    else
+      test_control_registered=0
+      test_control_alive=0
+    fi
+  }
+  opensurge_process_wait_tick() { :; }
+
+  opensurge_stop_installed_gui_processes 501 /Users/tester || {
+    echo "preinstall process stop must survive a late Control Service bootstrap" >&2
+    exit 1
+  }
+  [[ "$test_menu_term_count" -eq 1 && "$test_control_term_count" -eq 1 ]] || {
+    echo "preinstall race regression did not terminate the expected installed processes" >&2
+    exit 1
+  }
+  [[ "$test_control_bootout_count" -eq 2 && "$test_control_alive" -eq 0 ]] || {
+    echo "preinstall race regression did not remove the replacement Control Service" >&2
+    exit 1
+  }
+)
+
+# A process at an exact installed path that survives TERM and KILL must still
+# fail closed before the gateway/helper upgrade sequence begins.
+(
+  test_control_bootout_count=0
+  opensurge_installed_menu_bar_pids() { printf '%s\n' 301; }
+  opensurge_installed_gui_pids() { printf '%s\n' 301; }
+  opensurge_signal_installed_gui_pid() { :; }
+  opensurge_bootout_installed_control() {
+    test_control_bootout_count=$((test_control_bootout_count + 1))
+  }
+  opensurge_process_wait_tick() { :; }
+
+  if opensurge_stop_installed_gui_processes 501 /Users/tester; then
+    echo "preinstall must reject an installed menu bar process that cannot be stopped" >&2
+    exit 1
+  fi
+  [[ "$test_control_bootout_count" -eq 0 ]] || {
+    echo "preinstall must stop the menu bar before booting out the Control Service" >&2
+    exit 1
+  }
+)
+
 grep -Fq 'rm -rf "/Applications/OpenSurge Menu Bar.app"' "$POSTINSTALL" || {
   echo "postinstall must remove the legacy menu bar app bundle" >&2
   exit 1
@@ -135,8 +251,12 @@ grep -Fq 'if [[ ! -f "$ROOT/config.yaml" ]]' "$POSTINSTALL" || {
   echo "postinstall must preserve an existing config during upgrade" >&2
   exit 1
 }
-grep -Fq -- '--scripts "$ROOT/packaging/pkg-scripts"' "$ROOT/scripts/build-gui-installer.sh" || {
-  echo "pkgbuild must include the packaging scripts directory" >&2
+grep -Fq 'install -m 0755 "$ROOT/bin/omg" "$PKG_SCRIPTS/omg-recovery"' "$ROOT/scripts/build-gui-installer.sh" || {
+  echo "GUI package must stage its current omg as the preinstall recovery CLI" >&2
+  exit 1
+}
+grep -Fq -- '--scripts "$PKG_SCRIPTS"' "$ROOT/scripts/build-gui-installer.sh" || {
+  echo "pkgbuild must include the staged packaging scripts directory" >&2
   exit 1
 }
 grep -Fq 'plutil -replace CFBundleShortVersionString' "$ROOT/scripts/build-menubar-app.sh" || {
@@ -147,8 +267,36 @@ grep -Fq 'plutil -replace CFBundleVersion' "$ROOT/scripts/build-menubar-app.sh" 
   echo "menu bar build must stamp the build number into Info.plist" >&2
   exit 1
 }
+grep -Fq 'plutil -replace OpenSurgeReleaseTag' "$ROOT/scripts/build-menubar-app.sh" || {
+  echo "menu bar build must stamp the full release tag into Info.plist" >&2
+  exit 1
+}
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenSurgeReleaseTag' "$MENUBAR_INFO")" == "v0.1.0" ]] || {
+  echo "menu bar app Info.plist must declare a default full release tag" >&2
+  exit 1
+}
 [[ -s "$APP_ICON_SOURCE" && -s "$MENU_BAR_ICON_SOURCE" ]] || {
   echo "menu bar app icon assets must be present" >&2
+  exit 1
+}
+[[ -s "$MENUBAR_EN_STRINGS" && -s "$MENUBAR_ZH_STRINGS" ]] || {
+  echo "menu bar localization resources are missing" >&2
+  exit 1
+}
+/usr/bin/plutil -lint "$MENUBAR_EN_STRINGS" "$MENUBAR_ZH_STRINGS" >/dev/null || {
+  echo "menu bar localization resources must be valid strings files" >&2
+  exit 1
+}
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDevelopmentRegion' "$MENUBAR_INFO")" == "en" ]] || {
+  echo "menu bar development language must be English" >&2
+  exit 1
+}
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleLocalizations:0' "$MENUBAR_INFO")" == "en" && "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleLocalizations:1' "$MENUBAR_INFO")" == "zh-Hans" ]] || {
+  echo "menu bar bundle must declare English and Simplified Chinese localizations" >&2
+  exit 1
+}
+grep -Fq 'cp -R "$PACKAGE/Resources/en.lproj" "$PACKAGE/Resources/zh-Hans.lproj"' "$ROOT/scripts/build-menubar-app.sh" || {
+  echo "menu bar build must copy localization resources into the app bundle" >&2
   exit 1
 }
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$MENUBAR_INFO")" == "OpenSurgeAppIcon" ]] || {
@@ -209,12 +357,20 @@ grep -Fq 'lipo "$executable" -verify_arch "$OPENSURGE_APP_ARCH"' "$ROOT/scripts/
   echo "GUI package must verify bundled executable architectures" >&2
   exit 1
 }
+grep -Fq '"$APP_ROOT/bin/opensurge-network" "$APP_ROOT/share/opensurge-control"' "$ROOT/scripts/build-gui-installer.sh" || {
+  echo "GUI package must sign the IPv6 packet broker with the other bundled executables" >&2
+  exit 1
+}
 grep -Fq 'x86_64) GO_ARCH=amd64' "$ROOT/scripts/build-gui-installer.sh" || {
   echo "GUI package must map the Intel Mach-O architecture to Go amd64" >&2
   exit 1
 }
-grep -Fq 'mihomo-darwin-amd64-compatible' "$RELEASE_DEPS" || {
-  echo "release dependencies must include the compatible Intel mihomo build" >&2
+grep -Fq 'MIHOMO_SOURCE_ARCHIVE="mihomo-${MIHOMO_VERSION}-source.tar.gz"' "$RELEASE_DEPS" && grep -Fq 'MIHOMO_SOURCE_URL="https://github.com/MetaCubeX/mihomo/archive/' "$RELEASE_DEPS" && grep -Fq 'download_and_verify "$MIHOMO_SOURCE_URL"' "$RELEASE_DEPS" && grep -Fq 'build-opensurge-mihomo.sh' "$RELEASE_DEPS" || {
+  echo "release dependencies must build patched mihomo from the pinned source archive" >&2
+  exit 1
+}
+grep -Fq -- '-tags with_gvisor' "$MIHOMO_BUILD" && grep -Fq '0001-opensurge-packet-listener.patch' "$MIHOMO_BUILD" && grep -Fq 'SOURCE_SHA256=971dd453' "$MIHOMO_BUILD" && grep -Fq 'SOURCE_URL=https://github.com/MetaCubeX/mihomo/archive/' "$MIHOMO_BUILD" && grep -Fq 'source_archive_valid' "$MIHOMO_BUILD" || {
+  echo "OpenSurge mihomo build must download and verify pinned source before applying the gVisor packet-listener patch" >&2
   exit 1
 }
 grep -Fq 'actions/attest@v4' "$RELEASE_WORKFLOW" || {
@@ -229,12 +385,40 @@ grep -Fq 'arm64' "$RELEASE_WORKFLOW" && grep -Fq 'x86_64' "$RELEASE_WORKFLOW" ||
   echo "unsigned release workflow must build Apple Silicon and Intel packages" >&2
   exit 1
 }
-if grep -Fq -- '--prerelease' "$RELEASE_WORKFLOW"; then
-  echo "tagged packages must be published as a stable release" >&2
+grep -Fq 'source_branch="codex/release-v${package_version}"' "$RELEASE_WORKFLOW" || {
+  echo "release tags must be built from their versioned release branch" >&2
+  exit 1
+}
+if grep -Fq 'source_branch=master' "$RELEASE_WORKFLOW"; then
+  echo "stable releases must not bypass their verified versioned release branch" >&2
   exit 1
 fi
+grep -Fq 'channel_flag=--prerelease' "$RELEASE_WORKFLOW" || {
+  echo "release-candidate tags must publish a GitHub prerelease" >&2
+  exit 1
+}
 grep -Fq -- '--latest' "$RELEASE_WORKFLOW" || {
   echo "stable release workflow must mark the tagged release as latest" >&2
+  exit 1
+}
+grep -Fq 'OPENSURGE_RELEASE_TAG: ${{ steps.version.outputs.release_tag }}' "$RELEASE_WORKFLOW" || {
+  echo "release workflow must pass the full tag into the app bundle" >&2
+  exit 1
+}
+grep -Fq '"$OPENSURGE_RELEASE_TAG"' "$RELEASE_WORKFLOW" || {
+  echo "release workflow must verify the packaged full release tag" >&2
+  exit 1
+}
+grep -Fq 'OpenSurgeReleaseTag' "$RELEASE_VERIFY" || {
+  echo "package verification must inspect the full release tag" >&2
+  exit 1
+}
+grep -Fq '0.2.*) release_codename="Wind Rose" ;;' "$RELEASE_WORKFLOW" || {
+  echo "v0.2 releases must use the Wind Rose series codename" >&2
+  exit 1
+}
+grep -Fq -- '--title "$release_title"' "$RELEASE_WORKFLOW" || {
+  echo "GitHub release title must include the version-aware series title" >&2
   exit 1
 }
 grep -Fq 'actions/download-artifact@v8' "$RELEASE_WORKFLOW" || {

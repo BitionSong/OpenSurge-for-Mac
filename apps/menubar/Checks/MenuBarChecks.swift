@@ -44,6 +44,92 @@ struct MenuBarChecks {
         configuration.protocolClasses = [CheckURLProtocol.self]
         let client = ControlAPIClient(session: URLSession(configuration: configuration), applicationSupport: directory, tokenOverride: "test-token")
 
+        let updateChecker = UpdateChecker(session: URLSession(configuration: configuration))
+        try require(
+            installedReleaseVersion(releaseTag: "v0.1.24-rc.1", shortVersion: "0.1.24") == "0.1.24-rc.1",
+            "the full packaged release tag must take precedence over the numeric bundle version"
+        )
+        try require(
+            installedReleaseVersion(releaseTag: nil, shortVersion: "0.1.23") == "0.1.23",
+            "older packages without a full release tag must retain numeric-version fallback"
+        )
+        try require(
+            releaseDisplayVersion("0.2.0") == "0.2.0 · Wind Rose",
+            "v0.2 stable releases must show the Wind Rose series codename"
+        )
+        try require(
+            releaseDisplayVersion("0.2.1-rc.2") == "0.2.1-rc.2 · Wind Rose",
+            "v0.2 release candidates must show the Wind Rose series codename"
+        )
+        try require(
+            releaseDisplayVersion("0.3.0") == "0.3.0",
+            "other release series must not inherit the Wind Rose codename"
+        )
+        CheckURLProtocol.handler = { request in
+            try require(request.url?.absoluteString == "https://api.github.com/repos/YTwsy/OpenSurge-for-Mac/releases/latest", "latest release path mismatch")
+            try require(request.value(forHTTPHeaderField: "Accept") == "application/vnd.github+json", "GitHub API accept header missing")
+            try require(request.value(forHTTPHeaderField: "User-Agent") == "OpenSurge-for-Mac/0.1.23", "update User-Agent mismatch")
+            let body = #"{"tag_name":"v0.1.24","html_url":"https://github.com/YTwsy/OpenSurge-for-Mac/releases/tag/v0.1.24","draft":false,"prerelease":false}"#
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(body.utf8))
+        }
+        let availableUpdate: AvailableUpdate?
+        do {
+            availableUpdate = try await updateChecker.check(currentVersion: "0.1.23")
+        } catch {
+            throw CheckFailure.failed("update request failed: \(CheckURLProtocol.lastFailure ?? String(describing: error))")
+        }
+        try require(availableUpdate?.version == "0.1.24", "new stable version was not discovered")
+        try require(availableUpdate?.releasePage.path.hasSuffix("/releases/tag/v0.1.24") == true, "update did not retain the version-specific download page")
+        CheckURLProtocol.handler = { request in
+            try require(request.value(forHTTPHeaderField: "User-Agent") == "OpenSurge-for-Mac/0.1.24-rc.1", "release-candidate User-Agent mismatch")
+            let body = #"{"tag_name":"v0.1.24","html_url":"https://github.com/YTwsy/OpenSurge-for-Mac/releases/tag/v0.1.24","draft":false,"prerelease":false}"#
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(body.utf8))
+        }
+        let releaseCandidateUpdate = try await updateChecker.check(currentVersion: "0.1.24-rc.1")
+        try require(
+            releaseCandidateUpdate?.version == "0.1.24",
+            "the stable release must supersede the same-version release candidate"
+        )
+        CheckURLProtocol.handler = { request in
+            try require(request.value(forHTTPHeaderField: "User-Agent") == "OpenSurge-for-Mac/0.1.24", "current-version User-Agent mismatch")
+            let body = #"{"tag_name":"v0.1.24","html_url":"https://github.com/YTwsy/OpenSurge-for-Mac/releases/tag/v0.1.24","draft":false,"prerelease":false}"#
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(body.utf8))
+        }
+        let alreadyCurrent: AvailableUpdate?
+        do {
+            alreadyCurrent = try await updateChecker.check(currentVersion: "0.1.24")
+        } catch {
+            throw CheckFailure.failed("current-version request failed: \(CheckURLProtocol.lastFailure ?? String(describing: error))")
+        }
+        try require(alreadyCurrent == nil, "current stable version must not be offered again")
+
+        CheckURLProtocol.handler = { request in
+            try require(request.value(forHTTPHeaderField: "User-Agent") == "OpenSurge-for-Mac/0.1.25-rc.1", "newer release-candidate User-Agent mismatch")
+            let body = #"{"tag_name":"v0.1.24","html_url":"https://github.com/YTwsy/OpenSurge-for-Mac/releases/tag/v0.1.24","draft":false,"prerelease":false}"#
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(body.utf8))
+        }
+        let olderStable = try await updateChecker.check(currentVersion: "0.1.25-rc.1")
+        try require(olderStable == nil, "a release candidate must not be downgraded to an older stable release")
+
+        CheckURLProtocol.handler = { request in
+            let body = #"{"tag_name":"v0.1.25","html_url":"https://example.com/untrusted","draft":false,"prerelease":false}"#
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(body.utf8))
+        }
+        do {
+            _ = try await updateChecker.check(currentVersion: "0.1.24")
+            throw CheckFailure.failed("untrusted release page was accepted")
+        } catch UpdateCheckError.invalidRelease {
+            // Expected: the update button can only open this repository's GitHub release page.
+        }
+
+        CheckURLProtocol.handler = { _ in throw URLError(.notConnectedToInternet) }
+        do {
+            _ = try await updateChecker.check(currentVersion: "0.1.24")
+            throw CheckFailure.failed("update transport failure did not fail")
+        } catch UpdateCheckError.networkUnavailable {
+            // Expected: update connectivity stays separate from Control Service state.
+        }
+
         CheckURLProtocol.handler = { request in
             try require(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token", "status bearer token missing")
             try require(request.url?.path == "/api/v1/menubar", "status path mismatch")
@@ -111,6 +197,30 @@ struct MenuBarChecks {
         try require(stopped.canQuitOpenSurge && openSurgeQuitWarning(for: stopped).contains("root Helper 仍保持空闲加载"), "stopped gateway must allow the explicit OpenSurge quit path")
         try require(!active.canQuitOpenSurge && !recovery.canQuitOpenSurge, "active or recovery state must block the OpenSurge quit path")
         try require(!active.canUninstall && recovery.canUninstall, "uninstall must depend only on whether the gateway is stopped")
+        var staleSleepStatus = stopped
+        staleSleepStatus.sleepPrevention = SleepPreventionStatus(enabled: false, active: false, error: nil)
+        var currentSleepStatus = stopped
+        currentSleepStatus.sleepPrevention = SleepPreventionStatus(enabled: true, active: true, error: nil)
+        let protectedSleepStatus = menuBarStatusAfterRefresh(
+            staleSleepStatus,
+            currentStatus: currentSleepStatus,
+            requestSleepGeneration: 1,
+            currentSleepGeneration: 2
+        )
+        try require(
+            protectedSleepStatus.sleepPrevention?.active == true,
+            "a refresh started before sleep-prevention mutation completed must not overwrite its result"
+        )
+        let currentSleepRefresh = menuBarStatusAfterRefresh(
+            staleSleepStatus,
+            currentStatus: currentSleepStatus,
+            requestSleepGeneration: 2,
+            currentSleepGeneration: 2
+        )
+        try require(
+            currentSleepRefresh.sleepPrevention?.active == false,
+            "a current-generation refresh must adopt the Control Service sleep-prevention state"
+        )
         let forwardingAlreadyEnabled = MenuBarStatus(schemaVersion: 1, revision: "r", gateway: "stopped", topology: "isolated_lan", lanIp: "192.168.50.1", dhcp: "stopped", mihomo: "stopped", pfAnchor: "unloaded", forwarding: "enabled", clientCount: 0, drift: false, doctorHealthy: true, recoveryRequired: false, recoveryStage: nil, warnings: [], errorCode: nil)
         try require(!forwardingAlreadyEnabled.gatewayServicesActive && forwardingAlreadyEnabled.canQuitOpenSurge && forwardingAlreadyEnabled.canUninstall, "host forwarding must not block quit or uninstall")
 

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"open-mihomo-gateway/internal/lan"
 )
 
 func TestCompilePolicySetCreatesIndependentDeviceGroupsAndRules(t *testing.T) {
@@ -77,6 +79,44 @@ func TestCompilePolicySetCreatesIndependentDeviceGroupsAndRules(t *testing.T) {
 	}
 }
 
+func TestCompilePolicySetExpandsOutletFreeTemplateForDeviceRule(t *testing.T) {
+	set := PolicySet{
+		RuleSets: []RuleSet{
+			{ID: "claude-domains", Behavior: "classical", Payload: []string{"DOMAIN-SUFFIX,anthropic.com"}},
+			{ID: "claude-ip", Behavior: "classical", Payload: []string{"IP-CIDR,160.79.104.0/21,no-resolve"}},
+		},
+		Templates: []Template{{ID: "claude-code", RuleSets: []string{"claude-domains", "claude-ip"}}},
+		Profiles: []Profile{{
+			ID:              "work-mac-policy",
+			DefaultPolicies: []string{"DIRECT"},
+			Rules: []Rule{{
+				ID:       "claude-code",
+				Match:    RuleMatch{Template: "claude-code"},
+				Policies: []string{"Claude-US", "DIRECT"},
+			}},
+		}},
+		Devices: []ManagedDevice{{
+			ID: "work-mac", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "work-mac-policy", EgressMode: EgressModeInheritGlobal,
+		}},
+	}
+
+	compiled, err := CompilePolicySet(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"AND,((SRC-IP-CIDR,192.168.50.101/32),(RULE-SET,open-surge-ruleset-claude-domains)),device/work-mac/claude-code",
+		"AND,((SRC-IP-CIDR,192.168.50.101/32),(RULE-SET,open-surge-ruleset-claude-ip)),device/work-mac/claude-code",
+	} {
+		if !contains(compiled.OverrideRules, want) {
+			t.Fatalf("override rules missing %q: %#v", want, compiled.OverrideRules)
+		}
+	}
+	if len(compiled.RuleProviders) != 2 || !hasSelectorGroup(compiled.SelectorGroups, "device/work-mac/claude-code") {
+		t.Fatalf("compiled template = %#v", compiled)
+	}
+}
+
 func TestCompilePolicySetSeparatesExplicitEgressModesAndLegacyFallback(t *testing.T) {
 	set := PolicySet{
 		Profiles: []Profile{{ID: "home", DefaultPolicies: []string{"DIRECT", "Proxy"}}},
@@ -146,6 +186,106 @@ func TestCompileInheritedDeviceDoesNotReferenceUnusedDefaultPolicies(t *testing.
 	}
 }
 
+func TestCompileRouterBypassKeepsReservationWithoutMihomoRules(t *testing.T) {
+	set := PolicySet{
+		Profiles: []Profile{{
+			ID:              "living-room",
+			DefaultPolicies: []string{"DIRECT", "Proxy"},
+			Rules:           []Rule{{ID: "video", Match: RuleMatch{Domains: []string{"video.example"}}, Action: "REJECT"}},
+		}},
+		Devices: []ManagedDevice{{
+			ID:            "playstation-5",
+			Name:          "PlayStation 5",
+			MAC:           "aa:bb:cc:dd:ee:05",
+			IPv4:          "192.168.1.190",
+			Profile:       "living-room",
+			GatewayTarget: GatewayTargetUpstreamRouter,
+			EgressMode:    EgressModeDedicated,
+		}},
+	}
+
+	compiled, err := CompilePolicySet(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compiled.Devices) != 1 || compiled.Devices[0].GatewayTarget != GatewayTargetUpstreamRouter || len(compiled.Devices[0].Groups) != 0 {
+		t.Fatalf("compiled device = %#v", compiled.Devices)
+	}
+	if len(compiled.Reservations) != 1 || compiled.Reservations[0].GatewayTarget != GatewayTargetUpstreamRouter {
+		t.Fatalf("reservations = %#v", compiled.Reservations)
+	}
+	if len(compiled.SelectorGroups) != 0 || len(compiled.OverrideRules) != 0 || len(compiled.DedicatedRules) != 0 || len(compiled.DefaultRules) != 0 {
+		t.Fatalf("router bypass emitted mihomo policy: %#v", compiled)
+	}
+}
+
+func TestValidateRouterBypassRequiresMAC(t *testing.T) {
+	set := PolicySet{
+		Profiles: []Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices: []ManagedDevice{{
+			ID: "console", IPv4: "192.168.1.190", Profile: "home", GatewayTarget: GatewayTargetUpstreamRouter,
+		}},
+	}
+	if err := ValidatePolicySet(set); err == nil || !strings.Contains(err.Error(), "requires a MAC address") {
+		t.Fatalf("ValidatePolicySet() error = %v", err)
+	}
+}
+
+func TestCompilePolicySetTreatsMACAsOptionalIdentityForIPOnlyMode(t *testing.T) {
+	set := PolicySet{
+		Profiles: []Profile{{ID: "home", DefaultPolicies: []string{"DIRECT", "Proxy"}}},
+		Devices: []ManagedDevice{
+			{ID: "ip-only", IPv4: "192.168.50.101", Profile: "home", EgressMode: EgressModeDedicated},
+			{ID: "identified", MAC: "aa:bb:cc:dd:ee:02", IPv4: "192.168.50.102", Profile: "home", EgressMode: EgressModeDedicated},
+		},
+	}
+
+	sameLAN, err := CompilePolicySetForIPOnlyMode(set, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sameLAN.Devices) != 2 || sameLAN.Devices[0].MAC != "" {
+		t.Fatalf("same-LAN devices = %#v", sameLAN.Devices)
+	}
+	if len(sameLAN.Reservations) != 1 || sameLAN.Reservations[0].ID != "identified" {
+		t.Fatalf("same-LAN reservations = %#v", sameLAN.Reservations)
+	}
+	if !containsRule(sameLAN.DedicatedRules, "SRC-IP-CIDR,192.168.50.101/32,device/ip-only/default") {
+		t.Fatalf("same-LAN dedicated rules = %#v", sameLAN.DedicatedRules)
+	}
+
+	dhcp, err := CompilePolicySetForIPOnlyMode(set, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dhcp.Devices) != 1 || dhcp.Devices[0].ID != "identified" {
+		t.Fatalf("DHCP devices = %#v", dhcp.Devices)
+	}
+	if containsRule(dhcp.DedicatedRules, "SRC-IP-CIDR,192.168.50.101/32,device/ip-only/default") {
+		t.Fatalf("DHCP policy retained an unsafe IP-only rule: %#v", dhcp.DedicatedRules)
+	}
+	if _, err := DeviceGroupFromCompiled(dhcp, "ip-only", "default"); err == nil || !strings.Contains(err.Error(), "unknown device") {
+		t.Fatalf("DeviceGroupFromCompiled() error = %v", err)
+	}
+}
+
+func TestValidatePolicySetAllowsMultipleDevicesWithoutMACButStillRejectsInvalidMAC(t *testing.T) {
+	set := PolicySet{
+		Profiles: []Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices: []ManagedDevice{
+			{ID: "first", IPv4: "192.168.50.101", Profile: "home"},
+			{ID: "second", IPv4: "192.168.50.102", Profile: "home"},
+		},
+	}
+	if err := ValidatePolicySet(set); err != nil {
+		t.Fatalf("ValidatePolicySet() rejected optional MACs: %v", err)
+	}
+	set.Devices[1].MAC = "not-a-mac"
+	if err := ValidatePolicySet(set); err == nil || !strings.Contains(err.Error(), "must be an IEEE 802 6-byte MAC address") {
+		t.Fatalf("ValidatePolicySet() invalid MAC error = %v", err)
+	}
+}
+
 func TestPolicySetValidationRejectsUnsafeOrAmbiguousPolicies(t *testing.T) {
 	base := PolicySet{
 		Profiles: []Profile{{ID: "default", DefaultPolicies: []string{"DIRECT"}}},
@@ -192,6 +332,29 @@ func TestPolicySetValidationRejectsUnsafeOrAmbiguousPolicies(t *testing.T) {
 			},
 			want: "mrs format supports domain or ipcidr",
 		},
+		{
+			name: "template references unknown rule set",
+			edit: func(set *PolicySet) {
+				set.Templates = []Template{{ID: "bundle", RuleSets: []string{"missing"}}}
+			},
+			want: "references unknown rule set",
+		},
+		{
+			name: "rule references unknown routing template",
+			edit: func(set *PolicySet) {
+				set.Profiles[0].Rules = []Rule{{ID: "bad", Match: RuleMatch{Template: "missing"}, Action: "DIRECT"}}
+			},
+			want: "references unknown template",
+		},
+		{
+			name: "routing template mixed with direct match",
+			edit: func(set *PolicySet) {
+				set.RuleSets = []RuleSet{{ID: "domains", Behavior: "domain", Payload: []string{"example.com"}}}
+				set.Templates = []Template{{ID: "bundle", RuleSets: []string{"domains"}}}
+				set.Profiles[0].Rules = []Rule{{ID: "bad", Match: RuleMatch{Template: "bundle", Domains: []string{"example.com"}}, Action: "DIRECT"}}
+			},
+			want: "template cannot be combined",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -219,14 +382,11 @@ func TestLoadPolicySetRejectsUnknownJSONFieldsAndValidatesLAN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPolicySet() error = %v", err)
 	}
-	if err := ValidatePolicySetForLAN(set, "192.168.50.1"); err != nil {
-		t.Fatalf("ValidatePolicySetForLAN() error = %v", err)
-	}
-	if err := ValidatePolicySetForLAN(set, "192.168.51.1"); err == nil || !strings.Contains(err.Error(), "must remain in gateway LAN") {
+	if err := ValidatePolicySetForLAN(set, mustScope(t, "192.168.50.1", 24), nil, true); err != nil {
 		t.Fatalf("ValidatePolicySetForLAN() error = %v", err)
 	}
 	set.Devices[0].IPv4 = "192.168.50.255"
-	if err := ValidatePolicySetForLAN(set, "192.168.50.1"); err == nil || !strings.Contains(err.Error(), "network or broadcast") {
+	if err := ValidatePolicySetForLAN(set, mustScope(t, "192.168.50.1", 24), nil, true); err == nil || !strings.Contains(err.Error(), "network or broadcast") {
 		t.Fatalf("ValidatePolicySetForLAN() error = %v", err)
 	}
 	if err := os.WriteFile(path, []byte(`{"unknown":true}`), 0o644); err != nil {
@@ -336,10 +496,49 @@ func TestValidatePolicySetForLANRejectsProtectedAddress(t *testing.T) {
 		Profiles: []Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
 		Devices:  []ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home"}},
 	}
-	err := ValidatePolicySetForLANWithProtected(set, "192.168.50.1", []string{"192.168.50.101", "192.168.50.253"})
+	err := ValidatePolicySetForLAN(set, mustScope(t, "192.168.50.1", 24), []string{"192.168.50.101", "192.168.50.253"}, true)
 	if err == nil || !strings.Contains(err.Error(), "conflicts with a protected") {
-		t.Fatalf("ValidatePolicySetForLANWithProtected() error = %v", err)
+		t.Fatalf("ValidatePolicySetForLAN() error = %v", err)
 	}
+}
+
+func TestValidatePolicySetForLANAcceptsRegistrationsFromAnotherLAN(t *testing.T) {
+	set := PolicySet{
+		Profiles: []Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices:  []ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home"}},
+	}
+	scope := mustScope(t, "192.168.60.1", 24)
+	if err := ValidatePolicySetForLAN(set, scope, []string{"192.168.50.101"}, true); err != nil {
+		t.Fatalf("ValidatePolicySetForLAN() error = %v", err)
+	}
+	if got := OutOfLANDevices(set, scope); len(got) != 1 || got[0] != "phone" {
+		t.Fatalf("OutOfLANDevices() = %v", got)
+	}
+	if got := OutOfLANDevices(set, mustScope(t, "192.168.50.1", 24)); len(got) != 0 {
+		t.Fatalf("OutOfLANDevices() = %v", got)
+	}
+}
+
+func TestValidatePolicySetForLANHonorsConfiguredPrefixLength(t *testing.T) {
+	set := PolicySet{
+		Profiles: []Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices:  []ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.51.101", Profile: "home"}},
+	}
+	if got := OutOfLANDevices(set, mustScope(t, "192.168.50.1", 24)); len(got) != 1 {
+		t.Fatalf("OutOfLANDevices() on /24 = %v", got)
+	}
+	if got := OutOfLANDevices(set, mustScope(t, "192.168.50.1", 22)); len(got) != 0 {
+		t.Fatalf("OutOfLANDevices() on /22 = %v", got)
+	}
+}
+
+func mustScope(t *testing.T, gatewayIP string, prefixLen int) lan.Scope {
+	t.Helper()
+	scope, err := lan.NewScope(gatewayIP, prefixLen)
+	if err != nil {
+		t.Fatalf("lan.NewScope() error = %v", err)
+	}
+	return scope
 }
 
 func containsRule(rules []string, want string) bool {

@@ -12,7 +12,7 @@ import { ConnectivityPage } from './ConnectivityPage'
 const catalog: ConnectivityResponse = {
   schema_version: 1,
   source: 'gateway_mihomo',
-  scope: 'applied_global_rules',
+  scope: 'local_mac_runtime',
   rounds: 3,
   targets: [
     { id: 'baidu', name: '百度', category: 'china', symbol: 'BD', url: 'https://www.baidu.com/favicon.ico', expected_route: 'direct' },
@@ -23,8 +23,11 @@ const catalog: ConnectivityResponse = {
 
 const running = {
   drift: false,
+  warnings: [],
   status: { gateway: 'running', mihomo: 'running' },
 } as unknown as Overview
+
+const onChanged = vi.fn(async () => {})
 
 describe('ConnectivityPage', () => {
   beforeEach(() => {
@@ -46,10 +49,11 @@ describe('ConnectivityPage', () => {
   afterEach(() => { cleanup(); vi.clearAllMocks() })
 
   it('runs the applied-path catalog and exposes reachability plus route evidence', async () => {
-    render(<ConnectivityPage overview={running} />)
+    render(<ConnectivityPage overview={running} onChanged={onChanged} />)
     expect(await screen.findByText('百度')).toBeTruthy()
     expect(api.testConnectivity).not.toHaveBeenCalled()
     expect(document.querySelector('.mismatch-badge')).toBeNull()
+    expect(screen.queryByRole('button', { name: '恢复 Mihomo' })).toBeNull()
 
     await userEvent.click(screen.getByRole('button', { name: '检测全部' }))
     await waitFor(() => expect(api.testConnectivity).toHaveBeenCalledWith(['baidu', 'github']))
@@ -64,7 +68,7 @@ describe('ConnectivityPage', () => {
   })
 
   it('permits probes when the running mihomo status includes its live version', async () => {
-    render(<ConnectivityPage overview={{ ...running, status: { ...running.status, mihomo: 'running (v1.19.27)' } }} />)
+    render(<ConnectivityPage overview={{ ...running, status: { ...running.status, mihomo: 'running (v1.19.27)' } }} onChanged={onChanged} />)
     await screen.findByText('百度')
 
     expect((screen.getByRole('button', { name: '检测全部' }) as HTMLButtonElement).disabled).toBe(false)
@@ -74,20 +78,65 @@ describe('ConnectivityPage', () => {
   })
 
   it('keeps external browser testing available while the gateway is stopped', async () => {
-    render(<ConnectivityPage overview={{ ...running, status: { ...running.status, gateway: 'stopped', mihomo: 'stopped' } }} />)
+    render(<ConnectivityPage overview={{ ...running, status: { ...running.status, gateway: 'stopped', mihomo: 'stopped' } }} onChanged={onChanged} />)
     await screen.findByText('百度')
     expect((screen.getByRole('button', { name: '检测全部' }) as HTMLButtonElement).disabled).toBe(true)
     expect(screen.getByRole('link', { name: /本机浏览器线路/ }).getAttribute('href')).toBe('https://ip.net.coffee/link/')
     expect(screen.getByText(/启动网关和 mihomo/)).toBeTruthy()
   })
 
-  it('restarts only mihomo and reruns applied-path probes after recovery', async () => {
+  it('offers manual mihomo-only recovery after automatic recovery failed for an active runtime', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
-    render(<ConnectivityPage overview={running} />)
+    const degraded = {
+      ...running,
+      status: { ...running.status, gateway: 'degraded', mihomo: 'stopped', runtime_state: 'active' },
+      mihomo_recovery: { state: 'failed', reason: 'process_missing', error: 'replacement did not become ready' },
+    } as Overview
+    render(<ConnectivityPage overview={degraded} onChanged={onChanged} />)
     await screen.findByText('百度')
-    await userEvent.click(screen.getByRole('button', { name: '仅重启 Mihomo' }))
+    const restart = screen.getByRole('button', { name: '恢复 Mihomo' })
+    expect(restart.classList.contains('primary')).toBe(true)
+    await userEvent.click(restart)
     await waitFor(() => expect(api.gateway).toHaveBeenCalledWith('restart-mihomo'))
     expect(waitForOperation).toHaveBeenCalledWith('restart-1')
-    await waitFor(() => expect(api.testConnectivity).toHaveBeenCalledWith(['baidu', 'github']))
+    await waitFor(() => expect(onChanged).toHaveBeenCalled())
+    expect(api.testConnectivity).not.toHaveBeenCalled()
+  })
+
+  it('offers recovery when the local mihomo controller refuses connections even if the PID is still alive', async () => {
+    render(<ConnectivityPage overview={{
+      ...running,
+      warnings: ['mihomo policies unavailable: Get "http://127.0.0.1:9090/proxies": dial tcp 127.0.0.1:9090: connect: connection refused'],
+      status: { ...running.status, runtime_state: 'active', mihomo_error: 'dial tcp 127.0.0.1:9090: connect: connection refused' },
+      mihomo_recovery: { state: 'failed', reason: 'controller_refused' },
+    } as Overview} onChanged={onChanged} />)
+    await screen.findByText('百度')
+    expect(screen.getByRole('button', { name: '恢复 Mihomo' })).toBeTruthy()
+    expect((screen.getByRole('button', { name: '检测全部' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('suppresses the manual recovery card while the backend is observing or recovering', async () => {
+    const automatic = {
+      ...running,
+      status: { ...running.status, gateway: 'degraded', mihomo: 'stopped', runtime_state: 'active' },
+      mihomo_recovery: { state: 'recovering', reason: 'process_missing' },
+    } as Overview
+    render(<ConnectivityPage overview={automatic} onChanged={onChanged} />)
+    await screen.findByText('百度')
+    expect(screen.queryByRole('button', { name: '恢复 Mihomo' })).toBeNull()
+    expect(screen.getByText('正在自动恢复 Mihomo')).toBeTruthy()
+    expect((screen.getByRole('button', { name: '检测全部' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('blocks mihomo-only recovery for a runtime interrupted by system reboot', async () => {
+    const interrupted = {
+      ...running,
+      status: { ...running.status, gateway: 'degraded', mihomo: 'stopped', runtime_state: 'interrupted' },
+    } as Overview
+    render(<ConnectivityPage overview={interrupted} onChanged={onChanged} />)
+    await screen.findByText('百度')
+    expect(screen.getByText(/系统重启中断/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '恢复 Mihomo' })).toBeNull()
+    expect(api.gateway).not.toHaveBeenCalled()
   })
 })

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +43,41 @@ func TestFetchVersion(t *testing.T) {
 	}
 	if !version.Meta {
 		t.Fatalf("Meta = false")
+	}
+}
+
+func TestFetchTUNRuntimeState(t *testing.T) {
+	cfg := config.Default()
+	cfg.Mihomo.APIAddr = "127.0.0.1:9090"
+	cfg.Mihomo.Secret = "test-secret"
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != "http://127.0.0.1:9090/configs" {
+			t.Fatalf("URL = %q", req.URL.String())
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(`{"tun":{"enable":true,"device":"utun123"}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	state, err := fetchTUNRuntimeStateWithClient(context.Background(), cfg, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.Enabled || state.Device != "utun123" {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestFetchTUNRuntimeStateRejectsMissingState(t *testing.T) {
+	cfg := config.Default()
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{}`)), Header: make(http.Header)}, nil
+	})}
+	if _, err := fetchTUNRuntimeStateWithClient(context.Background(), cfg, client); err == nil {
+		t.Fatal("missing TUN state should fail")
 	}
 }
 
@@ -131,6 +167,84 @@ func TestFetchProxyHealthKeepsLeafStatusAndLatestDelay(t *testing.T) {
 	}
 	if got := byName["Proxy"]; got.Selected != "HK" || !got.Probeable {
 		t.Fatalf("Proxy = %#v", got)
+	}
+}
+
+func TestFetchProxyHealthUsesRoleSpecificTailscaleStatus(t *testing.T) {
+	response := func() *http.Response {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(`{"proxies":{"open-surge/tailscale":{"name":"open-surge/tailscale","type":"Tailscale","alive":false,"udp":true}}}`)),
+			Header:     make(http.Header),
+		}
+	}
+	cfg := config.Default()
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.DisplayName = "Home Tailnet"
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return response(), nil })}
+
+	tailnet, err := fetchProxyHealthWithClient(context.Background(), cfg, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tailnet.Proxies[0]; got.DisplayName != "Home Tailnet" || got.Role != "tailnet" || got.Status != "available_on_demand" || got.Probeable {
+		t.Fatalf("Tailnet-only health = %#v", got)
+	}
+
+	cfg.Tailscale.ExitNode = "100.90.3.4"
+	exit, err := fetchProxyHealthWithClient(context.Background(), cfg, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := exit.Proxies[0]; got.Role != "exit_node" || got.Status != "unreachable" || !got.Probeable {
+		t.Fatalf("Exit Node health = %#v", got)
+	}
+}
+
+func TestFetchProxyHealthLabelsTailscaleExitGroup(t *testing.T) {
+	cfg := config.Default()
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.DisplayName = "Home Tailnet"
+	cfg.Tailscale.ExitNode = "100.90.3.4"
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(`{"proxies":{"open-surge/tailscale-exit":{"name":"open-surge/tailscale-exit","type":"Selector","now":"open-surge/tailscale","all":["open-surge/tailscale"]}}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	snapshot, err := fetchProxyHealthWithClient(context.Background(), cfg, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Proxies) != 1 || snapshot.Proxies[0].DisplayName != "Home Tailnet · Exit Node" || snapshot.Proxies[0].Role != "exit_node" || snapshot.Proxies[0].Selected != config.TailscaleProxyName {
+		t.Fatalf("Tailscale Exit group health = %#v", snapshot.Proxies)
+	}
+}
+
+func TestTailscaleWarmupUsesRoleSpecificTarget(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		exitNode    string
+		wantURL     string
+		wantTimeout time.Duration
+	}{
+		{name: "tailnet", wantURL: DefaultTailscaleWarmupURL, wantTimeout: defaultTailscaleTailnetWarmupTimeout},
+		{name: "exit node", exitNode: "100.90.3.4", wantURL: DefaultTailscaleExitNodeTestURL, wantTimeout: DefaultTailscaleExitNodeTestTimeout},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Tailscale.Enabled = true
+			cfg.Tailscale.ExitNode = tt.exitNode
+			if got := tailscaleWarmupURL(cfg); got != tt.wantURL {
+				t.Fatalf("warm-up URL = %q, want %q", got, tt.wantURL)
+			}
+			if got := tailscaleWarmupTimeout(cfg); got != tt.wantTimeout {
+				t.Fatalf("warm-up timeout = %s, want %s", got, tt.wantTimeout)
+			}
+		})
 	}
 }
 
@@ -258,6 +372,41 @@ func TestFetchConnections(t *testing.T) {
 	}
 	if connection.Metadata["host"] != "example.com" {
 		t.Fatalf("metadata = %#v", connection.Metadata)
+	}
+}
+
+func TestCloseConnectionsDeletesEachUniqueConnection(t *testing.T) {
+	cfg := config.Default()
+	cfg.Mihomo.APIAddr = "127.0.0.1:9090"
+	cfg.Mihomo.Secret = "test-secret"
+
+	requested := []string{}
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodDelete {
+			t.Fatalf("method = %q", req.Method)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer test-secret" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		requested = append(requested, req.URL.EscapedPath())
+		statusCode, status := http.StatusNoContent, "204 No Content"
+		if req.URL.EscapedPath() == "/connections/failing" {
+			statusCode, status = http.StatusBadGateway, "502 Bad Gateway"
+		}
+		return &http.Response{
+			StatusCode: statusCode,
+			Status:     status,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	closed, err := closeConnectionsWithClient(context.Background(), cfg, client, []string{"abc/123", "abc/123", "", "failing"})
+	if closed != 1 || err == nil || !strings.Contains(err.Error(), "failing") {
+		t.Fatalf("closeConnectionsWithClient() = %d, %v", closed, err)
+	}
+	if !reflect.DeepEqual(requested, []string{"/connections/abc%2F123", "/connections/failing"}) {
+		t.Fatalf("requested paths = %#v", requested)
 	}
 }
 
@@ -421,6 +570,7 @@ func TestImportedProfilePolicySwitchFixture(t *testing.T) {
 	for _, want := range []string{
 		"profile:",
 		"  store-selected: true",
+		"  store-fake-ip: true",
 		"- name: \"Proxy\"",
 		"- \"demo-proxy\"",
 		"- DIRECT",

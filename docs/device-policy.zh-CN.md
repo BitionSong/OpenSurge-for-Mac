@@ -1,19 +1,28 @@
 # 每设备策略覆盖
 
 OpenSurge 只运行一个 mihomo 进程；不会为每台设备启动一份 mihomo 或复制完整 profile。
-它会将已登记 MAC 固定到 IPv4 DHCP 租约，为每台设备生成独立 selector group，并用
+DHCP 模式会将已登记 MAC 固定到 IPv4 租约；`same_lan` 旁路由模式也允许只登记固定
+IPv4、把 MAC 作为可选身份信息。OpenSurge 为当前拓扑中有效的设备生成独立 selector group，并用
 mihomo 的 `SRC-IP-CIDR` 规则区分流量。
 
-这是可选功能。在 gateway 配置中指定 JSON 文件：
+安装版默认启用每设备策略，Web GUI 不提供关闭开关。新安装会自动创建空策略文件，
+升级时会为旧的未启用配置补齐文件路径，并保留已有策略内容。保存网络配置也始终
+保持启用。需要独立出口时，直接在“设备”页登记和配置设备。
+
+使用独立 CLI 配置时，通过以下字段指定 JSON 文件：
 
 ```yaml
 device_policy:
   file: "./devices.json"
 ```
 
-空的 [starter 文件](../examples/device-policy.example.json) 合法，但不会启用任何设备策略。
-路径相对于 gateway 配置文件解析。设备 IPv4 必须唯一、位于 gateway 的 `/24`，且不能
-是网段地址、广播地址或 `gateway.lan_ip`。
+空的 [starter 文件](../examples/device-policy.example.json) 合法，尚未登记设备时不会生成设备专属路由。
+路径相对于 gateway 配置文件解析。设备 IPv4 必须唯一；位于当前网关网段内的地址
+不能是网段地址、广播地址或 `gateway.lan_ip`。网段由 `gateway.lan_ip` 与
+`gateway.lan_prefix_len` 决定（省略时按 /24）。不在当前网段的登记会休眠而不是
+报错：网关照常启动并保留完整 desired 记录，但 applied 运行态设备列表、dnsmasq
+保留、Mihomo IPv4 selector/规则和下游 IPv6 MAC 身份都不包含它。设备页把它标记为
+“不在当前网段”，由操作者改地址或删除。
 
 在 `same_wifi_dhcp` 中，还必须声明路由器、恢复设备、LAN proxy 等绝不能被 reservation
 占用的静态地址：
@@ -31,12 +40,13 @@ reservation 可位于动态 DHCP 池内，`devices --format json` 会显式标�
 
 ## 模型
 
-项目不内置儿童、影音、IoT 或第三方规则内容；规则和模板由操作者自己提供。JSON 中有：
+Web GUI 的规则库内置一份可查看的 Claude Code 社区示例；规则集与分流模版页始终展示，但不会默认写入配置或应用到设备。
+其他规则内容由操作者提供。JSON 中有：
 
-- `devices`：稳定 `id`、可选显示名称 `name`、MAC、固定 IPv4、profile 与明确的
-  `egress_mode`；
+- `devices`：稳定 `id`、可选显示名称 `name`、MAC、固定 IPv4、profile、
+  `gateway_target` 与明确的 `egress_mode`；
 - `profiles`：默认 selector 候选项与设备覆盖规则；
-- `templates`：可复用的 profile 默认值和规则片段；
+- `templates`：把多份 `rule_sets` 组合成不带出口的分流模版；
 - `rule_sets`：inline 或 HTTP mihomo rule-provider。
 
 以下只是格式示例，`Proxy` 必须已存在于 managed 或 imported 的全局 mihomo profile：
@@ -44,7 +54,7 @@ reservation 可位于动态 DHCP 池内，`devices --format json` 会显式标�
 ```json
 {
   "templates": [
-    {"id": "baseline", "default_policies": ["DIRECT", "Proxy"]}
+    {"id": "media-bundle", "rule_sets": ["media"]}
   ],
   "rule_sets": [
     {"id": "media", "behavior": "domain", "payload": ["media.example"]}
@@ -52,10 +62,10 @@ reservation 可位于动态 DHCP 池内，`devices --format json` 会显式标�
   "profiles": [
     {
       "id": "phone",
-      "template": "baseline",
+      "default_policies": ["DIRECT", "Proxy"],
       "rules": [
         {"id": "block-udp", "match": {"protocols": ["udp"]}, "action": "REJECT"},
-        {"id": "media", "match": {"rule_sets": ["media"]}, "policies": ["Proxy", "DIRECT"]}
+        {"id": "media", "match": {"template": "media-bundle"}, "policies": ["Proxy", "DIRECT"]}
       ]
     }
   ],
@@ -72,8 +82,8 @@ reservation 可位于动态 DHCP 池内，`devices --format json` 会显式标�
 
 `egress_mode` 有两种明确取值：
 
-- `inherit_global`：设备专属规则仍优先；未命中流量继续走与本机相同的全局规则和
-  terminal `MATCH`；
+- `inherit_global`：设备专属规则仍优先；未命中流量继续走 imported/managed 网关规则和
+  terminal `MATCH`。它不跟随 Mac 本机的规则 / 全局 / 直连开关；
 - `dedicated`：未命中的公网流量会在全局规则前进入设备自己的
   `device/<device-id>/default` selector。局域网、私网、link-local、CGNAT 和 multicast
   目标仍保持 `DIRECT`。
@@ -81,6 +91,19 @@ reservation 可位于动态 DHCP 池内，`devices --format json` 会显式标�
 Web GUI 新登记设备默认使用 `inherit_global`。旧文件没有 `egress_mode` 时不会被静默改变，
 而会以 `legacy_fallback` 保留原来的“全局规则优先、设备出口兜底”语义；GUI 会明确提示
 用户选择一种新模式。
+
+`gateway_target` 默认为 `opensurge`。只有 `same_wifi_dhcp`（局域网 DHCP
+接管）可显式选择 `upstream_router`：dnsmasq 仍按 MAC 为设备分配登记的固定
+IPv4，但通过 tag 向它单独下发 `dhcp.bypass_gateway` 和
+`dhcp.bypass_dns`。此时不生成该设备的代理 selector 或普通设备规则，Profile
+和规则只保留不删除；切回 `opensurge` 后重新生效。这是仅限 IPv4 的绕行：启用
+下游 IPv6 时，packet listener 仍保留该设备基于 MAC 的 `device:<id>` 身份，只用于
+最优先的 `IN-TYPE,TUN + IN-USER,REJECT`，其他设备继续使用各自正常的 IPv6 策略。该设备
+仍可能保留 SLAAC 地址或 RDNSS，因此 UI 只显示“IPv6 出站已阻止”，不声称设备
+没有 IPv6。必须关闭主路由 RA/DHCPv6 或由 RA Guard 消除，否则 IPv6 仍可能完全
+绕过 OpenSurge。切换后必须让设备续租或重新连接网络，新的 IPv4 Router/DNS 才会
+生效。该选项必须有真实 MAC，且主路由网关必须与 Mac 网关处于同一网段、不得
+位于 DHCP 动态地址池内。
 
 只有跟随设备使用的 Profile 仍会保留 `default_policies` 作为以后切换独立模式的配置，
 但这些未渲染的候选不会参与当前 imported profile 引用校验；真正生成独立或兼容 selector
@@ -94,7 +117,8 @@ Web GUI 新登记设备默认使用 `inherit_global`。旧文件没有 `egress_m
 启动前会校验候选项和 action 是否引用 imported profile 中存在的 proxy/group；内置目标
 仅显式允许 `DIRECT`、`REJECT`、`REJECT-DROP`、`REJECT-TINYGIF`。`device/` 是生成
 group 的保留命名空间，`open-surge-ruleset-` 是生成 provider 的保留命名空间，imported
-profile 不能占用它们。
+profile 不能占用它们。`open-surge/mac-*` 由 Mac 本机流量模式保留，proxy/group 也不能
+占用；详见 [Mac 本机流量模式](local-mac-routing.zh-CN.md)。
 
 ## 匹配与顺序
 
@@ -105,11 +129,34 @@ profile 不能占用它们。
 AND,((SRC-IP-CIDR,192.168.50.101/32),(DOMAIN-SUFFIX,media.example),(NETWORK,tcp)),device/alice-phone/media
 ```
 
-设备专属覆盖在所有模式下都先于全局规则。`inherit_global` 随后继续进入全局规则与
-terminal `MATCH`；`dedicated` 的顺序是按设备源地址限定的本地/私网 `DIRECT` 保护 →
-设备专属覆盖 → 设备默认 selector → imported/managed 全局规则 → terminal `MATCH`。
+规则也可单独使用 `match.template`引用分流模版。模版按声明顺序展开其
+`rule_sets`；它不能与其他匹配字段同时出现，命中后的 `action` 或 `policies`
+始终保存在设备分流规则上。
+
+Mac 本机 source-scoped 模式规则最先执行，但下游设备源地址不会命中。设备专属覆盖在
+所有设备模式下都先于网关规则。`inherit_global` 随后继续进入 imported/managed 网关
+规则与 terminal `MATCH`；`dedicated` 的顺序是按设备源地址限定的本地/私网 `DIRECT`
+保护 → 设备专属覆盖 → 设备默认 selector → imported/managed 网关规则 → terminal
+`MATCH`。
 缺少模式的旧文件仍保持设备默认 selector 位于全局规则之后、`MATCH` 之前。imported
 profile 的 `MATCH` 必须位于最后；若其后还有规则，OpenSurge 会拒绝渲染。
+
+## 当前配置中已不存在的出口
+
+切换配置来源或更新订阅后，旧设备设置引用的出口名称可能消失。OpenSurge 在启动、
+重载和配置校验时根据最终合成配置生成有效策略，保留原始设备设置：
+
+- 设备当前选择的默认出口消失，或全部候选消失时，本次默认出口回退为“跟随网关规则”；
+  其他有效设备分流继续生效。此模式不跟随 Mac 本机的规则 / 全局 / 直连开关。
+- 绑定规则集、分流模版或直接域名/IP 条件的设备分流，其固定出口或当前选择的出口
+  消失时，本次跳过整条分流及其 UDP `REJECT` 兜底，继续匹配后续设备规则和设备默认出口。
+- 仅未选中的候选消失时，从本次运行的 selector 中排除它，保留有效的当前选择。
+
+规则集、模版与设备绑定均不会被删除。设备页会显示当前回退、跳过或过滤的结果；
+来源恢复后，下次启动或重载重新应用原设置。首次使用且没有历史选择时，以候选列表
+的第一项为默认选择；历史缓存无法读取且不能确认选择时，受影响策略保守回退或跳过。
+名称仍存在但暂时离线、测速超时或不支持 UDP，不触发这种回退。订阅自身的语法错误、
+全局规则错误和 OpenSurge 保留命名空间冲突仍须通过原有校验。
 
 ## 不支持 UDP 的出口
 
@@ -117,7 +164,7 @@ mihomo 遇到不支持 UDP 的出口会继续向下匹配。因而设备 selecto
 fail-closed：每条 selector/default 规则后都会紧跟同条件的 `REJECT`，避免 QUIC 或其他
 UDP 流量继续落入后续全局规则或 `MATCH,DIRECT`。
 
-可在 template、profile 或单条 rule 写入 `on_unsupported: "fallthrough"`，但只能在明确
+可在 profile 或单条 rule 写入 `on_unsupported: "fallthrough"`，但只能在明确
 希望后续规则承担 fallback 时使用；默认是 `"reject"`。group 名存在不等于其节点支持
 UDP，provider 候选仍须以真实流量验证。
 
@@ -125,7 +172,12 @@ UDP，provider 候选仍须以真实流量验证。
 
 `rule_sets` 支持 `inline`/`http`，以及 `domain`、`ipcidr`、`classical` behavior。HTTP
 provider 可用 `yaml`、`text`、`mrs`；MRS 只适用于 `domain` 和 `ipcidr`。大型共享域名/IP
-列表应使用 HTTP MRS；模板只复用策略选择和规则片段，不复制完整 mihomo profile。
+列表应使用 HTTP MRS；分流模版只复用规则集组合，不包含出口，也不复制完整 mihomo profile。
+
+Web GUI 的 Claude Code 内置示例来自
+[Net.Coffee 的社区规则页](https://ip.net.coffee/claude/site.html)，并明确标记为非 Anthropic
+官方规则。用户可先在规则集或分流模版中展开阅读；只有编辑并保存到草稿、把规则集加入
+自建模版，或选择“用于设备”并将分流添加到草稿时，对应的规则集和模版才会加入配置。
 
 ## 操作与验证
 
@@ -177,15 +229,34 @@ Web GUI 将两类操作持续分开：绿色表示 applied selector 的“即时
 的引用。
 
 `same_lan` 旁路由模式不运行 OpenSurge DHCP。该模式下，设备页从 mihomo 当前连接中提取与
-`gateway.lan_ip` 同 `/24` 的源 IPv4，并用 macOS ARP 邻居表尽力补充 MAC，列入“当前经过
+`gateway.lan_ip` 同网段的源 IPv4，并用 macOS ARP 邻居表尽力补充 MAC，列入“当前经过
 Mac 的设备”供登记。总览设备流量会合并 DHCP lease、applied 静态设备和当前观察到的
 same-LAN 源 IPv4：已登记静态 IPv4 可以获得名称、连接、速率、累计流量与出口归属，未登记
 但正在经过 Mac 的 IPv4 也以临时设备显示。ARP 与流量观察不是 DHCP 身份验证；MAC 未解析
-时仍需用户手工填写，且静态设备必须在主路由侧保持稳定 IPv4。
+时仍可只按固定 IPv4 登记，但必须在主路由侧确保该地址稳定且不会分配给其他设备。
 
-当前设备策略仍以 IPv4 `SRC-IP-CIDR` 执行。DHCP 模式提供 MAC 绑定租约的精确身份证据；
-`same_lan` 只提供静态登记、当前流量与可选 ARP 邻居观察，不把这些证据冒充 DHCP 验证。
-尚未提供 IPv6 设备身份、mihomo 内 MAC 匹配或预置第三方规则内容。
+从 `same_lan` 切换到 DHCP 拓扑时，已有设备全都带 MAC 则直接保存，不打断用户。若存在
+IP-only 登记，GUI 会按其原固定 IPv4 查找唯一、有效且未被其他登记占用的当前邻居 MAC，
+展示预填结果并让用户确认后写入。仍无法取得 MAC 的设备会列入迁移提示；用户可以检查
+设备、取消，或继续切换。继续切换会保留设备 ID、名称、Profile 和规则，但运行时不生成
+该设备的 selector、`SRC-IP-CIDR` 规则或 DHCP reservation，设备页显示暂停；补全 MAC 或
+切回 `same_lan` 后恢复。
+
+如果 applied 静态 IPv4 已没有流量，而设备页只观察到一个“相同邻居 MAC、不同 IPv4、
+仍有活跃连接”的来源，GUI 会显示原地址与当前地址，并提供“使用当前 IP 并应用”。确认后
+只更新该设备的 IPv4，保留设备 ID、名称、Profile、规则、路由方式与 selector 选择；网关
+运行时会在保存成功后执行安全重载，停止时则留待下次启动应用。在完成更新前，GUI 会禁用
+这台设备的路由方式与 applied selector，避免把对旧 `SRC-IP-CIDR` 的修改显示成即时生效。
+没有当前观察证据的离线设备仍可预设 selector，但会明确提示“设备按登记 IP 接入后生效”。
+多个同 MAC 活跃 IPv4、MAC 冲突或仅有不完整观察都不会触发自动猜测或静默改写。
+
+现有系统 TUN 设备策略路径仍以 IPv4 `SRC-IP-CIDR` 执行。下游 IPv6 packet path
+在三种受支持拓扑中都会保留观察到的 source MAC，并在 patched Mihomo 中映射为
+`IN-USER(device:<id>)` 复用设备规则；`upstream_router` 设备是例外，只获得最优先的
+IPv6 出站 `REJECT`。DHCP 模式提供 MAC 绑定租约的精确身份证据；`same_lan` 只提供
+静态登记、当前流量与可选邻居观察，不把这些证据冒充 DHCP 验证。packet path 中的
+MAC 是路由身份，不是防伪造认证。Claude Code 社区示例默认未启用，也不代表
+项目已验证这份第三方规则的完整性或可用性。
 
 数据面 gate：
 

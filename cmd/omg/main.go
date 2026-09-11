@@ -25,9 +25,15 @@ const defaultConfigPath = "examples/config.example.yaml"
 var (
 	fetchProxyGroups    = mihomo.FetchProxyGroups
 	selectProxyGroup    = mihomo.SelectProxyGroup
+	fetchLocalRouting   = mihomo.FetchLocalRouting
+	setLocalRouting     = mihomo.SetLocalRouting
 	fetchConnections    = mihomo.FetchConnections
 	fetchProviders      = mihomo.FetchProviders
 	updateProxyProvider = mihomo.UpdateProxyProvider
+	startGatewayConfig  = gateway.StartConfig
+	stopGatewayConfig   = gateway.StopConfig
+	reloadGatewayConfig = gateway.ReloadConfig
+	restartMihomoConfig = gateway.RestartMihomoConfig
 	newGatewayManager   = func(cfg config.Config) gatewayManager {
 		return gateway.New(cfg)
 	}
@@ -58,6 +64,7 @@ func run(args []string) int {
 	outputFormat := fs.String("format", "text", "output format: text or json")
 	policyGroup := fs.String("group", "", "mihomo policy group name")
 	policyName := fs.String("policy", "", "mihomo policy name to select")
+	localMode := fs.String("mode", "", "local Mac routing mode: rule, global, or direct")
 	deviceID := fs.String("device", "", "configured device id")
 	deviceSlot := fs.String("slot", "default", "device policy slot: default or a rule id")
 	providerName := fs.String("provider", "", "mihomo proxy provider name")
@@ -70,6 +77,27 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "format: %v\n", err)
 		return 2
 	}
+	ctx := context.Background()
+	var lifecycleAction func(context.Context, string) error
+	switch command {
+	case "start":
+		lifecycleAction = startGatewayConfig
+	case "stop":
+		lifecycleAction = stopGatewayConfig
+	case "reload":
+		lifecycleAction = reloadGatewayConfig
+	case "restart-mihomo":
+		lifecycleAction = restartMihomoConfig
+	}
+	if lifecycleAction != nil {
+		if err := lifecycleAction(ctx, *configPath); err != nil {
+			return writeErrorExit(command, jsonOutput, 1, command, err)
+		}
+		if jsonOutput {
+			return writeJSONExit(commandResultJSON{Command: command, OK: true, ConfigPath: *configPath})
+		}
+		return 0
+	}
 
 	loadConfig := config.LoadRuntime
 	if commandRequiresDesiredPolicy(command) {
@@ -80,38 +108,9 @@ func run(args []string) int {
 		return writeErrorExit(command, jsonOutput, 1, "config", err)
 	}
 
-	ctx := context.Background()
 	manager := newGatewayManager(cfg)
 
 	switch command {
-	case "start":
-		if err := manager.Start(ctx); err != nil {
-			return writeErrorExit(command, jsonOutput, 1, "start", err)
-		}
-		if jsonOutput {
-			return writeJSONExit(commandResultJSON{Command: "start", OK: true, ConfigPath: *configPath})
-		}
-	case "stop":
-		if err := manager.Stop(ctx); err != nil {
-			return writeErrorExit(command, jsonOutput, 1, "stop", err)
-		}
-		if jsonOutput {
-			return writeJSONExit(commandResultJSON{Command: "stop", OK: true, ConfigPath: *configPath})
-		}
-	case "reload":
-		if err := manager.Reload(ctx); err != nil {
-			return writeErrorExit(command, jsonOutput, 1, "reload", err)
-		}
-		if jsonOutput {
-			return writeJSONExit(commandResultJSON{Command: "reload", OK: true, ConfigPath: *configPath})
-		}
-	case "restart-mihomo":
-		if err := manager.RestartMihomo(ctx); err != nil {
-			return writeErrorExit(command, jsonOutput, 1, "restart-mihomo", err)
-		}
-		if jsonOutput {
-			return writeJSONExit(commandResultJSON{Command: "restart-mihomo", OK: true, ConfigPath: *configPath})
-		}
 	case "status":
 		status, err := manager.Status(ctx)
 		if err != nil {
@@ -183,15 +182,20 @@ func run(args []string) int {
 		if err != nil {
 			return writeErrorExit(command, jsonOutput, 1, "policies", err)
 		}
+		groups = mihomo.VisibleProxyGroups(groups)
 		if jsonOutput {
 			return writeJSONExit(policiesJSON{Groups: groups})
 		}
 		fmt.Print(formatProxyGroups(groups))
 	case "policy-select":
+		if mihomo.IsLocalRoutingGroup(*policyGroup) {
+			return writeErrorMessageExit(command, jsonOutput, 1, "policy-select: use local-routing-set to change OpenSurge local Mac routing groups")
+		}
 		groups, err := fetchProxyGroups(ctx, cfg)
 		if err != nil {
 			return writeErrorExit(command, jsonOutput, 1, "policy-select", err)
 		}
+		groups = mihomo.VisibleProxyGroups(groups)
 		if err := validatePolicySelection(groups, *policyGroup, *policyName); err != nil {
 			return writeErrorExit(command, jsonOutput, 1, "policy-select", err)
 		}
@@ -202,12 +206,30 @@ func run(args []string) int {
 			return writeJSONExit(policySelectJSON{Group: *policyGroup, Selected: *policyName})
 		}
 		fmt.Printf("Policy group %q selected %q\n", *policyGroup, *policyName)
+	case "local-routing":
+		snapshot, err := fetchLocalRouting(ctx, cfg)
+		if err != nil {
+			return writeErrorExit(command, jsonOutput, 1, "local-routing", err)
+		}
+		if jsonOutput {
+			return writeJSONExit(snapshot)
+		}
+		fmt.Print(formatLocalRouting(snapshot))
+	case "local-routing-set":
+		snapshot, err := setLocalRouting(ctx, cfg, *localMode, *policyName)
+		if err != nil {
+			return writeErrorExit(command, jsonOutput, 1, "local-routing-set", err)
+		}
+		if jsonOutput {
+			return writeJSONExit(snapshot)
+		}
+		fmt.Print(formatLocalRouting(snapshot))
 	case "device-policy-select":
 		bundle, err := loadAppliedPolicyBundle(cfg)
 		if err != nil {
 			return writeErrorExit(command, jsonOutput, 1, "device-policy-select", err)
 		}
-		group, err := device.DeviceGroup(bundle.Policy, *deviceID, *deviceSlot)
+		group, err := device.DeviceGroupFromCompiled(bundle.Compiled, *deviceID, *deviceSlot)
 		if err != nil {
 			return writeErrorExit(command, jsonOutput, 1, "device-policy-select", err)
 		}
@@ -240,11 +262,15 @@ func run(args []string) int {
 		if err != nil {
 			return writeErrorExit(command, jsonOutput, 1, "providers", err)
 		}
+		providers = mihomo.VisibleProviders(providers)
 		if jsonOutput {
 			return writeJSONExit(providers)
 		}
 		fmt.Print(formatProviders(providers))
 	case "provider-update":
+		if mihomo.IsLocalRoutingGroup(*providerName) {
+			return writeErrorMessageExit(command, jsonOutput, 1, "provider-update: OpenSurge local Mac routing groups are internal and cannot be refreshed")
+		}
 		provider, err := updateProxyProvider(ctx, cfg, *providerName)
 		if err != nil {
 			return writeErrorExit(command, jsonOutput, 1, "provider-update", err)
@@ -286,7 +312,7 @@ func run(args []string) int {
 
 func commandRequiresDesiredPolicy(command string) bool {
 	switch command {
-	case "start", "reload", "doctor", "render-mihomo", "validate-mihomo":
+	case "reload", "doctor", "render-mihomo", "validate-mihomo":
 		return true
 	default:
 		return false
@@ -398,7 +424,9 @@ type configuredDeviceJSON struct {
 	IPv4                     string            `json:"ipv4"`
 	ExpectedIP               string            `json:"expected_ip"`
 	Profile                  string            `json:"profile"`
+	GatewayTarget            string            `json:"gateway_target"`
 	EgressMode               string            `json:"egress_mode"`
+	IPv6Blocked              bool              `json:"ipv6_blocked,omitempty"`
 	Groups                   map[string]string `json:"groups"`
 	PolicySource             string            `json:"policy_source"`
 	DesiredDigest            string            `json:"desired_digest"`
@@ -494,6 +522,23 @@ func validatePolicySelection(groups []mihomo.ProxyGroup, groupName, selected str
 	return fmt.Errorf("policy group %q not found (available: %s)", groupName, strings.Join(policyGroupNames(groups), ", "))
 }
 
+func formatLocalRouting(snapshot mihomo.LocalRoutingSnapshot) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "Mac local traffic mode: %s\n", snapshot.Mode)
+	if snapshot.GlobalGroup != nil {
+		fmt.Fprintf(&out, "Global policy: %s\n", snapshot.GlobalGroup.Selected)
+	}
+	fmt.Fprintf(&out, "UDP behavior: %s\n", snapshot.UDPBehavior)
+	fmt.Fprintf(&out, "Transports: %s\n", strings.Join(snapshot.Transports, ", "))
+	if snapshot.NewConnectionsOnly {
+		out.WriteString("Applies to: new connections\n")
+	}
+	if snapshot.Warning != "" {
+		fmt.Fprintf(&out, "Warning: %s\n", snapshot.Warning)
+	}
+	return out.String()
+}
+
 func loadConfiguredPolicyBundle(cfg config.Config) (device.PolicyBundle, error) {
 	if strings.TrimSpace(cfg.DevicePolicy.File) == "" {
 		return device.PolicyBundle{}, fmt.Errorf("device_policy.file is not configured")
@@ -501,7 +546,11 @@ func loadConfiguredPolicyBundle(cfg config.Config) (device.PolicyBundle, error) 
 	if cfg.DevicePolicy.Bundle != nil {
 		return *cfg.DevicePolicy.Bundle, nil
 	}
-	return device.LoadPolicyBundle(cfg.DevicePolicy.File)
+	scope, err := cfg.LANScope()
+	if err != nil {
+		return device.PolicyBundle{}, err
+	}
+	return device.LoadPolicyBundleForLAN(cfg.DevicePolicy.File, scope, cfg.Gateway.Mode == config.GatewayModeSameLAN)
 }
 
 func loadAppliedPolicyBundle(cfg config.Config) (device.PolicyBundle, error) {
@@ -567,7 +616,9 @@ func configuredDevices(cfg config.Config) ([]configuredDeviceJSON, error) {
 			IPv4:                     managed.IPv4,
 			ExpectedIP:               managed.IPv4,
 			Profile:                  managed.Profile,
+			GatewayTarget:            managed.GatewayTarget,
 			EgressMode:               managed.EgressMode,
+			IPv6Blocked:              cfg.Transparent.TUNIPv6 != config.TUNIPv6Off && managed.GatewayTarget == device.GatewayTargetUpstreamRouter,
 			Groups:                   managed.Groups,
 			PolicySource:             policySource,
 			DesiredDigest:            desiredDigest,
@@ -697,6 +748,7 @@ func policiesSnapshot(ctx context.Context, cfg config.Config) policiesSnapshotJS
 	if groups == nil {
 		groups = []mihomo.ProxyGroup{}
 	}
+	groups = mihomo.VisibleProxyGroups(groups)
 	snapshot := policiesSnapshotJSON{Available: err == nil, Groups: groups}
 	if err != nil {
 		snapshot.Error = err.Error()
@@ -723,6 +775,7 @@ func connectionsSnapshot(ctx context.Context, cfg config.Config) connectionsSnap
 
 func providersSnapshot(ctx context.Context, cfg config.Config) providersSnapshotJSON {
 	providers, err := fetchProviders(ctx, cfg)
+	providers = mihomo.VisibleProviders(providers)
 	if providers.ProxyProviders == nil {
 		providers.ProxyProviders = []mihomo.ProxyProvider{}
 	}
@@ -1014,6 +1067,10 @@ Commands:
            list mihomo policy groups from the external-controller API
   policy-select --group <name> --policy <name>
            switch the selected policy in a mihomo policy group
+  local-routing
+           print the Mac-only rule/global/direct routing mode
+  local-routing-set --mode <rule|global|direct> [--policy <name>]
+           switch only Mac TUN and loopback explicit-proxy traffic
   device-policy-select --device <id> --slot <default|rule-id> --policy <name>
            switch one configured device's independent policy selector
   connections

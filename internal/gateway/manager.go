@@ -13,8 +13,12 @@ import (
 	"open-mihomo-gateway/internal/config"
 	"open-mihomo-gateway/internal/device"
 	"open-mihomo-gateway/internal/dhcp"
+	"open-mihomo-gateway/internal/ipv6packet"
+	"open-mihomo-gateway/internal/macosipv6"
+	"open-mihomo-gateway/internal/macosnetwork"
 	"open-mihomo-gateway/internal/mihomo"
 	"open-mihomo-gateway/internal/pf"
+	"open-mihomo-gateway/internal/process"
 	"open-mihomo-gateway/internal/runtime"
 	"open-mihomo-gateway/internal/sysctl"
 )
@@ -41,6 +45,7 @@ type mihomoService interface {
 	Check() error
 	WriteConfig() error
 	ValidateWrittenConfig() error
+	ValidateWrittenConfigContext(context.Context) error
 	Start() (int, error)
 	Stop(int) error
 	Running(int) bool
@@ -62,21 +67,50 @@ type sysctlService interface {
 	Restore(string) error
 }
 
+type localSystemProxyService interface {
+	Prepare(context.Context, string, int) (runtime.SystemProxySnapshot, error)
+	Enable(context.Context, runtime.SystemProxySnapshot, int) error
+	Restore(context.Context, runtime.SystemProxySnapshot) error
+}
+
+type ipv6PacketService interface {
+	Check() error
+	Start() (int, error)
+	Stop(int) error
+	Running(int) bool
+}
+
+type ipv6HostService interface {
+	NativeAvailable() (bool, error)
+	CheckGatewayAvailable() error
+	AddGateway(context.Context) error
+	RemoveGateway(context.Context) error
+	Withdraw(context.Context) error
+}
+
 type gatewayDeps struct {
-	geteuid            func() int
-	loadState          func(string) (runtime.State, bool, error)
-	saveState          func(string, runtime.State) error
-	removeState        func(string) error
-	ensure             func(runtime.Paths) error
-	newDHCP            func(config.Config, runtime.Paths) dhcpService
-	newMihomo          func(config.Config, runtime.Paths) mihomoService
-	newPF              func(config.Config, runtime.Paths) pfService
-	newSysctl          func() sysctlService
-	interfaces         func() ([]net.Interface, error)
-	interfaceByName    func(string) (*net.Interface, error)
-	interfaceAddrs     func(*net.Interface) ([]net.Addr, error)
-	probeReservationIP func(ip string, expectedMAC string) error
-	now                func() time.Time
+	geteuid             func() int
+	loadState           func(string) (runtime.State, bool, error)
+	saveState           func(string, runtime.State) error
+	removeState         func(string) error
+	ensure              func(runtime.Paths) error
+	newDHCP             func(config.Config, runtime.Paths) dhcpService
+	newMihomo           func(config.Config, runtime.Paths) mihomoService
+	newPF               func(config.Config, runtime.Paths) pfService
+	newSysctl           func() sysctlService
+	newLocalSystemProxy func() localSystemProxyService
+	newIPv6Packet       func(config.Config, runtime.Paths) ipv6PacketService
+	newIPv6Host         func(config.Config) ipv6HostService
+	interfaces          func() ([]net.Interface, error)
+	interfaceByName     func(string) (*net.Interface, error)
+	interfaceAddrs      func(*net.Interface) ([]net.Addr, error)
+	probeReservationIP  func(ip string, expectedMAC string) error
+	currentBoot         func() (runtime.BootSession, error)
+	processFingerprint  func(int) (string, error)
+	processMatches      func(int, string) (bool, error)
+	warmTailscale       func(context.Context, config.Config) error
+	stopPrepared        func(config.Config) error
+	now                 func() time.Time
 }
 
 func defaultGatewayDeps() gatewayDeps {
@@ -98,14 +132,96 @@ func defaultGatewayDeps() gatewayDeps {
 		newSysctl: func() sysctlService {
 			return sysctl.New()
 		},
+		newLocalSystemProxy: func() localSystemProxyService {
+			return macosnetwork.SystemProxy{}
+		},
+		newIPv6Packet: func(cfg config.Config, paths runtime.Paths) ipv6PacketService {
+			manager := ipv6packet.NewManager(cfg, paths)
+			return manager
+		},
+		newIPv6Host: func(cfg config.Config) ipv6HostService {
+			manager := macosipv6.New(cfg)
+			return manager
+		},
 		interfaces:      net.Interfaces,
 		interfaceByName: net.InterfaceByName,
 		interfaceAddrs: func(iface *net.Interface) ([]net.Addr, error) {
 			return iface.Addrs()
 		},
 		probeReservationIP: probeReservationIPConflict,
+		currentBoot:        runtime.CurrentBootSession,
+		processFingerprint: process.Fingerprint,
+		processMatches:     process.MatchesFingerprint,
+		warmTailscale:      mihomo.InitiateTailscaleWarmup,
+		stopPrepared:       mihomo.StopPreparedLocked,
 		now:                time.Now,
 	}
+}
+
+func (m Manager) ipv6Packet(deps gatewayDeps) ipv6PacketService {
+	if deps.newIPv6Packet != nil {
+		return deps.newIPv6Packet(m.cfg, m.paths)
+	}
+	manager := ipv6packet.NewManager(m.cfg, m.paths)
+	return manager
+}
+
+func (m Manager) ipv6Host(deps gatewayDeps) ipv6HostService {
+	if deps.newIPv6Host != nil {
+		return deps.newIPv6Host(m.cfg)
+	}
+	manager := macosipv6.New(m.cfg)
+	return manager
+}
+
+type ipv6Resolution struct {
+	Requested       string
+	NativeAvailable bool
+	Effective       bool
+	Reason          string
+}
+
+func (m *Manager) resolveIPv6(deps gatewayDeps) ipv6Resolution {
+	resolution := ipv6Resolution{Requested: m.cfg.Transparent.TUNIPv6, Reason: "disabled"}
+	switch m.cfg.Transparent.TUNIPv6 {
+	case config.TUNIPv6Always:
+		resolution.Effective = true
+		resolution.Reason = "forced_userspace_packet_path"
+		available, err := m.ipv6Host(deps).NativeAvailable()
+		if err != nil {
+			// always is an explicit force-on choice: upstream detection remains
+			// observability and must not turn it back off.
+			resolution.Reason += "; native_detection_failed: " + err.Error()
+		} else {
+			resolution.NativeAvailable = available
+		}
+	case config.TUNIPv6Auto:
+		available, err := m.ipv6Host(deps).NativeAvailable()
+		if err != nil {
+			m.cfg.Transparent.TUNIPv6 = config.TUNIPv6Off
+			resolution.Reason = "native_detection_failed: " + err.Error()
+			return resolution
+		}
+		resolution.NativeAvailable = available
+		resolution.Effective = available
+		if available {
+			resolution.Reason = "native_ipv6_available"
+		} else {
+			m.cfg.Transparent.TUNIPv6 = config.TUNIPv6Off
+			resolution.Reason = "native_ipv6_unavailable"
+		}
+	}
+	return resolution
+}
+
+func appliedConfigFromState(cfg config.Config, state runtime.State) config.Config {
+	cfg.DNS.IPv6 = state.DNSIPv6
+	if state.IPv6PacketEffective {
+		cfg.Transparent.TUNIPv6 = state.TUNIPv6Requested
+	} else {
+		cfg.Transparent.TUNIPv6 = config.TUNIPv6Off
+	}
+	return cfg
 }
 
 func (m Manager) gatewayDeps() gatewayDeps {
@@ -115,7 +231,91 @@ func (m Manager) gatewayDeps() gatewayDeps {
 	return m.deps
 }
 
-func (m Manager) Start(_ context.Context) error {
+func (m Manager) localSystemProxy(deps gatewayDeps) localSystemProxyService {
+	if deps.newLocalSystemProxy != nil {
+		return deps.newLocalSystemProxy()
+	}
+	return macosnetwork.SystemProxy{}
+}
+
+func currentBoot(deps gatewayDeps) (runtime.BootSession, error) {
+	if deps.currentBoot != nil {
+		return deps.currentBoot()
+	}
+	return runtime.CurrentBootSession()
+}
+
+func processFingerprint(deps gatewayDeps, pid int) (string, error) {
+	if deps.processFingerprint != nil {
+		return deps.processFingerprint(pid)
+	}
+	return process.Fingerprint(pid)
+}
+
+func processMatches(deps gatewayDeps, pid int, fingerprint string) (bool, error) {
+	if deps.processMatches != nil {
+		return deps.processMatches(pid, fingerprint)
+	}
+	return process.MatchesFingerprint(pid, fingerprint)
+}
+
+func stopTrackedProcess(deps gatewayDeps, name string, pid int, fingerprint string, stop func(int) error) error {
+	if strings.TrimSpace(fingerprint) == "" {
+		return stop(pid)
+	}
+	matches, err := processMatches(deps, pid, fingerprint)
+	if err != nil {
+		return fmt.Errorf("verify %s pid %d before stop: %w", name, pid, err)
+	}
+	if !matches {
+		return nil
+	}
+	return stop(pid)
+}
+
+func trackedProcessRunning(deps gatewayDeps, pid int, fingerprint string, running func(int) bool) bool {
+	if strings.TrimSpace(fingerprint) == "" {
+		return running(pid)
+	}
+	matches, err := processMatches(deps, pid, fingerprint)
+	return err == nil && matches && running(pid)
+}
+
+func (m Manager) Start(ctx context.Context) error {
+	if m.gatewayDeps().geteuid() != 0 {
+		return fmt.Errorf("start requires sudo/root privileges")
+	}
+	return m.withLifecycleLock(func() error { return m.start(ctx) })
+}
+
+// StartLocked starts the gateway while the caller holds the shared runtime
+// lifecycle lock. It exists for transactions that must persist the exact
+// desired policy graph and start that same graph without allowing a CLI or a
+// second Helper request to enter between those two steps.
+func (m Manager) StartLocked(ctx context.Context) error {
+	return m.start(ctx)
+}
+
+// StartCandidateLocked commits an App candidate only after final runtime
+// validation, before host takeover. The caller must hold the lifecycle lock.
+// A later startup failure rolls back the network but keeps the committed desired
+// configuration available for retry.
+func (m Manager) StartCandidateLocked(ctx context.Context, commit func() error) error {
+	if commit == nil {
+		return fmt.Errorf("candidate commit is required")
+	}
+	return m.startWithCommit(ctx, commit)
+}
+
+func (m Manager) start(ctx context.Context) error {
+	return m.startWithCommit(ctx, nil)
+}
+
+func (m Manager) startWithCommit(ctx context.Context, commit func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ReportProgress(ctx, "checking_runtime")
 	deps := m.gatewayDeps()
 	if deps.geteuid() != 0 {
 		return fmt.Errorf("start requires sudo/root privileges")
@@ -131,20 +331,55 @@ func (m Manager) Start(_ context.Context) error {
 	if err := config.Validate(m.cfg); err != nil {
 		return err
 	}
+	// Capture choices while the prepared controller can still report them,
+	// including source-free overlays whose cache directory differs from the
+	// original managed config. The lifecycle lock freezes this handoff.
+	if err := mihomo.PrepareDevicePolicy(&m.cfg); err != nil {
+		return err
+	}
+	// Prepared and gateway engines share cache.db and the managed tsnet
+	// identity. This happens under the cross-process lock, including CLI start.
+	if err := m.stopPreparedEngine(deps); err != nil {
+		return err
+	}
+	ReportProgress(ctx, "validating_network")
+	ipv6Resolution := m.resolveIPv6(deps)
 	if err := deps.ensure(m.paths); err != nil {
 		return err
+	}
+	bootSession, err := currentBoot(deps)
+	if err != nil {
+		return fmt.Errorf("determine current boot session: %w", err)
 	}
 
 	dhcpManager := deps.newDHCP(m.cfg, m.paths)
 	mihomoManager := deps.newMihomo(m.cfg, m.paths)
 	pfManager := deps.newPF(m.cfg, m.paths)
 	sysctlManager := deps.newSysctl()
+	systemProxyManager := m.localSystemProxy(deps)
+	ipv6PacketManager := m.ipv6Packet(deps)
+	ipv6HostManager := m.ipv6Host(deps)
+	if ipv6Resolution.Effective {
+		if err := ipv6HostManager.CheckGatewayAvailable(); err != nil {
+			return err
+		}
+	}
 	if err := m.preflight(dhcpManager, mihomoManager, pfManager, sysctlManager, deps); err != nil {
 		return err
 	}
+	ReportProgress(ctx, "checking_reservations")
 	if err := m.checkReservationConflicts(deps); err != nil {
 		return err
 	}
+	var systemProxySnapshot *runtime.SystemProxySnapshot
+	if m.cfg.LocalSystemProxy.Enabled {
+		snapshot, err := systemProxyManager.Prepare(ctx, m.cfg.Gateway.UpstreamInterface, m.cfg.Mihomo.MixedPort)
+		if err != nil {
+			return fmt.Errorf("prepare local system proxy coordination: %w", err)
+		}
+		systemProxySnapshot = &snapshot
+	}
+	ReportProgress(ctx, "preparing_config")
 	if err := mihomoManager.WriteConfig(); err != nil {
 		return err
 	}
@@ -154,18 +389,26 @@ func (m Manager) Start(_ context.Context) error {
 	if err := pfManager.WriteAnchor(); err != nil {
 		return err
 	}
-	if err := mihomoManager.ValidateWrittenConfig(); err != nil {
+	ReportProgress(ctx, "validating_config")
+	if err := mihomoManager.ValidateWrittenConfigContext(ctx); err != nil {
 		return err
 	}
-	if bundle := m.cfg.DevicePolicy.Bundle; bundle != nil {
-		if err := dhcp.ReconcilePolicyLeases(m.paths.LeaseFile, bundle.Compiled.Reservations); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if commit != nil {
+		ReportProgress(ctx, "saving_config")
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := device.WritePolicyBundleSnapshot(m.paths.DevicePolicyApplied, *bundle); err != nil {
+		if err := commit(); err != nil {
 			return err
 		}
 	}
-
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ReportProgress(ctx, "saving_runtime")
 	ipForwardingBefore, err := sysctlManager.Current()
 	if err != nil {
 		return err
@@ -178,12 +421,28 @@ func (m Manager) Start(_ context.Context) error {
 	if err != nil {
 		return fmt.Errorf("digest imported mihomo profile: %w", err)
 	}
+	if bundle := m.cfg.DevicePolicy.Bundle; bundle != nil {
+		if err := dhcp.ReconcilePolicyLeases(m.paths.LeaseFile, bundle.Compiled.Reservations); err != nil {
+			return err
+		}
+		if err := device.WritePolicyBundleSnapshot(m.paths.DevicePolicyApplied, *bundle); err != nil {
+			return err
+		}
+	}
 
 	state := runtime.State{
-		StartedAt:          deps.now(),
-		IPForwardingBefore: ipForwardingBefore,
-		PFEnabledBefore:    pfEnabledBefore,
-		ProfileDigest:      profileDigest,
+		StartedAt:           deps.now(),
+		BootSessionID:       bootSession.ID,
+		IPForwardingBefore:  ipForwardingBefore,
+		PFEnabledBefore:     pfEnabledBefore,
+		ProfileDigest:       profileDigest,
+		LocalSystemProxy:    systemProxySnapshot,
+		DNSIPv6:             m.cfg.DNS.IPv6,
+		TUNIPv6Requested:    ipv6Resolution.Requested,
+		IPv6PacketEffective: ipv6Resolution.Effective,
+		NativeIPv6Available: ipv6Resolution.NativeAvailable,
+		IPv6Reason:          ipv6Resolution.Reason,
+		IPv6RAEffective:     ipv6Resolution.Effective && m.cfg.DHCP.Enabled,
 	}
 	if bundle := m.cfg.DevicePolicy.Bundle; bundle != nil {
 		state.DevicePolicyDigest = bundle.Digest
@@ -192,42 +451,131 @@ func (m Manager) Start(_ context.Context) error {
 		_ = device.RemovePolicyBundleSnapshot(m.paths.DevicePolicyApplied)
 		return err
 	}
-
-	if err := sysctlManager.Enable(); err != nil {
-		return m.rollback(err, state, dhcpManager, mihomoManager, pfManager, sysctlManager)
+	systemProxyStarted := false
+	checkCanceled := func() error {
+		if err := ctx.Err(); err != nil {
+			return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, systemProxyStarted)
+		}
+		return nil
 	}
 
+	ReportProgress(ctx, "enabling_forwarding")
+	if err := checkCanceled(); err != nil {
+		return err
+	}
+	if err := sysctlManager.Enable(); err != nil {
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+	}
+
+	ReportProgress(ctx, "starting_mihomo")
+	if err := checkCanceled(); err != nil {
+		return err
+	}
 	mihomoPID, err := mihomoManager.Start()
 	if err != nil {
-		return m.rollback(err, state, dhcpManager, mihomoManager, pfManager, sysctlManager)
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 	}
 	state.PIDMihomo = mihomoPID
+	state.MihomoProcessFingerprint, err = processFingerprint(deps, mihomoPID)
+	if err != nil || (mihomoPID > 0 && state.MihomoProcessFingerprint == "") {
+		if err == nil {
+			err = fmt.Errorf("mihomo pid %d disappeared before its identity could be recorded", mihomoPID)
+		}
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+	}
 	if err := deps.saveState(m.paths.StateFile, state); err != nil {
-		return m.rollback(err, state, dhcpManager, mihomoManager, pfManager, sysctlManager)
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+	}
+	if ipv6Resolution.Effective {
+		ReportProgress(ctx, "starting_ipv6")
+		if err := checkCanceled(); err != nil {
+			return err
+		}
+		ipv6PacketPID, startErr := ipv6PacketManager.Start()
+		if startErr != nil {
+			return m.rollback(ctx, startErr, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+		}
+		state.PIDIPv6Packet = ipv6PacketPID
+		state.IPv6PacketFingerprint, err = processFingerprint(deps, ipv6PacketPID)
+		if err != nil || (ipv6PacketPID > 0 && state.IPv6PacketFingerprint == "") {
+			if err == nil {
+				err = fmt.Errorf("IPv6 packet broker pid %d disappeared before its identity could be recorded", ipv6PacketPID)
+			}
+			return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+		}
+		// Persist broker identity before changing the host interface. If the
+		// following alias step fails, a failed rollback remains retryable and
+		// never leaves an untracked root packet process behind.
+		if err := deps.saveState(m.paths.StateFile, state); err != nil {
+			return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+		}
+		// Persist alias ownership intent before mutating the interface. Removal is
+		// idempotent when the add command never took effect, while a successful add
+		// can no longer fall into an untracked gap if DAD or the next state write
+		// fails.
+		state.IPv6GatewayAliasOwned = true
+		if err := deps.saveState(m.paths.StateFile, state); err != nil {
+			return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+		}
+		if err := checkCanceled(); err != nil {
+			return err
+		}
+		if err := ipv6HostManager.AddGateway(ctx); err != nil {
+			return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+		}
 	}
 
+	ReportProgress(ctx, "starting_dns")
+	if err := checkCanceled(); err != nil {
+		return err
+	}
 	pid, err := dhcpManager.Start()
 	if err != nil {
-		return m.rollback(err, state, dhcpManager, mihomoManager, pfManager, sysctlManager)
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 	}
 	state.PIDDNSMasq = pid
+	state.DNSMasqProcessFingerprint, err = processFingerprint(deps, pid)
+	if err != nil || (pid > 0 && state.DNSMasqProcessFingerprint == "") {
+		if err == nil {
+			err = fmt.Errorf("dnsmasq pid %d disappeared before its identity could be recorded", pid)
+		}
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+	}
 	if err := deps.saveState(m.paths.StateFile, state); err != nil {
-		return m.rollback(err, state, dhcpManager, mihomoManager, pfManager, sysctlManager)
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 	}
 
+	ReportProgress(ctx, "applying_firewall")
+	if err := checkCanceled(); err != nil {
+		return err
+	}
 	if err := pfManager.Load(!pfEnabledBefore); err != nil {
-		return m.rollback(err, state, dhcpManager, mihomoManager, pfManager, sysctlManager)
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 	}
 	state.PFAnchorLoaded = true
 	loaded, err := pfManager.Loaded()
 	if err != nil {
-		return m.rollback(err, state, dhcpManager, mihomoManager, pfManager, sysctlManager)
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 	}
 	if !loaded {
-		return m.rollback(fmt.Errorf("pf anchor %s did not become visible after load", m.cfg.PF.AnchorName), state, dhcpManager, mihomoManager, pfManager, sysctlManager)
+		return m.rollback(ctx, fmt.Errorf("pf anchor %s did not become visible after load", m.cfg.PF.AnchorName), state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
 	}
 	if err := deps.saveState(m.paths.StateFile, state); err != nil {
-		return m.rollback(err, state, dhcpManager, mihomoManager, pfManager, sysctlManager)
+		return m.rollback(ctx, err, state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, false)
+	}
+	if state.LocalSystemProxy != nil {
+		ReportProgress(ctx, "enabling_system_proxy")
+		if err := checkCanceled(); err != nil {
+			return err
+		}
+		systemProxyStarted = true
+		if err := systemProxyManager.Enable(ctx, *state.LocalSystemProxy, m.cfg.Mihomo.MixedPort); err != nil {
+			return m.rollback(ctx, fmt.Errorf("enable local system proxy coordination: %w", err), state, dhcpManager, mihomoManager, pfManager, sysctlManager, systemProxyManager, true)
+		}
+	}
+	m.warmManagedTailscale(ctx, deps)
+	if err := checkCanceled(); err != nil {
+		return err
 	}
 
 	fmt.Printf("Gateway runtime prepared in %s\n", m.paths.Dir)
@@ -238,6 +586,9 @@ func (m Manager) Start(_ context.Context) error {
 		fmt.Printf("dnsmasq started with pid %d\n", pid)
 	}
 	fmt.Printf("pf anchor %s loaded\n", m.cfg.PF.AnchorName)
+	if state.LocalSystemProxy != nil {
+		fmt.Printf("macOS HTTP/HTTPS system proxy enabled for network service %s\n", state.LocalSystemProxy.NetworkService)
+	}
 	return nil
 }
 
@@ -246,6 +597,22 @@ func (m Manager) Start(_ context.Context) error {
 // commands. The Manager owns an immutable Config value, so the configuration
 // that passed validation is also the configuration applied after stop.
 func (m Manager) Reload(ctx context.Context) error {
+	if m.gatewayDeps().geteuid() != 0 {
+		return fmt.Errorf("reload requires sudo/root privileges")
+	}
+	return m.withLifecycleLock(func() error { return m.reload(ctx) })
+}
+
+// ReloadLocked reloads the gateway while the caller holds the shared runtime
+// lifecycle lock. It is used by privileged configuration transactions that
+// must keep validation, persistence, reload, and rollback indivisible from a
+// competing CLI lifecycle action.
+func (m Manager) ReloadLocked(ctx context.Context) error {
+	return m.reload(ctx)
+}
+
+func (m Manager) reload(ctx context.Context) error {
+	ReportProgress(ctx, "checking_runtime")
 	deps := m.gatewayDeps()
 	if deps.geteuid() != 0 {
 		return fmt.Errorf("reload requires sudo/root privileges")
@@ -257,16 +624,32 @@ func (m Manager) Reload(ctx context.Context) error {
 	if !exists {
 		return fmt.Errorf("gateway is not running; run start instead")
 	}
-	if !deps.newDHCP(m.cfg, m.paths).Running(state.PIDDNSMasq) || !deps.newMihomo(m.cfg, m.paths).Running(state.PIDMihomo) {
+	bootSession, err := currentBoot(deps)
+	if err != nil {
+		return fmt.Errorf("determine current boot session: %w", err)
+	}
+	if !state.BelongsToBoot(bootSession) {
+		return fmt.Errorf("gateway runtime was interrupted by a system reboot; run stop to clean the interrupted runtime, then start the gateway")
+	}
+	dhcpManager := deps.newDHCP(m.cfg, m.paths)
+	appliedCfg := appliedConfigFromState(m.cfg, state)
+	mihomoManager := deps.newMihomo(appliedCfg, m.paths)
+	if !trackedProcessRunning(deps, state.PIDDNSMasq, state.DNSMasqProcessFingerprint, dhcpManager.Running) || !trackedProcessRunning(deps, state.PIDMihomo, state.MihomoProcessFingerprint, mihomoManager.Running) {
 		return fmt.Errorf("gateway is degraded; reload requires both DHCP/DNS and mihomo to be running")
 	}
-	if err := m.validateReloadCandidate(); err != nil {
+	if state.IPv6PacketEffective {
+		packetManager := Manager{cfg: appliedCfg, paths: m.paths, deps: m.deps}.ipv6Packet(deps)
+		if !trackedProcessRunning(deps, state.PIDIPv6Packet, state.IPv6PacketFingerprint, packetManager.Running) {
+			return fmt.Errorf("gateway is degraded; reload requires the IPv6 packet broker to be running")
+		}
+	}
+	if err := m.validateReloadCandidate(ctx); err != nil {
 		return fmt.Errorf("reload candidate validation failed: %w", err)
 	}
-	if err := m.Stop(ctx); err != nil {
+	if err := m.stop(ctx); err != nil {
 		return fmt.Errorf("reload stop failed: %w", err)
 	}
-	if err := m.Start(ctx); err != nil {
+	if err := m.start(ctx); err != nil {
 		return fmt.Errorf("reload start failed after gateway stop: %w", err)
 	}
 	return nil
@@ -277,7 +660,15 @@ func (m Manager) Reload(ctx context.Context) error {
 // so an upstream link recovery does not turn into a full gateway takeover
 // transition. The existing rendered configuration is validated before the
 // live process is stopped, and the previous log is archived for diagnosis.
-func (m Manager) RestartMihomo(_ context.Context) error {
+func (m Manager) RestartMihomo(ctx context.Context) error {
+	if m.gatewayDeps().geteuid() != 0 {
+		return fmt.Errorf("restart-mihomo requires sudo/root privileges")
+	}
+	return m.withLifecycleLock(func() error { return m.restartMihomo(ctx) })
+}
+
+func (m Manager) restartMihomo(ctx context.Context) error {
+	ReportProgress(ctx, "checking_runtime")
 	deps := m.gatewayDeps()
 	if deps.geteuid() != 0 {
 		return fmt.Errorf("restart-mihomo requires sudo/root privileges")
@@ -289,6 +680,13 @@ func (m Manager) RestartMihomo(_ context.Context) error {
 	if !exists {
 		return fmt.Errorf("gateway is not running; run start instead")
 	}
+	bootSession, err := currentBoot(deps)
+	if err != nil {
+		return fmt.Errorf("determine current boot session: %w", err)
+	}
+	if !state.BelongsToBoot(bootSession) {
+		return fmt.Errorf("gateway runtime was interrupted by a system reboot; run stop to clean the interrupted runtime, then start the gateway")
+	}
 	desiredProfileDigest, err := config.MihomoProfileDigest(m.cfg)
 	if err != nil {
 		return fmt.Errorf("digest current imported mihomo profile: %w", err)
@@ -297,42 +695,83 @@ func (m Manager) RestartMihomo(_ context.Context) error {
 		return fmt.Errorf("desired imported mihomo profile differs from the applied runtime; run reload instead")
 	}
 
-	mihomoManager := deps.newMihomo(m.cfg, m.paths)
+	appliedCfg := appliedConfigFromState(m.cfg, state)
+	mihomoManager := deps.newMihomo(appliedCfg, m.paths)
+	systemProxyManager := m.localSystemProxy(deps)
+	restoreSystemProxy := func() error {
+		if state.LocalSystemProxy == nil {
+			return nil
+		}
+		ReportProgress(ctx, "restoring_system_proxy")
+		return systemProxyManager.Restore(ctx, *state.LocalSystemProxy)
+	}
+	ReportProgress(ctx, "validating_config")
 	if err := mihomoManager.ValidateWrittenConfig(); err != nil {
 		return fmt.Errorf("prepared mihomo config validation failed: %w", err)
 	}
 
 	previousPID := state.PIDMihomo
+	previousFingerprint := state.MihomoProcessFingerprint
 	state.PIDMihomo = 0
+	state.MihomoProcessFingerprint = ""
 	if err := deps.saveState(m.paths.StateFile, state); err != nil {
 		return fmt.Errorf("mark mihomo restart in runtime state: %w", err)
 	}
-	if err := mihomoManager.Stop(previousPID); err != nil {
-		if mihomoManager.Running(previousPID) {
+	ReportProgress(ctx, "stopping_mihomo")
+	if err := stopTrackedProcess(deps, "mihomo", previousPID, previousFingerprint, mihomoManager.Stop); err != nil {
+		if trackedProcessRunning(deps, previousPID, previousFingerprint, mihomoManager.Running) {
 			state.PIDMihomo = previousPID
+			state.MihomoProcessFingerprint = previousFingerprint
+			return errors.Join(fmt.Errorf("stop mihomo pid %d: %w", previousPID, err), deps.saveState(m.paths.StateFile, state))
 		}
-		return errors.Join(fmt.Errorf("stop mihomo pid %d: %w", previousPID, err), deps.saveState(m.paths.StateFile, state))
+		return errors.Join(fmt.Errorf("stop mihomo pid %d: %w", previousPID, err), restoreSystemProxy(), deps.saveState(m.paths.StateFile, state))
 	}
 
 	archivedLog, err := archiveMihomoLog(m.paths.MihomoLog, deps.now())
 	if err != nil {
-		return fmt.Errorf("archive mihomo log before restart: %w", err)
+		return errors.Join(fmt.Errorf("archive mihomo log before restart: %w", err), restoreSystemProxy())
 	}
+	ReportProgress(ctx, "starting_mihomo")
 	newPID, err := mihomoManager.Start()
 	if err != nil {
-		return fmt.Errorf("start replacement mihomo process: %w", err)
+		return errors.Join(fmt.Errorf("start replacement mihomo process: %w", err), restoreSystemProxy())
 	}
 	state.PIDMihomo = newPID
-	if err := deps.saveState(m.paths.StateFile, state); err != nil {
+	state.MihomoProcessFingerprint, err = processFingerprint(deps, newPID)
+	if err != nil || (newPID > 0 && state.MihomoProcessFingerprint == "") {
+		if err == nil {
+			err = fmt.Errorf("replacement mihomo pid %d disappeared before its identity could be recorded", newPID)
+		}
+		restoreErr := restoreSystemProxy()
 		stopErr := mihomoManager.Stop(newPID)
-		return errors.Join(fmt.Errorf("save replacement mihomo pid: %w", err), stopErr)
+		return errors.Join(err, restoreErr, stopErr)
 	}
+	if err := deps.saveState(m.paths.StateFile, state); err != nil {
+		restoreErr := restoreSystemProxy()
+		stopErr := mihomoManager.Stop(newPID)
+		return errors.Join(fmt.Errorf("save replacement mihomo pid: %w", err), restoreErr, stopErr)
+	}
+	m.warmManagedTailscale(ctx, deps)
 
 	fmt.Printf("mihomo restarted with pid %d\n", newPID)
 	if archivedLog != "" {
 		fmt.Printf("previous mihomo log archived at %s\n", archivedLog)
 	}
 	return nil
+}
+
+func (m Manager) warmManagedTailscale(ctx context.Context, deps gatewayDeps) {
+	if !m.cfg.Tailscale.Enabled || deps.warmTailscale == nil {
+		return
+	}
+	ReportProgress(ctx, "initiating_tailscale")
+	if err := deps.warmTailscale(ctx, m.cfg); err != nil {
+		reportNotice(ctx, "tailscale_warmup_unavailable")
+		fmt.Printf("Tailscale outbound warm-up could not be dispatched (best effort): %v\n", err)
+		return
+	}
+	reportNotice(ctx, "tailscale_warmup_started")
+	fmt.Println("Tailscale outbound warm-up dispatched; connection readiness is not a gateway lifecycle requirement and the first request may still need a retry.")
 }
 
 func archiveMihomoLog(path string, now time.Time) (string, error) {
@@ -353,7 +792,8 @@ func archiveMihomoLog(path string, now time.Time) (string, error) {
 // validateReloadCandidate renders every generated artifact into an isolated
 // temporary runtime and runs the real mihomo validator. It deliberately does
 // not write applied policy state or alter host networking.
-func (m Manager) validateReloadCandidate() error {
+func (m Manager) validateReloadCandidate(ctx context.Context) error {
+	ReportProgress(ctx, "validating_network")
 	parent := filepath.Dir(m.paths.Dir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
@@ -365,16 +805,17 @@ func (m Manager) validateReloadCandidate() error {
 	defer os.RemoveAll(temp)
 
 	candidateConfig := m.cfg
-	candidateConfig.Runtime.Dir = temp
-	candidateConfig.Mihomo.Config = filepath.Join(temp, "mihomo.yaml")
 	if err := config.PrepareDevicePolicy(&candidateConfig); err != nil {
 		return err
 	}
+	candidateConfig.Runtime.Dir = temp
+	candidateConfig.Mihomo.Config = filepath.Join(temp, "mihomo.yaml")
 	if err := config.Validate(candidateConfig); err != nil {
 		return err
 	}
 	candidate := Manager{cfg: candidateConfig, paths: runtime.NewPaths(candidateConfig), deps: m.gatewayDeps()}
 	deps := candidate.gatewayDeps()
+	candidate.resolveIPv6(deps)
 	if err := deps.ensure(candidate.paths); err != nil {
 		return err
 	}
@@ -385,9 +826,11 @@ func (m Manager) validateReloadCandidate() error {
 	if err := candidate.preflight(dhcpManager, mihomoManager, pfManager, sysctlManager, deps); err != nil {
 		return err
 	}
+	ReportProgress(ctx, "checking_reservations")
 	if err := candidate.checkReservationConflicts(deps); err != nil {
 		return err
 	}
+	ReportProgress(ctx, "preparing_config")
 	if err := mihomoManager.WriteConfig(); err != nil {
 		return err
 	}
@@ -397,26 +840,58 @@ func (m Manager) validateReloadCandidate() error {
 	if err := pfManager.WriteAnchor(); err != nil {
 		return err
 	}
+	ReportProgress(ctx, "validating_config")
 	return mihomoManager.ValidateWrittenConfig()
 }
 
-func (m Manager) Stop(_ context.Context) error {
+func (m Manager) Stop(ctx context.Context) error {
+	if m.gatewayDeps().geteuid() != 0 {
+		return fmt.Errorf("stop requires sudo/root privileges")
+	}
+	return m.withLifecycleLock(func() error { return m.stop(ctx) })
+}
+
+func (m Manager) stop(ctx context.Context) error {
+	ReportProgress(ctx, "checking_runtime")
 	deps := m.gatewayDeps()
 	if deps.geteuid() != 0 {
 		return fmt.Errorf("stop requires sudo/root privileges")
+	}
+	if err := m.stopPreparedEngine(deps); err != nil {
+		return err
 	}
 	state, exists, err := deps.loadState(m.paths.StateFile)
 	if err != nil {
 		return err
 	}
+	if exists {
+		bootSession, bootErr := currentBoot(deps)
+		if bootErr != nil {
+			return fmt.Errorf("determine current boot session: %w", bootErr)
+		}
+		if !state.BelongsToBoot(bootSession) {
+			return m.cleanupInterruptedRuntime(ctx, deps, state)
+		}
+	}
 	var cleanupErr error
 	pfManager := deps.newPF(m.cfg, m.paths)
 	sysctlManager := deps.newSysctl()
 	if exists {
+		if state.LocalSystemProxy != nil {
+			ReportProgress(ctx, "restoring_system_proxy")
+			if err := m.localSystemProxy(deps).Restore(ctx, *state.LocalSystemProxy); err != nil {
+				return fmt.Errorf("restore local system proxy before stopping gateway services: %w", err)
+			}
+		}
+		ReportProgress(ctx, "stopping_dns")
 		dhcpManager := deps.newDHCP(m.cfg, m.paths)
-		cleanupErr = errors.Join(cleanupErr, dhcpManager.Stop(state.PIDDNSMasq))
-		mihomoManager := deps.newMihomo(m.cfg, m.paths)
-		cleanupErr = errors.Join(cleanupErr, mihomoManager.Stop(state.PIDMihomo))
+		cleanupErr = errors.Join(cleanupErr, stopTrackedProcess(deps, "dnsmasq", state.PIDDNSMasq, state.DNSMasqProcessFingerprint, dhcpManager.Stop))
+		ReportProgress(ctx, "stopping_ipv6")
+		cleanupErr = errors.Join(cleanupErr, m.cleanupIPv6(ctx, deps, state))
+		ReportProgress(ctx, "stopping_mihomo")
+		mihomoManager := deps.newMihomo(appliedConfigFromState(m.cfg, state), m.paths)
+		cleanupErr = errors.Join(cleanupErr, stopTrackedProcess(deps, "mihomo", state.PIDMihomo, state.MihomoProcessFingerprint, mihomoManager.Stop))
+		ReportProgress(ctx, "restoring_network")
 		if state.PFAnchorLoaded {
 			cleanupErr = errors.Join(cleanupErr, pfManager.Unload(!state.PFEnabledBefore))
 		}
@@ -425,6 +900,7 @@ func (m Manager) Stop(_ context.Context) error {
 	if cleanupErr != nil {
 		return cleanupErr
 	}
+	ReportProgress(ctx, "clearing_runtime")
 	cleanupErr = errors.Join(cleanupErr, deps.removeState(m.paths.StateFile))
 	cleanupErr = errors.Join(cleanupErr, device.RemovePolicyBundleSnapshot(m.paths.DevicePolicyApplied))
 	if cleanupErr != nil {
@@ -432,6 +908,60 @@ func (m Manager) Stop(_ context.Context) error {
 	}
 
 	fmt.Println("Gateway stopped and runtime state cleared.")
+	return nil
+}
+
+func (m Manager) stopPreparedEngine(deps gatewayDeps) error {
+	stop := deps.stopPrepared
+	if stop == nil {
+		stop = mihomo.StopPreparedLocked
+	}
+	if err := stop(m.cfg); err != nil {
+		return fmt.Errorf("release prepared engine before gateway transition: %w", err)
+	}
+	return nil
+}
+
+func (m Manager) cleanupIPv6(ctx context.Context, deps gatewayDeps, state runtime.State) error {
+	if !state.IPv6PacketEffective && state.PIDIPv6Packet == 0 && !state.IPv6GatewayAliasOwned {
+		return nil
+	}
+	applied := m
+	applied.cfg = appliedConfigFromState(m.cfg, state)
+	var cleanupErr error
+	if state.IPv6GatewayAliasOwned {
+		host := applied.ipv6Host(deps)
+		// IPv6RAEffective was added after the first isolated-LAN implementation.
+		// Fall back to the applied DHCP-owning topology so an older runtime state
+		// still receives a withdrawal during an upgrade stop.
+		if state.IPv6RAEffective || (state.IPv6PacketEffective && applied.cfg.DHCP.Enabled) {
+			cleanupErr = errors.Join(cleanupErr, host.Withdraw(ctx))
+		}
+		cleanupErr = errors.Join(cleanupErr, host.RemoveGateway(ctx))
+	}
+	if state.PIDIPv6Packet != 0 {
+		packet := applied.ipv6Packet(deps)
+		cleanupErr = errors.Join(cleanupErr, stopTrackedProcess(deps, "IPv6 packet broker", state.PIDIPv6Packet, state.IPv6PacketFingerprint, packet.Stop))
+	}
+	return cleanupErr
+}
+
+func (m Manager) cleanupInterruptedRuntime(ctx context.Context, deps gatewayDeps, state runtime.State) error {
+	if state.LocalSystemProxy != nil {
+		ReportProgress(ctx, "restoring_system_proxy")
+		if err := m.localSystemProxy(deps).Restore(ctx, *state.LocalSystemProxy); err != nil {
+			return fmt.Errorf("restore local system proxy snapshot after reboot: %w", err)
+		}
+	}
+	ReportProgress(ctx, "clearing_runtime")
+	cleanupErr := errors.Join(
+		deps.removeState(m.paths.StateFile),
+		device.RemovePolicyBundleSnapshot(m.paths.DevicePolicyApplied),
+	)
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	fmt.Println("Interrupted gateway runtime from a previous system boot was cleared without signaling stale PIDs or changing current PF/forwarding state.")
 	return nil
 }
 
@@ -447,6 +977,11 @@ func (m Manager) preflight(dhcpManager dhcpService, mihomoManager mihomoService,
 	}
 	if err := sysctlManager.Check(); err != nil {
 		return err
+	}
+	if m.cfg.Transparent.TUNIPv6 != config.TUNIPv6Off {
+		if err := m.ipv6Packet(deps).Check(); err != nil {
+			return fmt.Errorf("IPv6 packet broker: %w", err)
+		}
 	}
 	sameInterface := strings.TrimSpace(m.cfg.Gateway.Interface) == strings.TrimSpace(m.cfg.Gateway.UpstreamInterface)
 	if m.cfg.Gateway.SameLAN() {
@@ -528,19 +1063,36 @@ func addrHasIPv4(addr net.Addr, target net.IP) bool {
 	}
 }
 
-func (m Manager) rollback(cause error, state runtime.State, dhcpManager dhcpService, mihomoManager mihomoService, pfManager pfService, sysctlManager sysctlService) error {
+func (m Manager) rollback(ctx context.Context, cause error, state runtime.State, dhcpManager dhcpService, mihomoManager mihomoService, pfManager pfService, sysctlManager sysctlService, systemProxyManager localSystemProxyService, restoreSystemProxy bool) error {
+	if ctx.Err() != nil {
+		// Cancellation stops new takeover stages, but must not cancel restoration
+		// of host state that this action already changed.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		ctx = cleanupCtx
+	}
+	ReportProgress(ctx, "rolling_back")
 	deps := m.gatewayDeps()
 	var cleanupErr error
-	cleanupErr = errors.Join(cleanupErr, dhcpManager.Stop(state.PIDDNSMasq))
-	cleanupErr = errors.Join(cleanupErr, mihomoManager.Stop(state.PIDMihomo))
+	if restoreSystemProxy && state.LocalSystemProxy != nil {
+		if err := systemProxyManager.Restore(ctx, *state.LocalSystemProxy); err != nil {
+			return fmt.Errorf("%w; rollback could not restore the local system proxy, so gateway services were left running for recovery: %v", cause, err)
+		}
+	}
+	cleanupErr = errors.Join(cleanupErr, stopTrackedProcess(deps, "dnsmasq", state.PIDDNSMasq, state.DNSMasqProcessFingerprint, dhcpManager.Stop))
+	cleanupErr = errors.Join(cleanupErr, m.cleanupIPv6(ctx, deps, state))
+	cleanupErr = errors.Join(cleanupErr, stopTrackedProcess(deps, "mihomo", state.PIDMihomo, state.MihomoProcessFingerprint, mihomoManager.Stop))
 	if state.PFAnchorLoaded {
 		cleanupErr = errors.Join(cleanupErr, pfManager.Unload(!state.PFEnabledBefore))
 	}
 	cleanupErr = errors.Join(cleanupErr, sysctlManager.Restore(state.IPForwardingBefore))
+	if cleanupErr != nil {
+		return fmt.Errorf("%w; rollback failed and runtime state was retained for recovery: %v", cause, cleanupErr)
+	}
 	cleanupErr = errors.Join(cleanupErr, deps.removeState(m.paths.StateFile))
 	cleanupErr = errors.Join(cleanupErr, device.RemovePolicyBundleSnapshot(m.paths.DevicePolicyApplied))
 	if cleanupErr != nil {
-		return fmt.Errorf("%w; rollback failed: %v", cause, cleanupErr)
+		return fmt.Errorf("%w; rollback cleanup failed: %v", cause, cleanupErr)
 	}
 	return cause
 }

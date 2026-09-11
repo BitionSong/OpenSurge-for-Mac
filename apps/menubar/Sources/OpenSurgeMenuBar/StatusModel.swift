@@ -10,25 +10,44 @@ final class StatusModel: ObservableObject {
     @Published private(set) var serviceNeedsReconnect = false
     @Published private(set) var isChangingServices = false
     @Published private(set) var isUninstalling = false
+    @Published private(set) var isCheckingForUpdate = false
+    @Published private(set) var isChangingSleepPrevention = false
+    @Published private(set) var availableUpdate: AvailableUpdate?
+    @Published private(set) var updateCheckMessage: String?
+    @Published private(set) var requestedLanguage: RequestedAppLanguage = .system
     @Published var openAtLogin = false
 
     private let client: ControlAPIClient
     private let urlLauncher: WebGUIURLLauncher
+    private let updateChecker: UpdateChecker
+    let currentVersion: String
     private var timer: Timer?
     private var rapidPolling = false
     private var failureCount = 0
     private var isQuitting = false
+    private var lastAutomaticUpdateCheck: Date?
+    private var sleepPreventionGeneration = 0
 
     init(
         client: ControlAPIClient = ControlAPIClient(),
-        urlLauncher: WebGUIURLLauncher = WebGUIURLLauncher()
+        urlLauncher: WebGUIURLLauncher = WebGUIURLLauncher(),
+        updateChecker: UpdateChecker = UpdateChecker(),
+        currentVersion: String = installedReleaseVersion(
+            releaseTag: Bundle.main.object(forInfoDictionaryKey: "OpenSurgeReleaseTag") as? String,
+            shortVersion: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleShortVersionString"
+            ) as? String
+        )
     ) {
         self.client = client
         self.urlLauncher = urlLauncher
+        self.updateChecker = updateChecker
+        self.currentVersion = currentVersion
         self.openAtLogin = SMAppService.mainApp.status == .enabled
     }
 
     var indicator: IndicatorState { menuBarIndicator(status: status, hasError: error != nil) }
+    var resolvedLanguage: ResolvedAppLanguage { AppLanguageResolver.resolve(requestedLanguage) }
     var canQuitOpenSurge: Bool { status?.canQuitOpenSurge == true && !isChangingServices }
     var canUninstall: Bool { status?.canUninstall == true && !isChangingServices }
 
@@ -37,6 +56,7 @@ final class StatusModel: ObservableObject {
         timer?.invalidate()
         rapidPolling = rapid
         Task { await refresh() }
+        checkForUpdatesAutomaticallyIfNeeded()
     }
 
     func stopRapidPolling() {
@@ -46,11 +66,12 @@ final class StatusModel: ObservableObject {
 
     func refresh() async {
         guard !isQuitting, !isRefreshing else { return }
+        let sleepGeneration = sleepPreventionGeneration
         timer?.invalidate()
         isRefreshing = true
         defer { isRefreshing = false; scheduleNextRefresh() }
         do {
-            status = try await client.status()
+            storeStatus(try await client.status(), sleepGeneration: sleepGeneration)
             error = nil
             serviceNeedsReconnect = false
             failureCount = 0
@@ -61,7 +82,7 @@ final class StatusModel: ObservableObject {
             try? await Task.sleep(for: .milliseconds(350))
             guard !isQuitting else { return }
             do {
-                status = try await client.status()
+                storeStatus(try await client.status(), sleepGeneration: sleepGeneration)
                 error = nil
                 serviceNeedsReconnect = false
                 failureCount = 0
@@ -85,6 +106,26 @@ final class StatusModel: ObservableObject {
         await refresh()
     }
 
+    func setSleepPrevention(_ enabled: Bool) async {
+        guard !isQuitting, !isChangingSleepPrevention else { return }
+        sleepPreventionGeneration += 1
+        isChangingSleepPrevention = true
+        error = nil
+        defer { isChangingSleepPrevention = false }
+        do {
+            let sleepPrevention = try await client.setSleepPrevention(enabled)
+            sleepPreventionGeneration += 1
+            if var currentStatus = status {
+                currentStatus.sleepPrevention = sleepPrevention
+                status = currentStatus
+            }
+            await refresh()
+        } catch {
+            sleepPreventionGeneration += 1
+            self.error = error.localizedDescription
+        }
+    }
+
     func quitMenuBarApp() -> Never {
         isQuitting = true
         timer?.invalidate()
@@ -93,7 +134,7 @@ final class StatusModel: ObservableObject {
 
     func quitOpenSurge() {
         guard canQuitOpenSurge else {
-            error = openSurgeQuitWarning(for: status)
+            error = L10n.text(openSurgeQuitWarning(for: status))
             return
         }
         timer?.invalidate()
@@ -115,7 +156,7 @@ final class StatusModel: ObservableObject {
 
     func uninstall(_ mode: UninstallMode) {
         guard canUninstall else {
-            error = uninstallWarning(for: status)
+            error = L10n.text(uninstallWarning(for: status))
             return
         }
         timer?.invalidate()
@@ -166,6 +207,20 @@ final class StatusModel: ObservableObject {
         failureCount += 1
     }
 
+    private func storeStatus(_ nextStatus: MenuBarStatus, sleepGeneration: Int) {
+        if let language = nextStatus.uiPreferences?.language,
+           language != requestedLanguage {
+            requestedLanguage = language
+            L10n.activate(language)
+        }
+        status = menuBarStatusAfterRefresh(
+            nextStatus,
+            currentStatus: status,
+            requestSleepGeneration: sleepGeneration,
+            currentSleepGeneration: sleepPreventionGeneration
+        )
+    }
+
     private func scheduleNextRefresh() {
         guard !isQuitting else { return }
         let base = rapidPolling ? 2.0 : 15.0
@@ -191,4 +246,54 @@ final class StatusModel: ObservableObject {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
+
+    func checkForUpdates(manual: Bool = true) async {
+        guard !isQuitting, !isCheckingForUpdate else { return }
+        isCheckingForUpdate = true
+        if manual { updateCheckMessage = nil }
+        defer { isCheckingForUpdate = false }
+
+        do {
+            availableUpdate = try await updateChecker.check(currentVersion: currentVersion)
+            updateCheckMessage = availableUpdate == nil ? L10n.text("当前已是最新稳定版") : nil
+        } catch {
+            updateCheckMessage = manual
+                ? L10n.format("检查更新失败：%@", error.localizedDescription)
+                : L10n.text("自动检查更新失败，可手动重试")
+        }
+    }
+
+    func openUpdateDownloadPage() {
+        guard let availableUpdate else { return }
+        do {
+            try urlLauncher.open(availableUpdate.releasePage)
+        } catch {
+            updateCheckMessage = L10n.text("无法打开下载页，请前往 OpenSurge GitHub Releases")
+        }
+    }
+
+    private func checkForUpdatesAutomaticallyIfNeeded() {
+        let now = Date()
+        if let lastAutomaticUpdateCheck,
+           now.timeIntervalSince(lastAutomaticUpdateCheck) < 24 * 60 * 60 {
+            return
+        }
+        lastAutomaticUpdateCheck = now
+        Task { await checkForUpdates(manual: false) }
+    }
+}
+
+func menuBarStatusAfterRefresh(
+    _ nextStatus: MenuBarStatus,
+    currentStatus: MenuBarStatus?,
+    requestSleepGeneration: Int,
+    currentSleepGeneration: Int
+) -> MenuBarStatus {
+    guard requestSleepGeneration != currentSleepGeneration,
+          let currentSleepPrevention = currentStatus?.sleepPrevention else {
+        return nextStatus
+    }
+    var mergedStatus = nextStatus
+    mergedStatus.sleepPrevention = currentSleepPrevention
+    return mergedStatus
 }

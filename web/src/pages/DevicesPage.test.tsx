@@ -2,7 +2,7 @@
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { DevicePolicyDocument, DevicesResponse, Overview, PolicySet } from '../types'
+import type { DevicePolicyDocument, DevicesResponse, LocalRouting, LocalRoutingMode, Overview, PolicySet } from '../types'
 
 vi.mock('../api', () => {
   class RequestError extends Error {
@@ -12,13 +12,16 @@ vi.mock('../api', () => {
     RequestError,
     waitForOperation: vi.fn(async () => ({ id: 'reload-1', kind: 'reload', state: 'succeeded' })),
     api: {
-      devices: vi.fn(), config: vi.fn(), sources: vi.fn(), devicePolicy: vi.fn(), saveDevicePolicy: vi.fn(),
+      devices: vi.fn(), config: vi.fn(), sources: vi.fn(), tailscale: vi.fn(), tailscaleDiscovery: vi.fn(), profileOverlay: vi.fn(), devicePolicy: vi.fn(), saveDevicePolicy: vi.fn(),
       selectPolicy: vi.fn(), selectDevicePolicy: vi.fn(), gateway: vi.fn(),
+      localRouting: vi.fn(), setLocalRouting: vi.fn(),
+      refreshLocalConnections: vi.fn(), refreshDeviceConnections: vi.fn(),
       proxyHealth: vi.fn(), testProxyHealth: vi.fn(),
     },
   }
 })
 
+import { activateLanguage, prepareLanguage } from '../i18n'
 import { api, RequestError, waitForOperation } from '../api'
 import { DevicesPage } from './DevicesPage'
 
@@ -35,6 +38,19 @@ const overview = {
   leases: [],
 } as unknown as Overview
 
+function localRouting(mode: LocalRoutingMode = 'rule', selected = 'Proxy-A'): LocalRouting {
+  return {
+    schema_version: 1,
+    mode,
+    available_modes: ['rule', 'direct', 'global'],
+    global_group: { name: 'open-surge/mac-global', type: 'Selector', selected, options: ['Proxy-A', 'Proxy-B'] },
+    udp_behavior: mode === 'global' ? 'proxy' : mode === 'direct' ? 'direct' : 'rules',
+    transports: ['tun', 'loopback_explicit_proxy'],
+    new_connections_only: true,
+    consistent: true,
+  }
+}
+
 function documentFor(policy: PolicySet, revision = 'policy-r1'): DevicePolicyDocument {
   return { schema_version: 1, revision, policy }
 }
@@ -47,18 +63,29 @@ function renderPage(customOverview = overview) {
   const onChanged = vi.fn(async () => {})
   const onNavigate = vi.fn()
   const onDirtyChange = vi.fn()
-  render(<DevicesPage overview={customOverview} onChanged={onChanged} onNavigate={onNavigate} onDirtyChange={onDirtyChange} />)
-  return { onChanged, onNavigate, onDirtyChange }
+  const onNotify = vi.fn()
+  render(<DevicesPage overview={customOverview} onChanged={onChanged} onNavigate={onNavigate} onDirtyChange={onDirtyChange} onNotify={onNotify} />)
+  return { onChanged, onNavigate, onDirtyChange, onNotify }
 }
 
 describe('DevicesPage', () => {
   beforeEach(() => {
-    vi.mocked(api.config).mockResolvedValue({ device_policy: { enabled: true } } as never)
+    vi.mocked(api.config).mockResolvedValue({
+      gateway: { mode: 'same_wifi_dhcp' },
+      dhcp: { bypass_gateway: '192.168.1.1', bypass_dns: ['192.168.1.1'] },
+      device_policy: { enabled: true },
+    } as never)
     vi.mocked(api.sources).mockResolvedValue({ revision: 'sources-r1', sources: [] })
+    vi.mocked(api.tailscale).mockResolvedValue({ selectable_exit: false } as never)
+    vi.mocked(api.profileOverlay).mockResolvedValue({ applied: false } as never)
     vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(basePolicy))
     vi.mocked(api.devices).mockResolvedValue(devicesResponse())
     vi.mocked(api.selectPolicy).mockResolvedValue({} as never)
     vi.mocked(api.selectDevicePolicy).mockResolvedValue({} as never)
+    vi.mocked(api.localRouting).mockResolvedValue(localRouting())
+    vi.mocked(api.setLocalRouting).mockImplementation(async (mode, policy) => localRouting(mode, policy ?? 'Proxy-A'))
+    vi.mocked(api.refreshLocalConnections).mockResolvedValue({ schema_version: 1, scope: 'gateway_local', matched_connections: 2, closed_connections: 2 })
+    vi.mocked(api.refreshDeviceConnections).mockImplementation(async device => ({ schema_version: 1, scope: 'device', device_id: device, matched_connections: 1, closed_connections: 1 }))
     vi.mocked(api.gateway).mockResolvedValue({ id: 'reload-1', kind: 'reload', state: 'running' })
     vi.mocked(api.proxyHealth).mockResolvedValue({ schema_version: 1, test_url: 'https://www.gstatic.com/generate_204', proxies: [
       { name: 'DIRECT', type: 'Direct', selected: '', provider: '', udp: true, status: 'not_applicable', probeable: false },
@@ -68,9 +95,72 @@ describe('DevicesPage', () => {
     vi.mocked(api.saveDevicePolicy).mockImplementation(async (policy, revision) => documentFor(policy, `${revision}-next`))
   })
 
-  afterEach(() => { cleanup(); vi.clearAllMocks() })
+  afterEach(() => { cleanup(); vi.clearAllMocks(); activateLanguage('zh-Hans') })
 
-  it('keeps device cards in their own column and only floats save controls while dirty', async () => {
+  it('shows applied egress fallback and skipped ruleset and template routes without marking settings as unsaved', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', name: 'Alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['Gone'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true, drift: false,
+      applied_devices: [{ ...policy.devices[0], egress_mode: 'inherit_global', configured_egress_mode: 'dedicated', groups: {}, policy_adjustments: [
+        { slot: 'default', effect: 'inherit_global', missing_targets: ['Gone'] },
+        { slot: 'ruleset-route', effect: 'skip_rule', missing_targets: ['Missing-Ruleset-Exit'] },
+        { slot: 'template-route', effect: 'skip_rule', missing_targets: ['Missing-Template-Exit'] },
+        { slot: 'valid-route', effect: 'filter_candidates', missing_targets: ['Unused-Exit'] },
+      ] }],
+    }))
+    renderPage()
+    expect(await screen.findByText('设备默认出口 Gone 不存在，当前跟随网关规则。')).toBeTruthy()
+    expect(screen.getByText('设备分流 ruleset-route 的出口 Missing-Ruleset-Exit 不存在，当前已跳过这条分流。')).toBeTruthy()
+    expect(screen.getByText('设备分流 template-route 的出口 Missing-Template-Exit 不存在，当前已跳过这条分流。')).toBeTruthy()
+    expect(screen.getByText('valid-route 已忽略失效候选 Unused-Exit，保留当前有效出口。')).toBeTruthy()
+    expect(screen.getByText('原始设置已保留；出口恢复后，下次启动或重载会重新应用。')).toBeTruthy()
+    const card = screen.getByRole('button', { name: /alice-policy\s*Alice/ }).closest('article')!
+    expect(within(card).getAllByText('已应用').length).toBeGreaterThan(0)
+    expect(within(card).queryByText('待重载')).toBeNull()
+    expect(within(card).queryByText(/草稿将改为/)).toBeNull()
+    expect(api.saveDevicePolicy).not.toHaveBeenCalled()
+  })
+
+  it('refreshes only Mac-local connections from the Mac card', async () => {
+    const { onChanged } = renderPage()
+
+    const button = await screen.findByRole('button', { name: '刷新 Mac 本机连接' })
+    await userEvent.click(button)
+
+    expect(api.refreshLocalConnections).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText('已关闭 2 个连接，等待客户端建立新连接。')).toBeTruthy()
+    await waitFor(() => expect(onChanged).toHaveBeenCalled())
+  })
+
+  it('refreshes an applied device by its runtime device ID', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', name: 'Alice iPhone', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true,
+      devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', gateway_target: 'opensurge', egress_mode: 'inherit_global', groups: {} }],
+      applied_devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', gateway_target: 'opensurge', egress_mode: 'inherit_global', groups: {} }],
+      leases: [{ hostname: 'Alice-iPhone', mac: 'aa:bb:cc:dd:ee:01', ip: '192.168.1.121', online: true, expires_at: '2099-01-01T00:00:00Z' }],
+    }))
+    const { onChanged } = renderPage()
+
+    const button = await screen.findByRole('button', { name: '刷新 Alice iPhone 连接' })
+    await userEvent.click(button)
+
+    expect(api.refreshDeviceConnections).toHaveBeenCalledWith('alice')
+    expect(await screen.findByText('已关闭 1 个连接，等待客户端建立新连接。')).toBeTruthy()
+    await waitFor(() => expect(onChanged).toHaveBeenCalled())
+  })
+
+  it('keeps device cards in their own column and floats save controls while dirty', async () => {
     const policy: PolicySet = {
       ...basePolicy,
       devices: [
@@ -86,9 +176,8 @@ describe('DevicesPage', () => {
     renderPage()
 
     await screen.findByText('alice')
-    const layout = document.querySelector('.device-layout') as HTMLElement
-    const stack = layout.querySelector('.device-stack') as HTMLElement
-    expect(layout.children[0].classList.contains('this-mac')).toBe(true)
+    const stack = document.querySelector('.device-stack') as HTMLElement
+    expect(screen.getByRole('heading', { name: '当前 Mac 的设备设置' })).toBeTruthy()
     expect(stack.querySelectorAll('.device-card')).toHaveLength(2)
 
     const saveBar = document.querySelector('.sticky-save') as HTMLElement
@@ -96,19 +185,66 @@ describe('DevicesPage', () => {
     expect(saveBar.classList.contains('has-changes')).toBe(false)
     const firstCard = stack.querySelector('.device-card') as HTMLElement
     const secondCard = stack.querySelectorAll('.device-card')[1] as HTMLElement
-    expect(within(firstCard).getByRole('button', { name: '正在编辑此设备规则' })).toBeTruthy()
-    expect(within(secondCard).getByRole('button', { name: '编辑此设备规则' })).toBeTruthy()
+    expect(within(firstCard).getByRole('button', { name: '正在编辑设备分流' })).toBeTruthy()
+    expect(within(secondCard).getByRole('button', { name: '编辑设备分流' })).toBeTruthy()
+    await userEvent.click(within(secondCard).getByRole('button', { name: '编辑设备分流' }))
+    expect(screen.getByRole('tab', { name: /设备分流/ }).getAttribute('aria-selected')).toBe('true')
+    expect((screen.getByLabelText('设备分流设备') as HTMLSelectElement).value).toBe('bob')
     await userEvent.click(within(firstCard).getByRole('radio', { name: /独立设备出口/ }))
     expect(saveBar.classList.contains('has-changes')).toBe(true)
   })
 
-  it('shows only global groups on THIS MAC and switches them immediately', async () => {
+  it('replaces the dirty save bar with a floating reload bar after saving', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT', 'Proxy-A'], rules: [] }],
+    }
+    let saved = false
+    let savedDocument = documentFor(policy)
+    vi.mocked(api.devicePolicy).mockImplementation(async () => savedDocument)
+    vi.mocked(api.devices).mockImplementation(async () => devicesResponse(saved
+      ? { drift: true, applied: true, desired_digest: 'desired123', applied_digest: 'applied123' }
+      : { applied: true, desired_digest: 'applied123', applied_digest: 'applied123' }))
+    vi.mocked(api.saveDevicePolicy).mockImplementation(async next => {
+      saved = true
+      savedDocument = documentFor(next, 'policy-r2')
+      return savedDocument
+    })
     renderPage()
-    const selector = await screen.findByLabelText('Main 当前出口 DIRECT')
-    expect(screen.queryByLabelText('device/alice/default 当前出口 DIRECT')).toBeNull()
-    await userEvent.click(selector)
-    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: /Proxy-A/ }))
-    await waitFor(() => expect(api.selectPolicy).toHaveBeenCalledWith('Main', 'Proxy-A'))
+
+    await userEvent.click(await screen.findByRole('radio', { name: /独立设备出口/ }))
+    expect((document.querySelector('.sticky-save') as HTMLElement).classList.contains('has-changes')).toBe(true)
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+
+    const reloadBar = (await screen.findByText('设备配置已保存，但尚未应用')).closest('.sticky-save') as HTMLElement
+    expect(reloadBar.classList.contains('needs-reload')).toBe(true)
+    expect(reloadBar.classList.contains('has-changes')).toBe(false)
+    expect(screen.queryByText(/请使用上方按钮应用并重载/)).toBeNull()
+    expect(within(reloadBar).getByRole('button', { name: '应用并重载网关' })).toBeTruthy()
+  })
+
+  it('shows the local global outlet only for fixed routing and keeps the policy-page shortcut', async () => {
+    const { onNavigate } = renderPage()
+    await screen.findByRole('heading', { name: '出口方式' })
+    expect(screen.getByText('根据网站和网关规则自动分流')).toBeTruthy()
+    expect(screen.queryByLabelText(/本机全局策略组/)).toBeNull()
+
+    await userEvent.click(screen.getByRole('button', { name: '固定出口' }))
+    await waitFor(() => expect(api.setLocalRouting).toHaveBeenCalledWith('global', undefined))
+    expect(await screen.findByText('本机公网流量统一使用当前全局策略')).toBeTruthy()
+    await userEvent.click(screen.getByLabelText('本机全局策略组 当前策略 Proxy-A'))
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: /Proxy-B/ }))
+    await waitFor(() => expect(api.setLocalRouting).toHaveBeenCalledWith('global', 'Proxy-B'))
+    expect(await screen.findByLabelText('本机全局策略组 当前策略 Proxy-B')).toBeTruthy()
+
+    await userEvent.click(screen.getByRole('button', { name: '本机直连' }))
+    await waitFor(() => expect(api.setLocalRouting).toHaveBeenCalledWith('direct', undefined))
+    expect(await screen.findByText('本机公网流量不使用代理')).toBeTruthy()
+    expect(screen.queryByLabelText(/本机全局策略组/)).toBeNull()
+
+    await userEvent.click(screen.getByRole('button', { name: '前往策略与节点健康 →' }))
+    expect(onNavigate).toHaveBeenCalledWith('policies')
   })
 
   it('merges desired and applied devices into four states and separates identity readiness', async () => {
@@ -194,14 +330,33 @@ describe('DevicesPage', () => {
       applied_devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'inherit_global', groups: {} }],
     }))
     renderPage()
-    expect(await screen.findByText('默认出口跟随本机 / 全局规则')).toBeTruthy()
+    await userEvent.click(await screen.findByRole('tab', { name: /设备分流/ }))
+    expect(await screen.findByText('设备出口跟随网关规则')).toBeTruthy()
     expect(screen.queryByLabelText('alice 独立出口 当前摘要')).toBeNull()
     await userEvent.click(screen.getByRole('radio', { name: /独立设备出口/ }))
     expect(screen.getByText(/草稿将改为“独立设备出口”/)).toBeTruthy()
-    expect(screen.getByLabelText('独立出口候选')).toBeTruthy()
+    expect(screen.getByLabelText('独立设备出口候选')).toBeTruthy()
     await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
     await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
     expect(vi.mocked(api.saveDevicePolicy).mock.calls[0][0].devices[0].egress_mode).toBe('dedicated')
+  })
+
+  it('offers a configured Tailscale Exit Node as a friendly device outlet candidate', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.tailscale).mockResolvedValue({ selectable_exit: true, settings: { display_name: 'Home Tailnet' } } as never)
+    renderPage()
+
+    await userEvent.click(await screen.findByRole('tab', { name: /设备分流/ }))
+    const input = screen.getByLabelText('独立设备出口候选')
+    await userEvent.type(input, 'open-surge/tailscale-exit')
+    await userEvent.click(screen.getByRole('button', { name: '添加' }))
+
+    expect(screen.getByText('Home Tailnet · Exit Node')).toBeTruthy()
   })
 
   it('keeps legacy routing readable and requires an explicit migration choice', async () => {
@@ -218,9 +373,9 @@ describe('DevicesPage', () => {
     renderPage()
     expect(await screen.findByText('需要选择新的路由方式')).toBeTruthy()
     expect(screen.getByLabelText('alice 兼容兜底出口 当前摘要')).toBeTruthy()
-    expect((screen.getByRole('radio', { name: /跟随本机/ }) as HTMLInputElement).checked).toBe(false)
+    expect((screen.getByRole('radio', { name: /跟随网关/ }) as HTMLInputElement).checked).toBe(false)
     expect((screen.getByRole('radio', { name: /独立设备出口/ }) as HTMLInputElement).checked).toBe(false)
-    await userEvent.click(screen.getByRole('radio', { name: /跟随本机/ }))
+    await userEvent.click(screen.getByRole('radio', { name: /跟随网关/ }))
     await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
     await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
     expect(vi.mocked(api.saveDevicePolicy).mock.calls[0][0].devices[0].egress_mode).toBe('inherit_global')
@@ -228,7 +383,7 @@ describe('DevicesPage', () => {
 
   it('defaults newly registered devices to following global rules and reveals candidates only for dedicated routing', async () => {
     renderPage()
-    const follow = await screen.findByRole('radio', { name: /跟随本机/ })
+    const follow = await screen.findByRole('radio', { name: /跟随网关/ })
     const registration = follow.closest('.registration') as HTMLElement
     expect(registration.classList.contains('device-tools-section')).toBe(true)
     expect(within(registration).getByRole('heading', { name: '设备身份与路由' })).toBeTruthy()
@@ -244,6 +399,92 @@ describe('DevicesPage', () => {
     await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
     await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
     expect(vi.mocked(api.saveDevicePolicy).mock.calls[0][0].devices[0]).toEqual(expect.objectContaining({ id: 'pixel-living-room', name: 'Pixel Living Room', egress_mode: 'dedicated' }))
+  })
+
+  it('removes a device with its private profile and keeps the other devices intact', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [
+        { id: 'alice', name: 'Alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'inherit_global' },
+        { id: 'bob', mac: 'aa:bb:cc:dd:ee:02', ipv4: '192.168.1.122', profile: 'bob-policy', egress_mode: 'inherit_global' },
+      ],
+      profiles: [
+        { id: 'alice-policy', default_policies: ['DIRECT'], rules: [{ id: 'rule-1', match: { domains: ['alice.example'] }, action: 'DIRECT' }] },
+        { id: 'bob-policy', default_policies: ['DIRECT'], rules: [] },
+      ],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    renderPage()
+
+    const card = (await screen.findByText('Alice')).closest('.device-card') as HTMLElement
+    await userEvent.click(within(card).getByRole('button', { name: '删除设备' }))
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('删除设备“Alice”吗？'))
+    expect(screen.queryByText('Alice')).toBeNull()
+    expect(screen.getByText(/Alice 已从本地草稿移除/)).toBeTruthy()
+    expect(document.querySelectorAll('.device-card')).toHaveLength(1)
+
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
+    expect(saved.devices.map(device => device.id)).toEqual(['bob'])
+    expect(saved.profiles.map(profile => profile.id)).toEqual(['bob-policy'])
+  })
+
+  it('marks registrations from another LAN instead of hiding them', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [
+        { id: 'alice', name: 'Alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'shared', egress_mode: 'inherit_global' },
+        { id: 'bob', name: 'Bob', mac: 'aa:bb:cc:dd:ee:02', ipv4: '192.168.50.122', profile: 'shared', egress_mode: 'inherit_global' },
+      ],
+      profiles: [{ id: 'shared', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({ out_of_lan_devices: ['bob'], lan_prefix: '192.168.1.0/24' }))
+    renderPage()
+
+    const card = (await screen.findByText('Bob')).closest('.device-card') as HTMLElement
+    expect((card.querySelector('.pill') as HTMLElement).textContent).toBe('不在当前网段')
+    expect(within(card).getByText(/192\.168\.50\.122 不属于当前网关网段 192\.168\.1\.0\/24/)).toBeTruthy()
+    expect(within(card).getByRole('button', { name: '编辑身份与路由' })).toBeTruthy()
+    expect(within(card).getByRole('button', { name: '删除设备' })).toBeTruthy()
+
+    const healthy = (screen.getByText('Alice')).closest('.device-card') as HTMLElement
+    expect(healthy.querySelector('.device-out-of-lan')).toBeNull()
+  })
+
+  it('reopens the registration form to re-register an existing device identity and routing', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'pixel', name: 'Pixel', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.137', profile: 'pixel-policy', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'pixel-policy', default_policies: ['DIRECT'], rules: [{ id: 'rule-1', match: { domains: ['video.example'] }, action: 'DIRECT' }] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    renderPage()
+
+    const card = (await screen.findByText('Pixel')).closest('.device-card') as HTMLElement
+    expect(screen.queryByLabelText('设备名称')).toBeNull()
+    await userEvent.click(within(card).getByRole('button', { name: '编辑身份与路由' }))
+
+    expect(screen.getByRole('button', { name: /编辑设备身份与路由/ }).getAttribute('aria-expanded')).toBe('true')
+    const panel = document.querySelector('.registration') as HTMLElement
+    expect((within(panel).getByLabelText('设备名称') as HTMLInputElement).value).toBe('Pixel')
+    expect((within(panel).getByLabelText('设备 MAC') as HTMLInputElement).value).toBe('aa:bb:cc:dd:ee:37')
+    expect((within(panel).getByLabelText('固定 IPv4') as HTMLInputElement).value).toBe('192.168.1.137')
+    expect((panel.querySelector('.registration-id-hint') as HTMLElement).textContent).toContain('pixel')
+    expect((panel.querySelector('.registration-id-hint') as HTMLElement).textContent).toContain('保持不变')
+
+    await userEvent.clear(within(panel).getByLabelText('固定 IPv4'))
+    await userEvent.type(within(panel).getByLabelText('固定 IPv4'), '192.168.1.150')
+    await userEvent.click(within(panel).getByRole('radio', { name: /独立设备出口/ }))
+    await userEvent.click(within(panel).getByRole('button', { name: '更新设备身份与路由' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
+    expect(saved.devices).toEqual([{ id: 'pixel', name: 'Pixel', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.150', profile: 'pixel-policy', egress_mode: 'dedicated' }])
+    expect(saved.profiles).toEqual(policy.profiles)
   })
 
   it('lists a same-LAN source currently passing through Mac and prefills its observed identity', async () => {
@@ -267,6 +508,81 @@ describe('DevicesPage', () => {
     expect((screen.getByLabelText('固定 IPv4') as HTMLInputElement).value).toBe('192.168.1.137')
   })
 
+  it('registers multiple same-LAN devices by fixed IPv4 without inventing a MAC', async () => {
+    renderPage({ ...overview, topology: 'same_lan' } as unknown as Overview)
+
+    await screen.findByText('当前经过 Mac 的设备')
+    expect(screen.getByText('MAC 地址（可选身份信息）')).toBeTruthy()
+    await userEvent.type(screen.getByLabelText('设备名称'), 'IP Only One')
+    await userEvent.type(screen.getByLabelText('固定 IPv4'), '192.168.1.137')
+    expect(screen.getByText(/只按固定 IPv4 匹配/)).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: '按固定 IPv4 登记' }))
+
+    await userEvent.click(screen.getByRole('button', { name: /登记新设备/ }))
+    await userEvent.type(screen.getByLabelText('设备名称'), 'IP Only Two')
+    await userEvent.type(screen.getByLabelText('固定 IPv4'), '192.168.1.138')
+    await userEvent.click(screen.getByRole('button', { name: '按固定 IPv4 登记' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    expect(vi.mocked(api.saveDevicePolicy).mock.calls[0][0].devices).toEqual([
+      expect.objectContaining({ id: 'ip-only-one', mac: '', ipv4: '192.168.1.137' }),
+      expect.objectContaining({ id: 'ip-only-two', mac: '', ipv4: '192.168.1.138' }),
+    ])
+  })
+
+  it('shows an IP-only device as active by fixed IPv4 in same-LAN mode', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'speaker', name: 'Speaker', mac: '', ipv4: '192.168.1.137', profile: 'speaker-policy', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'speaker-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true,
+      applied_devices: [{ id: 'speaker', mac: '', ipv4: '192.168.1.137', profile: 'speaker-policy', egress_mode: 'inherit_global', groups: {} }],
+      observed_devices: [{ ip: '192.168.1.137', mac: 'aa:bb:cc:dd:ee:37', active_connections: 1, neighbor_observed: true }],
+    }))
+    renderPage({ ...overview, topology: 'same_lan' } as unknown as Overview)
+
+    expect(await screen.findByText(/固定 IPv4 已生效/)).toBeTruthy()
+    expect(screen.getByText('MAC')).toBeTruthy()
+    expect(screen.getByText('未登记 · 当前按固定 IPv4 匹配')).toBeTruthy()
+    expect(screen.queryByText(/身份冲突/)).toBeNull()
+  })
+
+  it('keeps an IP-only device visible but paused in DHCP mode', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'speaker', name: 'Speaker', mac: '', ipv4: '192.168.1.137', profile: 'speaker-policy', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'speaker-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    renderPage({ ...overview, topology: 'same_wifi_dhcp' } as unknown as Overview)
+
+    expect(await screen.findByText('设备 ID')).toBeTruthy()
+    expect(screen.getByText('speaker')).toBeTruthy()
+    expect(screen.getByText('IPv4')).toBeTruthy()
+    expect(screen.getByText('192.168.1.137')).toBeTruthy()
+    expect(screen.getByText('MAC')).toBeTruthy()
+    expect(screen.getByText('等待 MAC')).toBeTruthy()
+    expect(screen.getByText('未登记 · 策略已暂停，补充后恢复')).toBeTruthy()
+    expect(screen.queryByText('部分设备策略已暂停')).toBeNull()
+    expect(screen.queryByText('DHCP 模式下策略已暂停')).toBeNull()
+    expect(screen.queryByText('重载后应用')).toBeNull()
+
+    await userEvent.click(screen.getByRole('button', { name: /登记新设备/ }))
+    await userEvent.type(screen.getByLabelText('设备名称'), 'Speaker')
+    await userEvent.type(screen.getByLabelText('设备 MAC'), 'aa:bb:cc:dd:ee:37')
+    await userEvent.type(screen.getByLabelText('固定 IPv4'), '192.168.1.137')
+    await userEvent.click(screen.getByRole('button', { name: '登记或更新设备' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    expect(vi.mocked(api.saveDevicePolicy).mock.calls[0][0].devices).toEqual([
+      expect.objectContaining({ id: 'speaker', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.137', profile: 'speaker-policy' }),
+    ])
+  })
+
   it('shows observation evidence instead of requiring a DHCP lease in same-LAN mode', async () => {
     const policy: PolicySet = {
       ...basePolicy,
@@ -282,107 +598,287 @@ describe('DevicesPage', () => {
     renderPage({ ...overview, topology: 'same_lan' } as unknown as Overview)
 
     expect(await screen.findByText('流量与邻居已观察：MAC / IPv4 匹配')).toBeTruthy()
+    const card = screen.getByText('Pixel').closest('.device-card') as HTMLElement
+    expect(within(card).getByText('设备 ID')).toBeTruthy()
+    expect(within(card).getByText('pixel')).toBeTruthy()
+    expect(within(card).getByText('192.168.1.137')).toBeTruthy()
+    expect(within(card).getByText('aa:bb:cc:dd:ee:37')).toBeTruthy()
     expect(screen.queryByText(/需要在线且未过期的精确/)).toBeNull()
   })
 
-  it('privatizes a shared template profile before adding a validated flat rule', async () => {
+  it('rebinds a known same-LAN device to its observed IPv4 and blocks misleading outlet switches until reload', async () => {
     const policy: PolicySet = {
-      devices: [
-        { id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'shared', egress_mode: 'dedicated' },
-        { id: 'bob', mac: 'aa:bb:cc:dd:ee:02', ipv4: '192.168.1.122', profile: 'shared', egress_mode: 'dedicated' },
+      ...basePolicy,
+      devices: [{ id: 'pixel', name: 'Pixel', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.101', profile: 'pixel-policy', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'pixel-policy', default_policies: ['DIRECT', 'Proxy-A'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true,
+      applied_devices: [{ id: 'pixel', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.101', profile: 'pixel-policy', egress_mode: 'dedicated', groups: { default: 'device/pixel/default' } }],
+      observed_devices: [{ ip: '192.168.1.137', mac: 'aa:bb:cc:dd:ee:37', active_connections: 2, neighbor_observed: true }],
+    }))
+    const sameLANOverview = {
+      ...overview,
+      topology: 'same_lan',
+      policies: [...overview.policies, { name: 'device/pixel/default', type: 'Selector', selected: 'DIRECT', options: ['DIRECT', 'Proxy-A'] }],
+    } as unknown as Overview
+    renderPage(sameLANOverview)
+
+    expect(await screen.findByText('设备已识别，但 IP 已变化')).toBeTruthy()
+    expect(screen.getByText(/原地址 192\.168\.1\.101/).textContent).toContain('当前地址 192.168.1.137')
+    const outlet = screen.getByLabelText('pixel 独立出口 当前摘要') as HTMLButtonElement
+    expect(outlet.disabled).toBe(true)
+    expect(outlet.textContent).toContain('先更新 IP 绑定')
+    const card = outlet.closest('.device-card') as HTMLElement
+    expect((within(card).getByRole('group', { name: /设备路由方式/ }) as HTMLFieldSetElement).disabled).toBe(true)
+    expect(api.selectDevicePolicy).not.toHaveBeenCalled()
+
+    await userEvent.click(screen.getByRole('button', { name: '使用当前 IP 并应用' }))
+    const dialog = screen.getByRole('dialog', { name: '更新 Pixel 的设备 IP？' })
+    expect(dialog.textContent).toContain('192.168.1.101')
+    expect(dialog.textContent).toContain('192.168.1.137')
+    expect(dialog.textContent).toContain('设备 ID、Profile、规则和出口选择都会保留')
+    await userEvent.click(within(dialog).getByRole('button', { name: '更新并重载网关' }))
+
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
+    expect(saved.devices[0]).toEqual({
+      id: 'pixel', name: 'Pixel', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.137', profile: 'pixel-policy', egress_mode: 'dedicated',
+    })
+    expect(saved.profiles).toEqual(policy.profiles)
+    expect(api.gateway).toHaveBeenCalledWith('reload')
+    expect(waitForOperation).toHaveBeenCalledWith('reload-1')
+  })
+
+  it('saves an observed IPv4 without trying to reload a stopped gateway', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'pixel', name: 'Pixel', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.101', profile: 'pixel-policy', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'pixel-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true,
+      applied_devices: [{ id: 'pixel', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.101', profile: 'pixel-policy', egress_mode: 'inherit_global', groups: {} }],
+      observed_devices: [{ ip: '192.168.1.137', mac: 'aa:bb:cc:dd:ee:37', active_connections: 1, neighbor_observed: true }],
+    }))
+    renderPage({ ...overview, topology: 'same_lan', status: { ...overview.status, gateway: 'stopped' } } as unknown as Overview)
+
+    await userEvent.click(await screen.findByRole('button', { name: '使用当前 IP 并应用' }))
+    const dialog = screen.getByRole('dialog', { name: '更新 Pixel 的设备 IP？' })
+    expect(dialog.textContent).toContain('配置会在下次启动时应用')
+    await userEvent.click(within(dialog).getByRole('button', { name: '更新设备 IP' }))
+
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    expect(api.gateway).not.toHaveBeenCalled()
+    expect(waitForOperation).not.toHaveBeenCalled()
+  })
+
+  it('does not guess a new IPv4 when the same MAC has multiple active observations', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'pixel', name: 'Pixel', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.101', profile: 'pixel-policy', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'pixel-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true,
+      applied_devices: [{ id: 'pixel', mac: 'aa:bb:cc:dd:ee:37', ipv4: '192.168.1.101', profile: 'pixel-policy', egress_mode: 'inherit_global', groups: {} }],
+      observed_devices: [
+        { ip: '192.168.1.137', mac: 'aa:bb:cc:dd:ee:37', active_connections: 1, neighbor_observed: true },
+        { ip: '192.168.1.138', mac: 'aa:bb:cc:dd:ee:37', active_connections: 1, neighbor_observed: true },
       ],
-      profiles: [{ id: 'shared', template: 'base', default_policies: [], rules: [{ id: 'existing', match: { ports: ['443'] }, action: 'DIRECT' }] }],
-      templates: [{ id: 'base', default_policies: ['DIRECT'], rules: [{ id: 'template-rule', match: { protocols: ['udp'] }, action: 'REJECT' }] }],
+    }))
+    renderPage({ ...overview, topology: 'same_lan' } as unknown as Overview)
+
+    expect(await screen.findByText('静态配置身份：等待该 IPv4 经过 Mac')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '使用当前 IP 并应用' })).toBeNull()
+    const activation = screen.getByText('设备按登记 IP 接入后生效')
+    expect(activation.closest('.device-meta-item')).toBeTruthy()
+    expect(activation.closest('.device-metadata')).toBeTruthy()
+    expect(document.querySelector('.outlet-activation-note')).toBeNull()
+  })
+
+  it('allows an offline same-LAN device outlet to be preset with an explicit activation boundary', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT', 'Proxy-A'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true,
+      applied_devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'dedicated', groups: { default: 'device/alice/default' } }],
+    }))
+    renderPage({ ...overview, topology: 'same_lan' } as unknown as Overview)
+
+    expect(await screen.findByText('静态配置身份：等待该 IPv4 经过 Mac')).toBeTruthy()
+    expect(screen.getByText('设备按登记 IP 接入后生效')).toBeTruthy()
+    const outlet = screen.getByLabelText('alice 独立出口 当前摘要') as HTMLButtonElement
+    expect(outlet.disabled).toBe(false)
+    expect(outlet.textContent).toContain('独立出口 · 预设')
+    await userEvent.click(outlet)
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: /Proxy-A/ }))
+    await waitFor(() => expect(api.selectDevicePolicy).toHaveBeenCalledWith('alice', 'default', 'Proxy-A'))
+  })
+
+  it('installs the inactive Claude Code example only when it is assigned to a device', async () => {
+    const policy: PolicySet = {
+      devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT'], rules: [] }],
+      templates: [],
       rule_sets: [],
     }
     vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
     renderPage()
-    await screen.findByRole('heading', { name: 'alice 的规则' })
-    const searchableOutlet = screen.getByLabelText('独立出口候选')
-    expect(searchableOutlet.getAttribute('type')).toBe('search')
-    await userEvent.type(searchableOutlet, 'REJECT{Enter}')
-    expect(screen.getByRole('button', { name: '移除 REJECT' })).toBeTruthy()
-    await userEvent.click(screen.getByRole('button', { name: '＋ 添加设备规则' }))
-    await userEvent.click(screen.getByRole('button', { name: '保存到草稿' }))
-    expect(screen.getByRole('alert').textContent).toContain('至少添加一个匹配条件')
-    await userEvent.type(screen.getByLabelText('域名后缀'), 'youtube.example')
-    await userEvent.click(within(screen.getByLabelText('域名后缀').parentElement!).getByRole('button', { name: '添加' }))
-    await userEvent.click(screen.getByRole('button', { name: '保存到草稿' }))
+    expect(await screen.findByText('Claude Code 核心域名')).toBeTruthy()
+    expect(screen.getByText('Claude Code 扩展服务')).toBeTruthy()
+    expect(screen.getByText('Claude Code IP / ASN 兜底')).toBeTruthy()
+    expect(screen.getByText('NTP 通用规则')).toBeTruthy()
+    expect((document.querySelector('.sticky-save') as HTMLElement).classList.contains('is-saved')).toBe(true)
+    await userEvent.click(await screen.findByRole('tab', { name: /分流模版/ }))
+    expect(screen.getByText('内置示例 · 未启用')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Claude Code' })).toBeTruthy()
+    expect(screen.getByRole('link', { name: /Net\.Coffee/ }).getAttribute('href')).toBe('https://ip.net.coffee/claude/site.html')
+    expect(policy.templates).toHaveLength(0)
+    expect(policy.rule_sets).toHaveLength(0)
+
+    await userEvent.click(screen.getByRole('button', { name: '用于设备' }))
+    expect(screen.getByRole('tab', { name: /设备分流/ }).getAttribute('aria-selected')).toBe('true')
+    expect((screen.getByLabelText('设备分流匹配对象') as HTMLSelectElement).value).toBe('claude-code')
+    await userEvent.click(screen.getByRole('button', { name: '添加到草稿' }))
     await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
     await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
     const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
-    expect(saved.devices.find(device => device.id === 'alice')?.profile).toBe('alice-policy')
-    expect(saved.devices.find(device => device.id === 'bob')?.profile).toBe('shared')
-    expect(saved.profiles.find(profile => profile.id === 'shared')?.template).toBe('base')
-    expect(saved.profiles.find(profile => profile.id === 'alice-policy')).toEqual(expect.objectContaining({
-      template: undefined,
-      default_policies: ['DIRECT', 'REJECT'],
-      rules: expect.arrayContaining([expect.objectContaining({ id: 'template-rule' }), expect.objectContaining({ id: 'existing' }), expect.objectContaining({ match: { domains: ['youtube.example'] }, action: 'REJECT' })]),
-    }))
+    expect(saved.templates.find(template => template.id === 'claude-code')?.rule_sets).toHaveLength(4)
+    expect(saved.rule_sets.map(ruleSet => ruleSet.id)).toEqual(expect.arrayContaining(['claude-code-domains', 'claude-code-extra', 'claude-code-network', 'ntp-common']))
+    expect(saved.profiles.find(profile => profile.id === 'alice-policy')?.rules).toContainEqual(expect.objectContaining({ match: { template: 'claude-code' }, action: 'DIRECT' }))
   })
 
-  it('supports rule reorder, deletion, and mutually exclusive selector output', async () => {
+  it('creates a rule set and uses it in an ordered device route selector', async () => {
     const policy: PolicySet = {
       ...basePolicy,
       devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'inherit_global' }],
-      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT'], rules: [
-        { id: 'first', match: { domains: ['first.example'] }, action: 'DIRECT' },
-        { id: 'second', match: { domains: ['second.example'] }, action: 'REJECT' },
-      ] }],
+      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT'], rules: [] }],
     }
     vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     renderPage()
-    await screen.findByText('域名 first.example')
-    await userEvent.click(screen.getByRole('button', { name: '上移规则 second' }))
-    expect(document.querySelectorAll('.flat-rule')[0].textContent).toContain('second.example')
-    await userEvent.click(within(document.querySelectorAll('.flat-rule')[1] as HTMLElement).getByRole('button', { name: '删除' }))
-    expect(screen.queryByText('域名 first.example')).toBeNull()
-    await userEvent.click(screen.getByRole('button', { name: '＋ 添加设备规则' }))
-    await userEvent.type(screen.getByLabelText('域名后缀'), 'selector.example{Enter}')
-    await userEvent.click(screen.getByLabelText('可即时切换的 Selector'))
-    await userEvent.type(screen.getByLabelText('Selector 候选'), 'Main{Enter}')
+    await userEvent.click(await screen.findByRole('button', { name: '＋ 新建规则集' }))
+    await userEvent.type(screen.getByLabelText('规则集名称'), 'work-domains')
+    await userEvent.type(screen.getByLabelText('规则集内容'), 'example.com\nexample.net')
     await userEvent.click(screen.getByRole('button', { name: '保存到草稿' }))
+    await userEvent.click(screen.getByRole('tab', { name: /设备分流/ }))
+    await userEvent.click(screen.getByRole('button', { name: '＋ 添加设备分流' }))
+    await userEvent.click(screen.getByRole('radio', { name: '单个规则集' }))
+    await userEvent.selectOptions(screen.getByLabelText('设备分流匹配对象'), 'work-domains')
+    await userEvent.click(screen.getByRole('radio', { name: '独立即时切换' }))
+    await userEvent.type(screen.getByLabelText('设备分流出口候选'), 'Main{Enter}')
+    await userEvent.click(screen.getByRole('button', { name: '添加到草稿' }))
     await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
     await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
     const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
-    const added = saved.profiles.find(profile => profile.id === 'alice-policy')?.rules?.find(rule => rule.match.domains?.includes('selector.example'))
+    expect(saved.rule_sets.find(ruleSet => ruleSet.id === 'work-domains')?.payload).toEqual(['example.com', 'example.net'])
+    const added = saved.profiles.find(profile => profile.id === 'alice-policy')?.rules?.find(rule => rule.match.rule_sets?.includes('work-domains'))
     expect(added?.policies).toEqual(['DIRECT', 'Main'])
     expect(added?.action).toBeUndefined()
   })
 
-  it('keeps advanced reuse tools collapsed and disables referenced-object deletion', async () => {
+  it('keeps the rule library expanded and makes the Claude Code rules inspectable', async () => {
     const policy: PolicySet = {
+      ...basePolicy,
       devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'home', egress_mode: 'inherit_global' }],
-      profiles: [{ id: 'home', template: 'base', default_policies: [], rules: [{ id: 'managed', match: { rule_sets: ['streaming'] }, action: 'DIRECT' }] }],
-      templates: [{ id: 'base', default_policies: ['DIRECT'], rules: [] }],
-      rule_sets: [{ id: 'streaming', type: 'inline', behavior: 'domain', payload: ['youtube.example'] }],
+      profiles: [{ id: 'home', default_policies: ['DIRECT'], rules: [] }],
     }
     vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
     renderPage()
-    const toggle = await screen.findByRole('button', { name: /高级 \/ 复用机制/ })
-    expect(toggle.getAttribute('aria-expanded')).toBe('false')
-    await userEvent.click(toggle)
-    expect(toggle.getAttribute('aria-expanded')).toBe('true')
-    const advanced = toggle.closest('.advanced-policy') as HTMLElement
-    expect(advanced.classList.contains('device-tools-section')).toBe(true)
-    expect(within(advanced).getByText(/设备实际关联的策略入口/)).toBeTruthy()
-    expect(within(advanced).getByText(/可由多个 Profile 继承的基础策略/)).toBeTruthy()
-    expect(within(advanced).getByText(/可复用的域名、IP CIDR 或经典匹配列表/)).toBeTruthy()
-    const ruleSetPrimaryRow = advanced.querySelector('.ruleset-primary-row') as HTMLElement
-    expect(within(ruleSetPrimaryRow).getByLabelText('Rule set ID')).toBeTruthy()
-    expect(within(ruleSetPrimaryRow).getByLabelText('Rule set type')).toBeTruthy()
-    expect(within(ruleSetPrimaryRow).getByLabelText('Rule set behavior')).toBeTruthy()
-    expect(within(ruleSetPrimaryRow).getByRole('button', { name: '添加 Rule Set' })).toBeTruthy()
-    for (const label of ['home', 'template: base', 'rule-set: streaming']) {
-      const row = within(advanced).getByText(label).closest('.editor-item') as HTMLElement
-      expect((within(row).getByRole('button', { name: '移除' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(await screen.findByRole('tablist', { name: '规则库' })).toBeTruthy()
+    expect(screen.getByRole('tab', { name: /规则集/ }).getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByText('Claude Code 核心域名')).toBeTruthy()
+    expect(screen.queryByText('高级 / 复用机制')).toBeNull()
+    await userEvent.click(screen.getByRole('tab', { name: /分流模版/ }))
+    await userEvent.click(screen.getByRole('button', { name: '查看规则' }))
+    expect(screen.getByText(/DOMAIN-SUFFIX,anthropic\.com/)).toBeTruthy()
+    expect(screen.getByText(/IP-ASN,399358,no-resolve/)).toBeTruthy()
+    expect(screen.getByText(/DST-PORT,123/)).toBeTruthy()
+  })
+
+  it('lets the operator inspect catalog rule sets without writing desired state', async () => {
+    renderPage()
+    const item = (await screen.findByText('Claude Code 核心域名')).closest('.library-item') as HTMLElement
+    expect(within(item).getByText(/内置示例 · 未启用/)).toBeTruthy()
+    expect(within(item).queryByRole('button', { name: '移除' })).toBeNull()
+    await userEvent.click(within(item).getByRole('button', { name: '查看规则' }))
+    expect(within(item).getByText(/DOMAIN-SUFFIX,anthropic\.com/)).toBeTruthy()
+    expect((document.querySelector('.sticky-save') as HTMLElement).classList.contains('is-saved')).toBe(true)
+    expect(api.saveDevicePolicy).not.toHaveBeenCalled()
+  })
+
+  it('writes a catalog rule set only after the operator saves an edit to the draft', async () => {
+    renderPage()
+    const item = (await screen.findByText('Claude Code 核心域名')).closest('.library-item') as HTMLElement
+    await userEvent.click(within(item).getByRole('button', { name: '编辑' }))
+    expect((document.querySelector('.sticky-save') as HTMLElement).classList.contains('is-saved')).toBe(true)
+    await userEvent.click(within(item).getByRole('button', { name: '保存到草稿' }))
+    expect((document.querySelector('.sticky-save') as HTMLElement).classList.contains('has-changes')).toBe(true)
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
+    expect(saved.rule_sets.map(ruleSet => ruleSet.id)).toEqual(['claude-code-domains'])
+    expect(saved.templates).toEqual([])
+  })
+
+  it('installs a catalog rule set when a device route selects it', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'alice', mac: 'aa:bb:cc:dd:ee:01', ipv4: '192.168.1.121', profile: 'alice-policy', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'alice-policy', default_policies: ['DIRECT'], rules: [] }],
     }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: /设备分流/ }))
+    await userEvent.click(screen.getByRole('button', { name: '＋ 添加设备分流' }))
+    await userEvent.click(screen.getByRole('radio', { name: '单个规则集' }))
+    await userEvent.selectOptions(screen.getByLabelText('设备分流匹配对象'), 'claude-code-domains')
+    await userEvent.click(screen.getByRole('button', { name: '添加到草稿' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
+    expect(saved.rule_sets.map(ruleSet => ruleSet.id)).toEqual(['claude-code-domains'])
+    expect(saved.templates).toEqual([])
+    expect(saved.profiles.find(profile => profile.id === 'alice-policy')?.rules).toContainEqual(expect.objectContaining({ match: { rule_sets: ['claude-code-domains'] }, action: 'DIRECT' }))
+  })
+
+  it('persists selected catalog rule sets when saving a custom template', async () => {
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: /分流模版/ }))
+    await userEvent.click(screen.getByRole('button', { name: '＋ 新建分流模版' }))
+    await userEvent.type(screen.getByLabelText('分流模版名称'), 'core-only')
+    await userEvent.click(screen.getByRole('checkbox', { name: /Claude Code 核心域名/ }))
+    await userEvent.click(screen.getByRole('button', { name: '保存到草稿' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
+    await waitFor(() => expect(api.saveDevicePolicy).toHaveBeenCalled())
+    const saved = vi.mocked(api.saveDevicePolicy).mock.calls[0][0]
+    expect(saved.templates.find(template => template.id === 'core-only')?.rule_sets).toEqual(['claude-code-domains'])
+    expect(saved.rule_sets.map(ruleSet => ruleSet.id)).toEqual(['claude-code-domains'])
+  })
+
+  it('renders the catalog rule library in English without leftover CJK', async () => {
+    await prepareLanguage('en')
+    activateLanguage('en')
+    renderPage()
+    expect(await screen.findByText('Claude Code core domains')).toBeTruthy()
+    expect(screen.getByText('Claude Code extended services')).toBeTruthy()
+    const library = document.querySelector('.rule-library') as HTMLElement
+    const item = within(library).getByText('Claude Code core domains').closest('.library-item') as HTMLElement
+    await userEvent.click(within(item).getByRole('button', { name: 'View rules' }))
+    expect(within(item).getByText(/DOMAIN-SUFFIX,anthropic\.com/)).toBeTruthy()
+    expect(library.textContent).not.toMatch(/[\u3400-\u9fff]/)
   })
 
   it('uses a custom interruption warning before reload and waits for the operation', async () => {
     vi.mocked(api.devices).mockResolvedValue(devicesResponse({ drift: true, applied: true, desired_digest: 'desired123', applied_digest: 'applied123' }))
-    renderPage()
+    const { onNotify } = renderPage()
     await userEvent.click(await screen.findByRole('button', { name: '应用并重载网关' }))
     const dialog = screen.getByRole('dialog', { name: '应用设备配置并重载网关？' })
     expect(dialog.textContent).toContain('DHCP/DNS、mihomo、PF 与 IPv4 forwarding')
@@ -391,16 +887,73 @@ describe('DevicesPage', () => {
     await waitFor(() => expect(api.gateway).toHaveBeenCalledWith('reload'))
     expect(waitForOperation).toHaveBeenCalledWith('reload-1')
     expect(await screen.findByText(/网关已使用最新设备配置重新启动/)).toBeTruthy()
+    expect(onNotify).toHaveBeenCalledWith(expect.objectContaining({ tone: 'success', title: '应用并重载网关成功' }))
+  })
+
+  it('offers router bypass only in DHCP takeover and names the device in renewal guidance', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'playstation-5', name: 'PlayStation 5', mac: 'aa:bb:cc:dd:ee:05', ipv4: '192.168.1.190', profile: 'console-policy', gateway_target: 'upstream_router', egress_mode: 'dedicated' }],
+      profiles: [{ id: 'console-policy', default_policies: ['DIRECT', 'Proxy-A'], rules: [{ id: 'video', match: { domains: ['video.example'] }, action: 'DIRECT' }] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      drift: true,
+      applied: true,
+      desired_digest: 'desired123',
+      applied_digest: 'applied123',
+      applied_devices: [{ id: 'playstation-5', mac: 'aa:bb:cc:dd:ee:05', ipv4: '192.168.1.190', profile: 'console-policy', gateway_target: 'opensurge', egress_mode: 'dedicated', groups: { default: 'device/playstation-5/default' } }],
+    }))
+    renderPage({ ...overview, topology: 'same_wifi_dhcp' } as unknown as Overview)
+
+    const routerBypass = await screen.findByRole('radio', { name: /直连主路由/ })
+    expect((routerBypass as HTMLInputElement).checked).toBe(true)
+    expect(screen.getByText(/启用下游 IPv6 时，该设备的 IPv6 出站会被阻止；设备仍可能保留 SLAAC 地址或 RDNSS/)).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: /编辑设备分流/ }))
+    expect(screen.getByText(/直连主路由期间，设备分流和出口设置会保留但不生效/)).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: '应用并重载网关' }))
+    expect(within(screen.getByRole('dialog')).getByText('应用后，请重新连接 PlayStation 5 的网络，使新的主路由网关和 DNS 生效。')).toBeTruthy()
+  })
+
+  it('shows the applied IPv6 block without claiming the device has no IPv6 address', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'console', mac: 'aa:bb:cc:dd:ee:05', ipv4: '192.168.1.190', profile: 'console-policy', gateway_target: 'upstream_router', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'console-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    vi.mocked(api.devices).mockResolvedValue(devicesResponse({
+      applied: true,
+      devices: [{ id: 'console', mac: 'aa:bb:cc:dd:ee:05', ipv4: '192.168.1.190', profile: 'console-policy', gateway_target: 'upstream_router', egress_mode: 'inherit_global', ipv6_blocked: true, groups: {} }],
+      applied_devices: [{ id: 'console', mac: 'aa:bb:cc:dd:ee:05', ipv4: '192.168.1.190', profile: 'console-policy', gateway_target: 'upstream_router', egress_mode: 'inherit_global', ipv6_blocked: true, groups: {} }],
+    }))
+    renderPage({ ...overview, topology: 'same_wifi_dhcp' } as unknown as Overview)
+
+    expect(await screen.findByText('IPv4 直连主路由 · IPv6 出站已阻止')).toBeTruthy()
+    expect(screen.queryByText(/没有 IPv6 地址/)).toBeNull()
+  })
+
+  it('does not expose router bypass outside DHCP takeover', async () => {
+    const policy: PolicySet = {
+      ...basePolicy,
+      devices: [{ id: 'console', mac: 'aa:bb:cc:dd:ee:05', ipv4: '192.168.1.190', profile: 'console-policy', egress_mode: 'inherit_global' }],
+      profiles: [{ id: 'console-policy', default_policies: ['DIRECT'], rules: [] }],
+    }
+    vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
+    renderPage({ ...overview, topology: 'same_lan' } as unknown as Overview)
+    await screen.findByText('console')
+    expect(screen.queryByRole('radio', { name: /直连主路由/ })).toBeNull()
   })
 
   it('keeps drift retryable and shows a readable error when reload fails', async () => {
     vi.mocked(api.devices).mockResolvedValue(devicesResponse({ drift: true, applied: true, desired_digest: 'desired123', applied_digest: 'applied123' }))
     vi.mocked(waitForOperation).mockRejectedValueOnce(new Error('候选配置校验失败；现有网关仍在运行'))
-    renderPage()
+    const { onNotify } = renderPage()
     await userEvent.click(await screen.findByRole('button', { name: '应用并重载网关' }))
     await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认应用并重载' }))
     expect((await screen.findByRole('alert')).textContent).toContain('候选配置校验失败；现有网关仍在运行')
     expect((screen.getByRole('button', { name: '应用并重载网关' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(onNotify).toHaveBeenCalledWith({ tone: 'error', title: '应用并重载网关失败', message: '候选配置校验失败；现有网关仍在运行' })
   })
 
   it('keeps the local form on revision conflict and offers an explicit reload choice', async () => {
@@ -408,13 +961,13 @@ describe('DevicesPage', () => {
     vi.mocked(api.devicePolicy).mockResolvedValue(documentFor(policy))
     vi.mocked(api.saveDevicePolicy).mockRejectedValue(new RequestError(409, 'revision_conflict', 'conflict'))
     renderPage()
-    await userEvent.click(await screen.findByRole('button', { name: /高级 \/ 复用机制/ }))
-    await screen.findByText('home')
-    await userEvent.type(screen.getByLabelText('Template ID'), 'new-template')
-    await userEvent.click(screen.getByRole('button', { name: '添加模板' }))
+    await userEvent.click(await screen.findByRole('button', { name: '＋ 新建规则集' }))
+    await userEvent.type(screen.getByLabelText('规则集名称'), 'new-rule-set')
+    await userEvent.type(screen.getByLabelText('规则集内容'), 'example.com')
+    await userEvent.click(screen.getByRole('button', { name: '保存到草稿' }))
     await userEvent.click(screen.getByRole('button', { name: '保存设备配置' }))
     expect(await screen.findByText(/配置已被其他操作更新/)).toBeTruthy()
-    expect(screen.getByText('template: new-template')).toBeTruthy()
+    expect(screen.getByText('new-rule-set')).toBeTruthy()
     expect(screen.getByRole('button', { name: '放弃本地修改并加载最新版本' })).toBeTruthy()
   })
 })

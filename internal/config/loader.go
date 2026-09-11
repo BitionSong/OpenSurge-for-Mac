@@ -75,6 +75,12 @@ func resolveRelativePaths(configPath string, cfg *Config) {
 	if cfg.DevicePolicy.File != "" && !filepath.IsAbs(cfg.DevicePolicy.File) {
 		cfg.DevicePolicy.File = filepath.Join(filepath.Dir(configPath), cfg.DevicePolicy.File)
 	}
+	if cfg.Tailscale.AuthKeyFile != "" && !filepath.IsAbs(cfg.Tailscale.AuthKeyFile) {
+		cfg.Tailscale.AuthKeyFile = filepath.Join(filepath.Dir(configPath), cfg.Tailscale.AuthKeyFile)
+	}
+	if cfg.Tailscale.StateDir != "" && !filepath.IsAbs(cfg.Tailscale.StateDir) {
+		cfg.Tailscale.StateDir = filepath.Join(filepath.Dir(configPath), cfg.Tailscale.StateDir)
+	}
 }
 
 func stripComment(line string) string {
@@ -117,6 +123,12 @@ func applyValue(cfg *Config, section, key, value string) error {
 		cfg.Gateway.Interface = value
 	case "gateway.lan_ip":
 		cfg.Gateway.LANIP = value
+	case "gateway.lan_prefix_len":
+		prefixLen, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("gateway.lan_prefix_len must be a number")
+		}
+		cfg.Gateway.LANPrefixLen = prefixLen
 	case "gateway.upstream_interface":
 		cfg.Gateway.UpstreamInterface = value
 	case "dhcp.binary":
@@ -135,6 +147,10 @@ func applyValue(cfg *Config, section, key, value string) error {
 		cfg.DHCP.LeaseTime = value
 	case "dhcp.domain":
 		cfg.DHCP.Domain = value
+	case "dhcp.bypass_gateway":
+		cfg.DHCP.BypassGateway = value
+	case "dhcp.bypass_dns":
+		cfg.DHCP.BypassDNS = splitCommaSeparated(value)
 	case "device_policy.file":
 		cfg.DevicePolicy.File = value
 	case "device_policy.protected_ipv4":
@@ -149,6 +165,12 @@ func applyValue(cfg *Config, section, key, value string) error {
 		cfg.DNS.Port = port
 	case "dns.upstream":
 		cfg.DNS.Upstream = value
+	case "dns.ipv6":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("dns.ipv6 must be a boolean")
+		}
+		cfg.DNS.IPv6 = enabled
 	case "mihomo.binary":
 		cfg.Mihomo.Binary = value
 	case "mihomo.config":
@@ -157,6 +179,16 @@ func applyValue(cfg *Config, section, key, value string) error {
 		cfg.Mihomo.ProfileMode = strings.ToLower(value)
 	case "mihomo.profile":
 		cfg.Mihomo.Profile = value
+	case "mihomo.profile_source_digest":
+		cfg.Mihomo.ProfileSourceDigest = value
+	case "mihomo.profile_overlay_digest":
+		cfg.Mihomo.ProfileOverlayDigest = value
+	case "mihomo.store_fake_ip":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("mihomo.store_fake_ip must be a boolean")
+		}
+		cfg.Mihomo.StoreFakeIP = enabled
 	case "mihomo.mixed_port":
 		port, err := strconv.Atoi(value)
 		if err != nil {
@@ -173,6 +205,56 @@ func applyValue(cfg *Config, section, key, value string) error {
 		cfg.Mihomo.APIAddr = value
 	case "mihomo.secret":
 		cfg.Mihomo.Secret = value
+	case "tailscale.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("tailscale.enabled must be a boolean")
+		}
+		cfg.Tailscale.Enabled = enabled
+	case "tailscale.display_name":
+		cfg.Tailscale.DisplayName = value
+	case "tailscale.hostname":
+		cfg.Tailscale.Hostname = strings.ToLower(value)
+	case "tailscale.control_url":
+		cfg.Tailscale.ControlURL = value
+	case "tailscale.auth_key_file":
+		cfg.Tailscale.AuthKeyFile = value
+	case "tailscale.state_dir":
+		cfg.Tailscale.StateDir = value
+	case "tailscale.accept_routes":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("tailscale.accept_routes must be a boolean")
+		}
+		cfg.Tailscale.AcceptRoutes = enabled
+	case "tailscale.magic_dns_suffixes":
+		cfg.Tailscale.MagicDNSSuffixes = splitCommaSeparated(strings.ToLower(value))
+	case "tailscale.peer_cidrs":
+		cfg.Tailscale.PeerCIDRs = splitCommaSeparated(value)
+	case "tailscale.subnet_routes":
+		cfg.Tailscale.SubnetRoutes = splitCommaSeparated(value)
+	case "tailscale.allow_mac":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("tailscale.allow_mac must be a boolean")
+		}
+		cfg.Tailscale.AllowMac = enabled
+	case "tailscale.allow_all_devices":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("tailscale.allow_all_devices must be a boolean")
+		}
+		cfg.Tailscale.AllowAllDevices = enabled
+	case "tailscale.allowed_devices":
+		cfg.Tailscale.AllowedDevices = splitCommaSeparated(value)
+	case "tailscale.exit_node":
+		cfg.Tailscale.ExitNode = value
+	case "tailscale.exit_node_allow_lan_access":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("tailscale.exit_node_allow_lan_access must be a boolean")
+		}
+		cfg.Tailscale.ExitNodeAllowLANAccess = enabled
 	case "pf.anchor_name":
 		cfg.PF.AnchorName = value
 	case "pf.redirect_tcp_to":
@@ -205,6 +287,28 @@ func applyValue(cfg *Config, section, key, value string) error {
 			return fmt.Errorf("transparent.tun_strict_route must be a boolean")
 		}
 		cfg.Transparent.TUNStrictRoute = enabled
+	case "transparent.tun_ipv6":
+		cfg.Transparent.TUNIPv6 = strings.ToLower(value)
+	case "transparent.ipv6_shared_l2_ready":
+		ready, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("transparent.ipv6_shared_l2_ready must be a boolean")
+		}
+		cfg.Transparent.IPv6SharedL2Ready = ready
+	case "transparent.ipv6_packet_broker_binary":
+		cfg.Transparent.IPv6PacketBrokerBinary = value
+	case "transparent.ipv6_packet_mtu":
+		mtu, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("transparent.ipv6_packet_mtu must be a number")
+		}
+		cfg.Transparent.IPv6PacketMTU = mtu
+	case "local_system_proxy.enabled":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("local_system_proxy.enabled must be a boolean")
+		}
+		cfg.LocalSystemProxy.Enabled = enabled
 	case "upstream_proxy.enabled":
 		enabled, err := strconv.ParseBool(value)
 		if err != nil {

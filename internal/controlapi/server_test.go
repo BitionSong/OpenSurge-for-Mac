@@ -92,14 +92,98 @@ func TestInspectSourceInvalidTopLevelReturnsEmptyCollections(t *testing.T) {
 }
 
 func TestInspectSourceRejectsReservedNamespace(t *testing.T) {
-	_, err := inspectSource([]byte(`proxy-groups:
+	tests := map[string]string{
+		"device group": `proxy-groups:
   - name: device/phone/default
     type: select
     proxies: [DIRECT]
 rules: ["MATCH,DIRECT"]
-`), "mihomo_profile")
-	if err == nil {
-		t.Fatal("inspectSource() succeeded")
+`,
+		"local routing proxy": `proxies:
+  - name: open-surge/mac-mode-tcp
+    type: direct
+rules: ["MATCH,DIRECT"]
+`,
+	}
+	for name, profile := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := inspectSource([]byte(profile), "mihomo_profile")
+			if err == nil || !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("inspectSource() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLocalRoutingEndpointUsesDedicatedController(t *testing.T) {
+	server := newTestServer(t)
+	server.fetchLocalRouting = func(_ context.Context, cfg config.Config) (mihomo.LocalRoutingSnapshot, error) {
+		if !cfg.Transparent.TUNEnabled() {
+			t.Fatal("local routing endpoint did not load TUN runtime config")
+		}
+		return mihomo.LocalRoutingSnapshot{
+			Mode:               mihomo.LocalRoutingModeRule,
+			AvailableModes:     []string{mihomo.LocalRoutingModeRule, mihomo.LocalRoutingModeGlobal, mihomo.LocalRoutingModeDirect},
+			UDPBehavior:        "rules",
+			Transports:         []string{"tun", "loopback_explicit_proxy"},
+			NewConnectionsOnly: true,
+			Consistent:         true,
+		}, nil
+	}
+	response := performAuthorized(server, http.MethodGet, "/api/v1/local-routing", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET local routing status=%d body=%s", response.Code, response.Body.String())
+	}
+	var fetched LocalRoutingResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &fetched); err != nil {
+		t.Fatal(err)
+	}
+	if fetched.SchemaVersion != SchemaVersion || fetched.Mode != mihomo.LocalRoutingModeRule || !fetched.Consistent {
+		t.Fatalf("GET local routing = %#v", fetched)
+	}
+
+	var mode, policy string
+	server.setLocalRouting = func(_ context.Context, _ config.Config, requestedMode, requestedPolicy string) (mihomo.LocalRoutingSnapshot, error) {
+		mode, policy = requestedMode, requestedPolicy
+		return mihomo.LocalRoutingSnapshot{
+			Mode:               requestedMode,
+			AvailableModes:     []string{mihomo.LocalRoutingModeRule, mihomo.LocalRoutingModeGlobal, mihomo.LocalRoutingModeDirect},
+			GlobalGroup:        &mihomo.ProxyGroup{Name: mihomo.LocalRoutingGlobalGroup, Selected: requestedPolicy, Options: []string{"Proxy-A", "Proxy-B"}},
+			UDPBehavior:        "proxy",
+			Transports:         []string{"tun", "loopback_explicit_proxy"},
+			NewConnectionsOnly: true,
+			Consistent:         true,
+		}, nil
+	}
+	response = performAuthorized(server, http.MethodPost, "/api/v1/local-routing", []byte(`{"mode":"global","global_policy":"Proxy-B"}`))
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST local routing status=%d body=%s", response.Code, response.Body.String())
+	}
+	if mode != mihomo.LocalRoutingModeGlobal || policy != "Proxy-B" {
+		t.Fatalf("set local routing arguments = %q/%q", mode, policy)
+	}
+	var updated LocalRoutingResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Mode != mihomo.LocalRoutingModeGlobal || updated.GlobalGroup == nil || updated.GlobalGroup.Selected != "Proxy-B" {
+		t.Fatalf("POST local routing = %#v", updated)
+	}
+}
+
+func TestGenericPolicySelectionRejectsLocalRoutingGroups(t *testing.T) {
+	server := newTestServer(t)
+	response := performAuthorized(server, http.MethodPost, "/api/v1/policies/open-surge%2Fmac-mode-tcp/selection", []byte(`{"policy":"DIRECT"}`))
+	if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), "reserved_policy_group") {
+		t.Fatalf("reserved policy selection status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestProviderRefreshRejectsLocalRoutingGroups(t *testing.T) {
+	server := newTestServer(t)
+	response := performAuthorized(server, http.MethodPost, "/api/v1/providers/open-surge%2Fmac-global/refresh", nil)
+	if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), "reserved_provider") {
+		t.Fatalf("reserved provider refresh status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -242,6 +326,77 @@ func TestRecoveryTransitionsPersist(t *testing.T) {
 	}
 }
 
+func TestGatewayPlanWarnsOnlyForCompetingIPv6DefaultRoute(t *testing.T) {
+	server := newTestServer(t)
+	selfOnly := true
+	server.discoverNetwork = func(context.Context, string, string) (macosnetwork.Snapshot, error) {
+		return macosnetwork.Snapshot{
+			NetworkService:      "Wi-Fi",
+			Interface:           "en0",
+			IPv4:                "192.168.1.20",
+			SubnetMask:          "255.255.255.0",
+			Router:              "192.168.1.1",
+			DNS:                 []string{"192.168.1.1"},
+			IPv6Default:         true,
+			IPv6DefaultSelfOnly: selfOnly,
+		}, nil
+	}
+
+	response := performAuthorized(server, http.MethodPost, "/api/v1/gateway/plan", []byte(`{}`))
+	if response.Code != http.StatusOK {
+		t.Fatalf("self-only plan status=%d body=%s", response.Code, response.Body.String())
+	}
+	var plan GatewayPlan
+	if err := json.Unmarshal(response.Body.Bytes(), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Warnings) != 0 || !plan.Snapshot.IPv6DefaultSelfOnly {
+		t.Fatalf("self-only plan = %#v", plan)
+	}
+
+	selfOnly = false
+	plan = GatewayPlan{}
+	response = performAuthorized(server, http.MethodPost, "/api/v1/gateway/plan", []byte(`{}`))
+	if response.Code != http.StatusOK {
+		t.Fatalf("competing plan status=%d body=%s", response.Code, response.Body.String())
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Warnings) != 1 || !strings.Contains(plan.Warnings[0], "per-device IPv4 policy can be bypassed") {
+		t.Fatalf("competing plan = %#v", plan)
+	}
+}
+
+func TestGatewayPlanWarnsWhenConfiguredPrefixDiffersFromLiveMask(t *testing.T) {
+	server := newTestServer(t)
+	server.discoverNetwork = func(context.Context, string, string) (macosnetwork.Snapshot, error) {
+		return macosnetwork.Snapshot{
+			NetworkService: "Wi-Fi",
+			Interface:      "en0",
+			IPv4:           "192.168.1.20",
+			SubnetMask:     "255.255.252.0",
+			Router:         "192.168.1.1",
+			DNS:            []string{"192.168.1.1"},
+		}, nil
+	}
+
+	response := performAuthorized(server, http.MethodPost, "/api/v1/gateway/plan", []byte(`{}`))
+	if response.Code != http.StatusOK {
+		t.Fatalf("plan status=%d body=%s", response.Code, response.Body.String())
+	}
+	var plan GatewayPlan
+	if err := json.Unmarshal(response.Body.Bytes(), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Warnings) != 1 || !strings.Contains(plan.Warnings[0], "gateway.lan_prefix_len") {
+		t.Fatalf("plan = %#v", plan)
+	}
+	if len(plan.Blockers) != 0 {
+		t.Fatalf("a stale prefix must stay a warning: %#v", plan.Blockers)
+	}
+}
+
 func TestNetworkInterfacesReturnsSelectableMacInterfaces(t *testing.T) {
 	server := newTestServer(t)
 	response := performAuthorized(server, http.MethodGet, "/api/v1/network/interfaces", nil)
@@ -255,8 +410,55 @@ func TestNetworkInterfacesReturnsSelectableMacInterfaces(t *testing.T) {
 	if payload.SchemaVersion != SchemaVersion || len(payload.Interfaces) != 2 {
 		t.Fatalf("interfaces response = %#v", payload)
 	}
-	if payload.Interfaces[0].Interface != "en0" || payload.Interfaces[0].NetworkService != "Wi-Fi" {
+	if payload.Interfaces[0].Interface != "en0" || payload.Interfaces[0].NetworkService != "Wi-Fi" || payload.Interfaces[0].IPv6LinkLocal != "fe80::100" {
 		t.Fatalf("first interface = %#v", payload.Interfaces[0])
+	}
+}
+
+func TestNetworkDefaultsUseCurrentDefaultNetworkForSameLANModes(t *testing.T) {
+	server := newTestServer(t)
+	server.discoverDefault = func(context.Context) (macosnetwork.Snapshot, error) {
+		return macosnetwork.Snapshot{
+			NetworkService: "USB LAN",
+			Interface:      "en7",
+			IPv4Mode:       macosnetwork.IPv4ModeDHCP,
+			IPv4:           "192.168.1.190",
+			SubnetMask:     "255.255.255.0",
+			Router:         "192.168.1.1",
+			DNS:            []string{"192.168.1.1"},
+		}, nil
+	}
+
+	response := performAuthorized(server, http.MethodGet, "/api/v1/network/defaults?mode=same_wifi_dhcp", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("defaults status=%d body=%s", response.Code, response.Body.String())
+	}
+	var takeover NetworkDefaultsResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &takeover); err != nil {
+		t.Fatal(err)
+	}
+	if takeover.GatewayIPv4 != "192.168.1.190" || takeover.Snapshot.Interface != "en7" || takeover.DHCPRangeStart != "192.168.1.100" || takeover.DHCPRangeEnd != "192.168.1.189" || takeover.BypassGateway != "192.168.1.1" || !reflect.DeepEqual(takeover.BypassDNS, []string{"192.168.1.1"}) || len(takeover.Blockers) != 0 {
+		t.Fatalf("takeover defaults = %#v", takeover)
+	}
+
+	response = performAuthorized(server, http.MethodGet, "/api/v1/network/defaults?mode=same_lan", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("same-LAN defaults status=%d body=%s", response.Code, response.Body.String())
+	}
+	var bypass NetworkDefaultsResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &bypass); err != nil {
+		t.Fatal(err)
+	}
+	if bypass.GatewayIPv4 != "192.168.1.190" || bypass.DHCPRangeStart != "" || bypass.DHCPRangeEnd != "" || len(bypass.Warnings) != 1 {
+		t.Fatalf("bypass defaults = %#v", bypass)
+	}
+}
+
+func TestNetworkDefaultsDoNotSupportIsolatedLAN(t *testing.T) {
+	server := newTestServer(t)
+	response := performAuthorized(server, http.MethodGet, "/api/v1/network/defaults?mode=isolated_lan", nil)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "network_defaults_mode_unsupported") {
+		t.Fatalf("isolated defaults status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -360,6 +562,88 @@ func TestSameWiFiNetworkRecoveryFlow(t *testing.T) {
 	state, _ = server.store.Recovery()
 	if state.Stage != RecoveryComplete || state.Required || !network.dhcpRestored {
 		t.Fatalf("final state=%#v network=%#v", state, network)
+	}
+}
+
+func TestAbandonTakeoverRestoresMacDHCPWhenServerAnswers(t *testing.T) {
+	server, network := newTestServerWithNetwork(t)
+	state := RecoveryState{
+		SchemaVersion: 1,
+		Stage:         RecoveryMacStatic,
+		Topology:      config.GatewayModeSameWiFiDHCP,
+		Required:      true,
+		NetworkSnapshot: &macosnetwork.Snapshot{
+			NetworkService: "Wi-Fi",
+			Interface:      "en0",
+		},
+	}
+	if err := server.store.SaveRecovery(state); err != nil {
+		t.Fatal(err)
+	}
+	network.servers = []string{"192.168.1.1"}
+
+	response := performAuthorized(server, http.MethodPost, "/api/v1/recovery/abandon-takeover", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("abandon status=%d body=%s", response.Code, response.Body.String())
+	}
+	state, _ = server.store.Recovery()
+	if state.Stage != RecoveryComplete || state.Required || !network.dhcpRestored {
+		t.Fatalf("state=%#v network=%#v", state, network)
+	}
+	if !strings.Contains(state.RecoveryNotes, "takeover abandoned") {
+		t.Fatalf("notes=%q", state.RecoveryNotes)
+	}
+}
+
+func TestAbandonTakeoverFinishesStaticWhenNoServerAnswers(t *testing.T) {
+	server, network := newTestServerWithNetwork(t)
+	state := RecoveryState{
+		SchemaVersion: 1,
+		Stage:         RecoveryRouterDHCPDisabledConfirmed,
+		Topology:      config.GatewayModeSameWiFiDHCP,
+		Required:      true,
+		NetworkSnapshot: &macosnetwork.Snapshot{
+			NetworkService: "Wi-Fi",
+			Interface:      "en0",
+		},
+	}
+	if err := server.store.SaveRecovery(state); err != nil {
+		t.Fatal(err)
+	}
+	network.servers = []string{}
+
+	response := performAuthorized(server, http.MethodPost, "/api/v1/recovery/abandon-takeover", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("abandon status=%d body=%s", response.Code, response.Body.String())
+	}
+	state, _ = server.store.Recovery()
+	if state.Stage != RecoveryCompleteStatic || state.Required || network.dhcpRestored {
+		t.Fatalf("state=%#v network=%#v", state, network)
+	}
+	if !strings.Contains(state.RecoveryNotes, "remains on fixed IPv4") {
+		t.Fatalf("notes=%q", state.RecoveryNotes)
+	}
+}
+
+func TestFailedSameWiFiStartPreservesRetryOrAbandonRecovery(t *testing.T) {
+	server := newTestServer(t)
+	state := RecoveryState{
+		SchemaVersion: 1,
+		Stage:         RecoveryRouterDHCPDisabledConfirmed,
+		Topology:      config.GatewayModeSameWiFiDHCP,
+		Required:      true,
+		NetworkSnapshot: &macosnetwork.Snapshot{
+			NetworkService: "Wi-Fi",
+			Interface:      "en0",
+		},
+	}
+	if err := server.store.SaveRecovery(state); err != nil {
+		t.Fatal(err)
+	}
+	server.recordStartRecoveryFailure(config.GatewayModeSameWiFiDHCP, state, errors.New("TUN route conflict via utun42"))
+	state, _ = server.store.Recovery()
+	if state.Stage != RecoveryRouterDHCPDisabledConfirmed || !state.Required || !strings.Contains(state.RecoveryNotes, "retry") || !strings.Contains(state.RecoveryNotes, "utun42") {
+		t.Fatalf("state=%#v", state)
 	}
 }
 
@@ -539,6 +823,89 @@ func TestControlConfigCanCorrectPreparedRecoveryBeforeNetworkChanges(t *testing.
 	}
 }
 
+func TestTailscaleEndpointNeverReturnsStoredAuthKey(t *testing.T) {
+	server := newTestServer(t)
+	authKeyPath, stateDir := tailscaleManagedPaths(server.configPath)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "tailscaled.state"), []byte("state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authKeyPath, []byte("tskey-auth-must-not-leak\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(server.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = append(body, []byte(`tailscale:
+  enabled: true
+  display_name: "Home Tailnet"
+  hostname: "opensurge-home"
+  control_url: "https://controlplane.tailscale.com"
+  auth_key_file: "`+authKeyPath+`"
+  state_dir: "`+stateDir+`"
+  allow_mac: true
+`)...)
+	if err := os.WriteFile(server.configPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	response := performAuthorized(server, http.MethodGet, "/api/v1/tailscale", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "tskey-auth-must-not-leak") || strings.Contains(response.Body.String(), "auth_key\"") {
+		t.Fatalf("Tailscale response leaked the write-only key: %s", response.Body.String())
+	}
+	var payload TailscaleResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.AuthKeyPresent || !payload.IdentityPresent || payload.Settings.DisplayName != "Home Tailnet" {
+		t.Fatalf("Tailscale response = %#v", payload)
+	}
+}
+
+func TestTailscaleUpdateRejectsNativeSubnetRouteConflictBeforeReload(t *testing.T) {
+	server := newTestServer(t)
+	cfg, err := config.Load(server.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := runtime.NewPaths(cfg)
+	if err := os.MkdirAll(filepath.Dir(paths.StateFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SaveState(paths.StateFile, runtime.State{PIDMihomo: os.Getpid(), StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	server.fetchTUNRuntime = func(context.Context, config.Config) (mihomo.TUNRuntimeState, error) {
+		return mihomo.TUNRuntimeState{Enabled: true, Device: "utun123"}, nil
+	}
+	server.lookupRoute = func(context.Context, string) (macosnetwork.RouteSelection, error) {
+		return macosnetwork.RouteSelection{Interface: "utun5", Prefix: "192.168.64.0/24"}, nil
+	}
+	runner := &recordingTailscaleConfigurationRunner{}
+	server.configRunner = runner
+	payload, _ := json.Marshal(TailscaleUpdateRequest{TailscaleSettings: TailscaleSettings{
+		Enabled: true, AcceptRoutes: true, SubnetRoutes: []string{"192.168.64.0/24"},
+	}})
+	request := httptest.NewRequest(http.MethodPut, "http://127.0.0.1:61767/api/v1/tailscale", bytes.NewReader(payload))
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("If-Match", `"`+fileDigest(server.configPath)+`"`)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !containsAll(response.Body.String(), `"code":"tailscale_route_conflict"`, "192.168.64.0/24", "utun5") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if runner.called {
+		t.Fatal("Tailscale configuration runner was called after route conflict preflight")
+	}
+}
+
 func TestSafeDialRejectsLoopback(t *testing.T) {
 	ctx := t.Context()
 	_, err := safeDialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", "443"))
@@ -622,6 +989,9 @@ func TestHelperAllowlistIncludesNamedLifecycleActions(t *testing.T) {
 	if !helperActionAllowed("restart-mihomo") {
 		t.Fatal("restart-mihomo is not available to the privileged helper")
 	}
+	if !helperActionAllowed("sleep-prevention-hold") {
+		t.Fatal("sleep-prevention-hold is not available to the privileged helper")
+	}
 	for _, action := range []string{"hot-reload", "restart", "shell"} {
 		if helperActionAllowed(action) {
 			t.Fatalf("unexpected helper action %q", action)
@@ -638,11 +1008,32 @@ func TestHelperRestartMihomoDefersInvalidDesiredDevicePolicy(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("device_policy:\n  file: ./device-policy.json\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadHelperConfig("restart-mihomo", configPath); err != nil {
-		t.Fatalf("restart-mihomo runtime config error=%v", err)
+	for _, action := range []string{"restart-mihomo", "policy-workspace", "policy-workspace-hold"} {
+		if _, err := loadHelperConfig(action, configPath); err != nil {
+			t.Fatalf("%s runtime config error=%v", action, err)
+		}
 	}
 	if _, err := loadHelperConfig("start", configPath); err == nil {
 		t.Fatal("start accepted an invalid desired device policy")
+	}
+}
+
+func TestHelperGatewayLifecycleActionsExcludePolicyWorkspace(t *testing.T) {
+	for _, action := range []string{"start", "stop", "reload", "restart-mihomo"} {
+		if !helperGatewayLifecycleAction(action) {
+			t.Fatalf("lifecycle action %q was not serialized", action)
+		}
+	}
+	for _, action := range []string{"policy-workspace", "policy-workspace-hold", "config-apply-profile"} {
+		if helperGatewayLifecycleAction(action) {
+			t.Fatalf("non-lifecycle action %q was classified as a gateway transition", action)
+		}
+	}
+}
+
+func TestReconcilePreparedPolicyEngineAllowsMissingInstallationConfig(t *testing.T) {
+	if err := reconcilePreparedPolicyEngine(t.TempDir()); err != nil {
+		t.Fatalf("missing installation config should not block helper startup: %v", err)
 	}
 }
 
@@ -667,7 +1058,7 @@ func TestTrustedPathRejectsEscapesAndUserOwnedFiles(t *testing.T) {
 }
 
 func TestPublicSourcesKeepsEmptyArray(t *testing.T) {
-	if sources := publicSources([]Source{}); sources == nil {
+	if sources := publicSources([]Source{}, t.TempDir()); sources == nil {
 		t.Fatal("publicSources returned nil for an empty collection")
 	}
 }
@@ -676,7 +1067,7 @@ func TestPublicSourcesNormalizesCurrentAndHistoricalInventory(t *testing.T) {
 	public := publicSources([]Source{{
 		Inventory: Inventory{},
 		Versions:  []SourceVersion{{Inventory: Inventory{}}},
-	}})
+	}}, t.TempDir())
 	data, err := json.Marshal(public)
 	if err != nil {
 		t.Fatal(err)
@@ -689,9 +1080,28 @@ func TestPublicSourcesNormalizesCurrentAndHistoricalInventory(t *testing.T) {
 }
 
 func TestPublicSourcesRedactsFetchURLAndPath(t *testing.T) {
-	public := publicSources([]Source{{Origin: "https://example.com/profile", FetchURL: "https://token@example.com/profile?secret=1", SnapshotPath: "/private/source.yaml"}})
+	public := publicSources([]Source{{Origin: "https://example.com/profile", FetchURL: "https://token@example.com/profile?secret=1", SnapshotPath: "/private/source.yaml", SnapshotDisplayPath: "/injected/path.yaml"}}, t.TempDir())
 	if public[0].FetchURL != "" || public[0].SnapshotPath != "" {
 		t.Fatalf("public source leaked private fields: %#v", public[0])
+	}
+	if public[0].SnapshotDisplayPath != "" {
+		t.Fatalf("untrusted source path received a display location: %#v", public[0])
+	}
+}
+
+func TestPublicSourcesAddsManagedDisplayPath(t *testing.T) {
+	server := newTestServer(t)
+	source, err := server.importReader("dg5.org-0715", "mihomo_profile", "file:dg5.yaml", strings.NewReader("rules:\n  - MATCH,DIRECT\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := publicSources([]Source{source}, server.store.Dir())
+	if public[0].SnapshotPath != "" {
+		t.Fatalf("public source leaked the absolute snapshot path: %#v", public[0])
+	}
+	want := filepath.Join("OpenSurge", "sources", source.ID, source.Digest+".yaml")
+	if public[0].SnapshotDisplayPath != want {
+		t.Fatalf("snapshot display path=%q want=%q", public[0].SnapshotDisplayPath, want)
 	}
 }
 
@@ -767,9 +1177,196 @@ func TestSourceRefreshPreservesAppliedVersionAndBuildsInventoryDiff(t *testing.T
 	if second.Diff.PreviousDigest != first.Digest || len(second.Diff.ProxiesAdded) != 1 || second.Diff.ProxiesAdded[0] != "new" || second.Diff.RuleCountDelta != 1 {
 		t.Fatalf("diff = %#v", second.Diff)
 	}
-	public := publicSources([]Source{second})[0]
+	public := publicSources([]Source{second}, server.store.Dir())[0]
 	if public.Versions[0].SnapshotPath != "" {
 		t.Fatal("public version leaked snapshot path")
+	}
+}
+
+func TestSourceSnapshotFileActionsRevealAndExport(t *testing.T) {
+	server := newTestServer(t)
+	sourceBody := "proxies:\n  - {name: edge, type: http, server: 127.0.0.1, port: 18080}\nrules:\n  - MATCH,edge\n"
+	source, err := server.importReader("dg5.org-0715", "mihomo_profile", "file:dg5.yaml", strings.NewReader(sourceBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	revealed := []string{}
+	server.revealInFinder = func(_ context.Context, path string) error {
+		revealed = append(revealed, path)
+		return nil
+	}
+
+	locationResponse := performAuthorized(server, http.MethodGet, "/api/v1/sources/"+source.ID+"/snapshot-location", nil)
+	if locationResponse.Code != http.StatusOK {
+		t.Fatalf("location status=%d body=%s", locationResponse.Code, locationResponse.Body.String())
+	}
+	var location SourceSnapshotFile
+	if err := json.Unmarshal(locationResponse.Body.Bytes(), &location); err != nil {
+		t.Fatal(err)
+	}
+	if location.Kind != "managed_snapshot" || location.Path != source.SnapshotPath || location.DisplayPath == "" {
+		t.Fatalf("location=%#v", location)
+	}
+
+	revealResponse := performAuthorized(server, http.MethodPost, "/api/v1/sources/"+source.ID+"/reveal", nil)
+	if revealResponse.Code != http.StatusOK || len(revealed) != 1 || revealed[0] != source.SnapshotPath {
+		t.Fatalf("reveal status=%d body=%s paths=%v", revealResponse.Code, revealResponse.Body.String(), revealed)
+	}
+
+	exportResponse := performAuthorized(server, http.MethodPost, "/api/v1/sources/"+source.ID+"/export", nil)
+	if exportResponse.Code != http.StatusCreated {
+		t.Fatalf("export status=%d body=%s", exportResponse.Code, exportResponse.Body.String())
+	}
+	var exported SourceSnapshotFile
+	if err := json.Unmarshal(exportResponse.Body.Bytes(), &exported); err != nil {
+		t.Fatal(err)
+	}
+	if exported.Kind != "editable_export" || !strings.HasPrefix(exported.Path, filepath.Join(server.store.Dir(), "exports")+string(os.PathSeparator)) {
+		t.Fatalf("exported=%#v", exported)
+	}
+	if !strings.HasPrefix(filepath.Base(exported.Path), "dg5.org-0715-"+source.Digest[:8]+"-") || filepath.Ext(exported.Path) != ".yaml" {
+		t.Fatalf("export filename=%q", filepath.Base(exported.Path))
+	}
+	data, err := os.ReadFile(exported.Path)
+	if err != nil || string(data) != sourceBody {
+		t.Fatalf("exported data=%q err=%v", data, err)
+	}
+	info, err := os.Stat(exported.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("exported mode=%v", info.Mode().Perm())
+	}
+	if len(revealed) != 2 || revealed[1] != exported.Path {
+		t.Fatalf("Finder reveal paths=%v", revealed)
+	}
+}
+
+func TestSourceSnapshotActionsRejectModifiedManagedFile(t *testing.T) {
+	server := newTestServer(t)
+	source, err := server.importReader("home", "mihomo_profile", "file:home.yaml", strings.NewReader("rules:\n  - MATCH,DIRECT\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source.SnapshotPath, []byte("rules:\n  - MATCH,REJECT\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	server.revealInFinder = func(context.Context, string) error {
+		called = true
+		return nil
+	}
+	response := performAuthorized(server, http.MethodPost, "/api/v1/sources/"+source.ID+"/reveal", nil)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "source_snapshot_unavailable") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if called {
+		t.Fatal("Finder was opened for a modified managed snapshot")
+	}
+}
+
+func TestSourcePreviewAndApplyRejectModifiedManagedFile(t *testing.T) {
+	server := newTestServer(t)
+	source, err := server.importReader("home", "mihomo_profile", "file:home.yaml", strings.NewReader("proxy-groups:\n  - {name: Main, type: select, proxies: [DIRECT]}\nrules:\n  - MATCH,Main\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source.SnapshotPath, []byte("rules:\n  - MATCH,REJECT\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	preview := performAuthorized(server, http.MethodGet, "/api/v1/sources/"+source.ID+"/preview", nil)
+	if preview.Code != http.StatusConflict || !strings.Contains(preview.Body.String(), "source_snapshot_unavailable") {
+		t.Fatalf("preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+
+	recorder := &recordingConfigurationRunner{}
+	server.configRunner = recorder
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:61767/api/v1/sources/"+source.ID+"/apply", nil)
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("If-Match", `"`+fileDigest(server.configPath)+`"`)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "source_snapshot_unavailable") {
+		t.Fatalf("apply status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(recorder.profilePayload) != 0 {
+		t.Fatalf("modified snapshot reached configuration runner: %q", recorder.profilePayload)
+	}
+}
+
+func TestProfileAppliedStateIgnoresPreviousBootRuntime(t *testing.T) {
+	server := newTestServer(t)
+	source, err := server.importReader("home", "mihomo_profile", "file:home.yaml", strings.NewReader("proxy-groups:\n  - {name: Main, type: select, proxies: [DIRECT]}\nrules:\n  - MATCH,Main\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := mihomo.DefaultProfileOverlayDocument()
+	document.Enabled = true
+	overlay, err := mihomo.RenderProfileOverlay(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.store.SaveProfileOverlay(overlay); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(server.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Mihomo.ProfileMode = config.MihomoProfileModeImported
+	cfg.Mihomo.Profile = source.SnapshotPath
+	cfg.Mihomo.ProfileSourceDigest = source.Digest
+	cfg.Mihomo.ProfileOverlayDigest = mihomo.ProfileOverlayDigest(overlay)
+	if err := os.WriteFile(server.configPath, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := config.MihomoProfileDigest(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := runtime.NewPaths(cfg)
+	if err := runtime.Ensure(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SaveState(paths.StateFile, runtime.State{BootSessionID: "previous-boot", ProfileDigest: desired}); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := server.profileOverlayResponse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Desired || response.Applied {
+		t.Fatalf("overlay state desired=%v applied=%v, want desired only", response.Desired, response.Applied)
+	}
+	listed := server.decorateSourceStates([]Source{source})
+	if len(listed) != 1 || !listed[0].Desired || listed[0].Applied {
+		t.Fatalf("source state=%#v, want desired but not applied", listed)
+	}
+}
+
+func TestSourceExportKeepsCopyWhenFinderRevealFails(t *testing.T) {
+	server := newTestServer(t)
+	source, err := server.importReader("home", "mihomo_profile", "file:home.yaml", strings.NewReader("rules:\n  - MATCH,DIRECT\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.revealInFinder = func(context.Context, string) error {
+		return errors.New("Finder unavailable")
+	}
+	response := performAuthorized(server, http.MethodPost, "/api/v1/sources/"+source.ID+"/export", nil)
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "editable copy was exported") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	exports, err := filepath.Glob(filepath.Join(server.store.Dir(), "exports", "*.yaml"))
+	if err != nil || len(exports) != 1 {
+		t.Fatalf("exports=%v err=%v", exports, err)
+	}
+	if data, err := os.ReadFile(exports[0]); err != nil || string(data) != "rules:\n  - MATCH,DIRECT\n" {
+		t.Fatalf("exported data=%q err=%v", data, err)
 	}
 }
 
@@ -796,6 +1393,189 @@ func TestSourceApplyDelegatesAuthoritativeEngineValidationToRunner(t *testing.T)
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), "mihomo_validation_failed") {
 		t.Fatalf("engine failure status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestGlobalProfileOverlaySaveDecoratesSourcesAndPreviewsFinalConfig(t *testing.T) {
+	server := newTestServer(t)
+	source, err := server.importReader("home", "mihomo_profile", "file:home.yaml", strings.NewReader(`proxies:
+  - {name: edge, type: http, server: 127.0.0.1, port: 18080}
+proxy-groups:
+  - {name: Main, type: select, proxies: [edge, DIRECT]}
+rules:
+  - DOMAIN,source.example,Main
+  - MATCH,DIRECT
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	get := performAuthorized(server, http.MethodGet, "/api/v1/profile-overlay", nil)
+	if get.Code != http.StatusOK {
+		t.Fatalf("get overlay status=%d body=%s", get.Code, get.Body.String())
+	}
+	var initial ProfileOverlayResponse
+	if err := json.Unmarshal(get.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	if initial.Document.Enabled || initial.Revision == "" {
+		t.Fatalf("initial overlay = %#v", initial)
+	}
+
+	overlayYAML := `schema-version: 1
+enabled: true
+rules:
+  prepend:
+    - DOMAIN,first.example,DIRECT
+  append-before-match:
+    - DOMAIN,last.example,Main
+proxies:
+  add:
+    - name: LAN-Proxy
+      type: socks5
+      server: 192.168.1.10
+      port: 1080
+proxy-groups:
+  patch:
+    - name: Main
+      append-proxies:
+        - LAN-Proxy
+`
+	body, _ := json.Marshal(ProfileOverlaySaveRequest{YAML: &overlayYAML})
+	request := httptest.NewRequest(http.MethodPut, "http://127.0.0.1:61767/api/v1/profile-overlay", bytes.NewReader(body))
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("If-Match", `"`+initial.Revision+`"`)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("save overlay status=%d body=%s", response.Code, response.Body.String())
+	}
+	var savedOverlay ProfileOverlayResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &savedOverlay); err != nil {
+		t.Fatal(err)
+	}
+
+	sourcesResponse := performAuthorized(server, http.MethodGet, "/api/v1/sources", nil)
+	var listed struct {
+		Sources []Source `json:"sources"`
+	}
+	if err := json.Unmarshal(sourcesResponse.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Sources) != 1 || !listed.Sources[0].OverlayCompatible || listed.Sources[0].EffectiveDigest == source.Digest {
+		t.Fatalf("decorated sources = %#v", listed.Sources)
+	}
+	if got := listed.Sources[0].EffectiveInventory; len(got.Proxies) != 2 || got.RuleCount != 4 {
+		t.Fatalf("effective inventory = %#v", got)
+	}
+
+	const tailscaleAuthKey = "tskey-auth-preview-must-not-leak"
+	cfg, err := config.Load(server.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.AuthKeyFile = filepath.Join(t.TempDir(), "tailscale-auth-key")
+	cfg.Tailscale.StateDir = filepath.Join(t.TempDir(), "tailscale-state")
+	if err := os.WriteFile(cfg.Tailscale.AuthKeyFile, []byte(tailscaleAuthKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(server.configPath, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previewResponse := performAuthorized(server, http.MethodGet, "/api/v1/sources/"+source.ID+"/preview", nil)
+	if previewResponse.Code != http.StatusOK {
+		t.Fatalf("preview status=%d body=%s", previewResponse.Code, previewResponse.Body.String())
+	}
+	var preview ProfileOverlayPreview
+	if err := json.Unmarshal(previewResponse.Body.Bytes(), &preview); err != nil {
+		t.Fatal(err)
+	}
+	first := strings.Index(preview.FinalMihomoYAML, "DOMAIN,first.example,DIRECT")
+	sourceRule := strings.Index(preview.FinalMihomoYAML, "DOMAIN,source.example,Main")
+	last := strings.Index(preview.FinalMihomoYAML, "DOMAIN,last.example,Main")
+	match := strings.Index(preview.FinalMihomoYAML, "MATCH,DIRECT")
+	if first < 0 || !(first < sourceRule && sourceRule < last && last < match) || !strings.Contains(preview.FinalMihomoYAML, "LAN-Proxy") {
+		t.Fatalf("unexpected final preview:\n%s", preview.FinalMihomoYAML)
+	}
+	if strings.Contains(preview.FinalMihomoYAML, tailscaleAuthKey) || !strings.Contains(preview.FinalMihomoYAML, `auth-key: "<redacted>"`) {
+		t.Fatalf("Tailscale auth key was not safely redacted from preview:\n%s", preview.FinalMihomoYAML)
+	}
+
+	recorder := &recordingConfigurationRunner{}
+	server.configRunner = recorder
+	applyRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:61767/api/v1/sources/"+source.ID+"/apply", nil)
+	applyRequest.Host = "127.0.0.1:61767"
+	applyRequest.SetPathValue("id", source.ID)
+	applyRequest.Header.Set("Authorization", "Bearer "+server.token)
+	applyRequest.Header.Set("If-Match", `"`+fileDigest(server.configPath)+`"`)
+	applyResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(applyResponse, applyRequest)
+	if applyResponse.Code != http.StatusOK {
+		t.Fatalf("apply overlay status=%d body=%s", applyResponse.Code, applyResponse.Body.String())
+	}
+	if recorder.sourceDigest != source.Digest || recorder.overlayDigest != savedOverlay.Revision {
+		t.Fatalf("composition digests source=%q overlay=%q", recorder.sourceDigest, recorder.overlayDigest)
+	}
+	first = strings.Index(string(recorder.profilePayload), "DOMAIN,first.example,DIRECT")
+	sourceRule = strings.Index(string(recorder.profilePayload), "DOMAIN,source.example,Main")
+	last = strings.Index(string(recorder.profilePayload), "DOMAIN,last.example,Main")
+	match = strings.Index(string(recorder.profilePayload), "MATCH,DIRECT")
+	if first < 0 || !(first < sourceRule && sourceRule < last && last < match) || !strings.Contains(string(recorder.profilePayload), "LAN-Proxy") {
+		t.Fatalf("runner received unexpected profile:\n%s", recorder.profilePayload)
+	}
+}
+
+func TestGlobalProfileOverlayRejectsGatewayFieldsAndSourceConflicts(t *testing.T) {
+	server := newTestServer(t)
+	source, err := server.importReader("home", "mihomo_profile", "file:home.yaml", strings.NewReader("proxy-groups:\n  - {name: Main, type: select, proxies: [DIRECT]}\nrules:\n  - MATCH,DIRECT\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := performAuthorized(server, http.MethodGet, "/api/v1/profile-overlay", nil)
+	var initial ProfileOverlayResponse
+	if err := json.Unmarshal(get.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	invalid := "schema-version: 1\nenabled: true\ndns:\n  merge:\n    listen: 127.0.0.1:53\n"
+	body, _ := json.Marshal(ProfileOverlaySaveRequest{YAML: &invalid})
+	request := httptest.NewRequest(http.MethodPut, "http://127.0.0.1:61767/api/v1/profile-overlay", bytes.NewReader(body))
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("If-Match", `"`+initial.Revision+`"`)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), "managed by OpenSurge") {
+		t.Fatalf("protected field status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	conflict := "schema-version: 1\nenabled: true\nproxy-groups:\n  add:\n    - {name: Main, type: select, proxies: [DIRECT]}\n"
+	body, _ = json.Marshal(ProfileOverlaySaveRequest{YAML: &conflict})
+	request = httptest.NewRequest(http.MethodPut, "http://127.0.0.1:61767/api/v1/profile-overlay", bytes.NewReader(body))
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("If-Match", `"`+initial.Revision+`"`)
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("conflicting overlay draft status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	preview := performAuthorized(server, http.MethodGet, "/api/v1/sources/"+source.ID+"/preview", nil)
+	if preview.Code != http.StatusUnprocessableEntity || !strings.Contains(preview.Body.String(), "conflicts with imported proxy-groups") {
+		t.Fatalf("conflicting preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	applyRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:61767/api/v1/sources/"+source.ID+"/apply", nil)
+	applyRequest.Host = "127.0.0.1:61767"
+	applyRequest.SetPathValue("id", source.ID)
+	applyRequest.Header.Set("Authorization", "Bearer "+server.token)
+	applyRequest.Header.Set("If-Match", `"`+fileDigest(server.configPath)+`"`)
+	apply := httptest.NewRecorder()
+	server.Handler().ServeHTTP(apply, applyRequest)
+	if apply.Code != http.StatusUnprocessableEntity || !strings.Contains(apply.Body.String(), "profile_overlay_incompatible") {
+		t.Fatalf("conflicting apply status=%d body=%s", apply.Code, apply.Body.String())
 	}
 }
 
@@ -932,6 +1712,68 @@ func TestGatewayReloadPreservesActiveTakeoverStage(t *testing.T) {
 	}
 }
 
+func TestGatewayStartUsesAuthoritativeWorkspaceWithoutPolicyVisit(t *testing.T) {
+	server := newTestServer(t)
+	if err := server.store.SaveRecovery(RecoveryState{Stage: RecoveryRouterDHCPDisabledConfirmed, Required: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.store.SaveProfileOverlay([]byte(policyWorkspaceOverlayFixture)); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingActionRunner{}
+	server.runner = runner
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:61767/api/v1/gateway/start", nil)
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("Idempotency-Key", "overlay-only-direct-start")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("start status=%d body=%s", response.Code, response.Body.String())
+	}
+	waitForStoredOperation(t, server, "overlay-only-direct-start", "succeeded")
+	if runner.action != "start" || runner.count != 1 || runner.workspace == nil {
+		t.Fatalf("runner action=%q count=%d workspace=%#v", runner.action, runner.count, runner.workspace)
+	}
+	if runner.workspace.Request.Action != "read" || runner.workspace.ExpectedGatewayState != policyWorkspaceGatewayStopped || len(runner.workspace.Source) != 0 || string(runner.workspace.Overlay) != policyWorkspaceOverlayFixture {
+		t.Fatalf("start did not receive server-authoritative overlay-only workspace: %#v", runner.workspace)
+	}
+	if runner.workspace.Revision != fileDigest(server.configPath) {
+		t.Fatalf("workspace revision=%q, want current %q", runner.workspace.Revision, fileDigest(server.configPath))
+	}
+}
+
+func TestGatewayStartRejectsSnapshotCapturedWhileAlreadyRunning(t *testing.T) {
+	server := newTestServer(t)
+	if err := server.store.SaveRecovery(RecoveryState{Stage: RecoveryRouterDHCPDisabledConfirmed, Required: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadRuntime(server.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(runtime.NewPaths(cfg).StateFile, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingActionRunner{}
+	server.runner = runner
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:61767/api/v1/gateway/start", nil)
+	request.Host = "127.0.0.1:61767"
+	request.Header.Set("Authorization", "Bearer "+server.token)
+	request.Header.Set("Idempotency-Key", "reject-running-start")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "gateway_already_running") {
+		t.Fatalf("running start status=%d body=%s", response.Code, response.Body.String())
+	}
+	if runner.count != 0 || runner.workspace != nil {
+		t.Fatalf("running gateway dispatched another start: %#v", runner)
+	}
+	if _, err := server.store.Operation("reject-running-start"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected running start created an operation: %v", err)
+	}
+}
+
 func TestGatewayRestartMihomoPreservesActiveTakeoverStage(t *testing.T) {
 	server := newTestServer(t)
 	cfg, err := config.LoadRuntime(server.configPath)
@@ -975,6 +1817,35 @@ func TestGatewayRestartMihomoRejectsMissingRuntimeState(t *testing.T) {
 	server := newTestServer(t)
 	response := performAuthorized(server, http.MethodPost, "/api/v1/gateway/restart-mihomo", nil)
 	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "gateway_not_running") {
+		t.Fatalf("restart-mihomo status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestGatewayLifecycleActionRejectsConcurrentOperation(t *testing.T) {
+	server := newTestServer(t)
+	server.lifecycleMu.Lock()
+	response := performAuthorized(server, http.MethodPost, "/api/v1/gateway/stop", nil)
+	server.lifecycleMu.Unlock()
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "operation_in_progress") {
+		t.Fatalf("concurrent lifecycle status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestGatewayRestartMihomoRejectsPreviousBootRuntime(t *testing.T) {
+	server := newTestServer(t)
+	cfg, err := config.LoadRuntime(server.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := runtime.NewPaths(cfg)
+	if err := runtime.Ensure(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SaveState(paths.StateFile, runtime.State{PIDMihomo: os.Getpid(), BootSessionID: "previous-boot", StartedAt: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	response := performAuthorized(server, http.MethodPost, "/api/v1/gateway/restart-mihomo", nil)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "runtime_interrupted") {
 		t.Fatalf("restart-mihomo status=%d body=%s", response.Code, response.Body.String())
 	}
 }
@@ -1100,13 +1971,246 @@ func TestControlConfigShowsMihomoDNSForLegacyEmptyUpstream(t *testing.T) {
 	}
 }
 
+func TestControlConfigRoundTripsFakeIPPersistence(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+	cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := controlConfigFrom(cfg, fileDigest(path))
+	if input.Mihomo.StoreFakeIP == nil || !*input.Mihomo.StoreFakeIP {
+		t.Fatalf("control config store_fake_ip = %v", input.Mihomo.StoreFakeIP)
+	}
+	disabled := false
+	input.Mihomo.StoreFakeIP = &disabled
+	payload, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyControlConfig(path, input.Revision, payload); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Mihomo.StoreFakeIP {
+		t.Fatal("fake-IP persistence remained enabled after control config update")
+	}
+}
+
+func TestControlConfigLegacyPayloadPreservesFakeIPPersistence(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+	cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := controlConfigFrom(cfg, fileDigest(path))
+	input.Mihomo.StoreFakeIP = nil
+	payload, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyControlConfig(path, input.Revision, payload); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Mihomo.StoreFakeIP {
+		t.Fatal("legacy control config payload disabled fake-IP persistence")
+	}
+}
+
+func TestControlConfigRoundTripsLocalSystemProxyCompatibilityMode(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.LocalSystemProxy.Enabled = true
+	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+	cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := controlConfigFrom(cfg, fileDigest(path))
+	if !input.LocalSystemProxy.Enabled {
+		t.Fatal("control config did not expose enabled local system proxy coordination")
+	}
+	input.LocalSystemProxy.Enabled = false
+	payload, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyControlConfig(path, input.Revision, payload); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.LocalSystemProxy.Enabled {
+		t.Fatal("local system proxy coordination remained enabled after control config update")
+	}
+}
+
+func TestControlConfigRoundTripsIPv6Controls(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+	cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := controlConfigFrom(cfg, fileDigest(path))
+	input.DNS.IPv6 = true
+	input.Transparent.TUNIPv6 = config.TUNIPv6Always
+	input.Transparent.IPv6SharedL2Ready = true
+	payload, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyControlConfig(path, input.Revision, payload); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.DNS.IPv6 || updated.Transparent.TUNIPv6 != config.TUNIPv6Always || !updated.Transparent.IPv6SharedL2Ready {
+		t.Fatalf("IPv6 controls were not persisted: DNS=%v takeover=%q sharedL2=%v", updated.DNS.IPv6, updated.Transparent.TUNIPv6, updated.Transparent.IPv6SharedL2Ready)
+	}
+}
+
+func TestControlConfigIPv6SaveWithTailscaleDeviceAccess(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		allowAll      bool
+		disablePolicy bool
+	}{
+		{name: "all registered devices", allowAll: true},
+		{name: "selected device"},
+		{name: "legacy disable flag cannot turn policy off", allowAll: true, disablePolicy: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := config.Default()
+			cfg.Gateway.Mode = config.GatewayModeSameWiFiDHCP
+			cfg.Transparent.Mode = config.TransparentModeTUN
+			cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+			cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+			cfg.DevicePolicy.File = filepath.Join(dir, "device-policy.json")
+			cfg.DevicePolicy.ProtectedIPv4 = []string{"192.168.50.2"}
+			policy, err := json.Marshal(device.PolicySet{
+				Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+				Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(cfg.DevicePolicy.File, policy, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg.Tailscale.Enabled = true
+			cfg.Tailscale.AuthKeyFile = filepath.Join(dir, "tailscale-auth-key")
+			cfg.Tailscale.StateDir = filepath.Join(dir, "tailscale-state")
+			cfg.Tailscale.AcceptRoutes = true
+			cfg.Tailscale.SubnetRoutes = []string{"fd7a:115c:a1e0:b1a:0:2a:cb00:7107/128"}
+			cfg.Tailscale.ExitNode = "100.82.10.7"
+			cfg.Tailscale.AllowAllDevices = tt.allowAll
+			if !tt.allowAll {
+				cfg.Tailscale.AllowedDevices = []string{"phone"}
+			}
+			path := filepath.Join(dir, "config.yaml")
+			originalConfig := []byte(config.Render(cfg))
+			if err := os.WriteFile(path, originalConfig, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err = config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := controlConfigFrom(cfg, fileDigest(path))
+			input.DNS.IPv6 = true
+			input.DevicePolicy.Enabled = !tt.disablePolicy
+			payload, err := json.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := applyControlConfig(path, input.Revision, payload); err != nil {
+				t.Fatal(err)
+			}
+			updated, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !updated.DNS.IPv6 || updated.Transparent != cfg.Transparent {
+				t.Fatalf("AAAA save changed unexpected IPv6 controls: DNS=%v transparent=%#v", updated.DNS.IPv6, updated.Transparent)
+			}
+			if !reflect.DeepEqual(updated.Tailscale, cfg.Tailscale) || updated.DevicePolicy.File != cfg.DevicePolicy.File || !reflect.DeepEqual(updated.DevicePolicy.ProtectedIPv4, cfg.DevicePolicy.ProtectedIPv4) {
+				t.Fatal("network save changed Tailscale or device-policy settings")
+			}
+			updatedPolicy, err := os.ReadFile(cfg.DevicePolicy.File)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(updatedPolicy, policy) {
+				t.Fatal("network configuration save changed the device-policy document")
+			}
+		})
+	}
+}
+
+func TestControlConfigAcceptsLegacyPayloadWithoutIPv6TakeoverMode(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+	cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	input := controlConfigFrom(cfg, fileDigest(path))
+	input.Transparent.TUNIPv6 = ""
+	payload, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyControlConfig(path, input.Revision, payload); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Transparent.TUNIPv6 != config.TUNIPv6Off {
+		t.Fatalf("legacy payload takeover mode = %q", updated.Transparent.TUNIPv6)
+	}
+}
+
 func TestStateEventCarriesConfigGatewayAndRecoveryState(t *testing.T) {
 	server := newTestServer(t)
+	runner := &fakeSleepPreventionRunner{}
+	server.sleepPrevention = newSleepPreventionController(runner, server.configPath)
+	if _, err := server.sleepPrevention.SetEnabled(t.Context(), true); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.sleepPrevention.Close() })
 	state, err := server.stateEvent(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Revision == "" || state.Gateway == "" || state.Recovery.Stage != RecoveryIdle {
+	if state.Revision == "" || state.Gateway == "" || state.Recovery.Stage != RecoveryIdle || !state.SleepPrevention.Active {
 		t.Fatalf("state event = %#v", state)
 	}
 }
@@ -1131,7 +2235,7 @@ func TestClientAcceptanceRequiresLeaseDNSAndTUNEvidence(t *testing.T) {
 	if err := os.WriteFile(paths.MihomoLog, []byte("[TCP] 192.168.1.121:50000 --> example.com:443 using DIRECT\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := server.store.SaveRecovery(RecoveryState{Stage: RecoveryGatewayActive, Required: true}); err != nil {
+	if err := server.store.SaveRecovery(RecoveryState{Stage: RecoveryGatewayActive, Required: true, NetworkSnapshot: &macosnetwork.Snapshot{IPv6Default: true, IPv6DefaultSelfOnly: true}}); err != nil {
 		t.Fatal(err)
 	}
 	response := performAuthorized(server, http.MethodPost, "/api/v1/recovery/client-validated", []byte(`{"client_ipv4":"192.168.1.121","gateway_dns_confirmed":true,"no_explicit_proxy_confirmed":true,"ipv6_bypass_warning_confirmed":false}`))
@@ -1141,6 +2245,14 @@ func TestClientAcceptanceRequiresLeaseDNSAndTUNEvidence(t *testing.T) {
 	state, _ := server.store.Recovery()
 	if state.Stage != RecoveryClientValidated {
 		t.Fatalf("state=%#v", state)
+	}
+
+	if err := server.store.SaveRecovery(RecoveryState{Stage: RecoveryGatewayActive, Required: true, NetworkSnapshot: &macosnetwork.Snapshot{IPv6Default: true}}); err != nil {
+		t.Fatal(err)
+	}
+	response = performAuthorized(server, http.MethodPost, "/api/v1/recovery/client-validated", []byte(`{"client_ipv4":"192.168.1.121","gateway_dns_confirmed":true,"no_explicit_proxy_confirmed":true,"ipv6_bypass_warning_confirmed":false}`))
+	if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), "ipv6_warning_unacknowledged") {
+		t.Fatalf("unacknowledged competing IPv6 status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -1166,7 +2278,7 @@ func TestClientAcceptanceCanBeExplicitlySkipped(t *testing.T) {
 	}
 }
 
-func TestControlConfigCanInitializeDevicePolicyFile(t *testing.T) {
+func TestControlConfigAlwaysInitializesDevicePolicyFile(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.Default()
 	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
@@ -1176,7 +2288,7 @@ func TestControlConfigCanInitializeDevicePolicyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := controlConfigFrom(cfg, fileDigest(path))
-	input.DevicePolicy.Enabled = true
+	input.DevicePolicy.Enabled = false // Legacy clients cannot disable the default.
 	payload, _ := json.Marshal(input)
 	if _, err := applyControlConfig(path, input.Revision, payload); err != nil {
 		t.Fatal(err)
@@ -1190,6 +2302,51 @@ func TestControlConfigCanInitializeDevicePolicyFile(t *testing.T) {
 	}
 	if _, err := os.Stat(updated.DevicePolicy.File); err != nil {
 		t.Fatal(err)
+	}
+	if !controlConfigFrom(updated, fileDigest(path)).DevicePolicy.Enabled {
+		t.Fatal("saved control config still reports device policy disabled")
+	}
+}
+
+func TestControlConfigPreservesExistingDefaultPolicy(t *testing.T) {
+	for _, rejectSave := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reject=%v", rejectSave), func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := config.Default()
+			cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+			path := filepath.Join(dir, "config.yaml")
+			original := []byte(config.Render(cfg))
+			if err := os.WriteFile(path, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			policyPath := filepath.Join(dir, "data", "device-policy.json")
+			if _, err := device.CreateEmptyPolicyFile(policyPath); err != nil {
+				t.Fatal(err)
+			}
+			saved := []byte(`{"devices":[],"profiles":[{"id":"saved","default_policies":["DIRECT"]}],"templates":[],"rule_sets":[]}`)
+			if err := os.WriteFile(policyPath, saved, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			input := controlConfigFrom(cfg, fileDigest(path))
+			if rejectSave {
+				input.Gateway.LANPrefixLen = 31
+			}
+			payload, _ := json.Marshal(input)
+			_, err := applyControlConfig(path, input.Revision, payload)
+			if (err != nil) != rejectSave {
+				t.Fatalf("save error=%v, reject=%v", err, rejectSave)
+			}
+			actual, err := os.ReadFile(policyPath)
+			if err != nil || !bytes.Equal(actual, saved) {
+				t.Fatalf("existing policy changed: %s, %v", actual, err)
+			}
+			if rejectSave {
+				actual, _ := os.ReadFile(path)
+				if !bytes.Equal(actual, original) {
+					t.Fatal("rejected save changed the config")
+				}
+			}
+		})
 	}
 }
 
@@ -1366,6 +2523,73 @@ func TestSameLANDevicesEndpointListsSourcesCurrentlyPassingThroughMac(t *testing
 	}
 }
 
+func TestDevicesEndpointKeepsOutOfLANRegistrationDormant(t *testing.T) {
+	server := newTestServer(t)
+	cfg, err := config.LoadRuntime(server.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := device.PolicySet{
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{"DIRECT"}}},
+		Devices: []device.ManagedDevice{
+			{ID: "active", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.1.101", Profile: "home", EgressMode: device.EgressModeDedicated},
+			{ID: "dormant", MAC: "aa:bb:cc:dd:ee:02", IPv4: "192.168.60.101", Profile: "home", EgressMode: device.EgressModeDedicated},
+		},
+	}
+	data, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.DevicePolicy.File, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := cfg.LANScope()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := device.CompilePolicyBundleForLAN(policy, scope, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := runtime.NewPaths(cfg)
+	if err := device.WritePolicyBundleSnapshot(paths.DevicePolicyApplied, bundle); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SaveState(paths.StateFile, runtime.State{DevicePolicyDigest: bundle.Digest}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := performAuthorized(server, http.MethodGet, "/api/v1/devices", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("devices status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload DevicesResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.LANPrefix != "192.168.1.0/24" || len(payload.OutOfLANDevices) != 1 || payload.OutOfLANDevices[0] != "dormant" {
+		t.Fatalf("LAN state = %#v", payload)
+	}
+	if len(payload.DesiredDevices) != 1 || payload.DesiredDevices[0].ID != "active" || len(payload.AppliedDevices) != 1 || payload.AppliedDevices[0].ID != "active" || len(payload.Devices) != 1 || payload.Devices[0].ID != "active" {
+		t.Fatalf("runtime devices = %#v", payload)
+	}
+}
+
+func TestAnnotateCompiledDeviceIPv6BlockState(t *testing.T) {
+	devices := []device.CompiledDevice{
+		{ID: "console", GatewayTarget: device.GatewayTargetUpstreamRouter},
+		{ID: "phone", GatewayTarget: device.GatewayTargetOpenSurge},
+	}
+	annotateCompiledDeviceIPv6BlockState(devices, true)
+	if !devices[0].IPv6Blocked || devices[1].IPv6Blocked {
+		t.Fatalf("compiled device IPv6 state = %#v", devices)
+	}
+	annotateCompiledDeviceIPv6BlockState(devices, false)
+	if devices[0].IPv6Blocked {
+		t.Fatalf("disabled downstream IPv6 still reported blocked = %#v", devices)
+	}
+}
+
 func newTestServer(t *testing.T) *Server {
 	server, _ := newTestServerWithNetwork(t)
 	return server
@@ -1374,6 +2598,7 @@ func newTestServer(t *testing.T) *Server {
 func newTestServerWithNetwork(t *testing.T) (*Server, *fakeNetworkRunner) {
 	t.Helper()
 	dir := t.TempDir()
+	mihomoAPI := newReadyMihomoTestServer(t)
 	configPath := filepath.Join(dir, "config.yaml")
 	policyPath := filepath.Join(dir, "device-policy.json")
 	if err := os.WriteFile(policyPath, []byte(`{"devices":[],"profiles":[],"templates":[],"rule_sets":[]}`), 0o600); err != nil {
@@ -1392,6 +2617,8 @@ device_policy:
   file: "`+policyPath+`"
 transparent:
   mode: "tun"
+mihomo:
+  api_addr: "`+mihomoAPI.URL+`"
 runtime:
   dir: "`+filepath.Join(dir, "runtime")+`"
 `), 0o600); err != nil {
@@ -1406,8 +2633,10 @@ runtime:
 		return macosnetwork.Snapshot{NetworkService: "Wi-Fi", Interface: "en0", IPv4Mode: mode, IPv4: "192.168.1.20", SubnetMask: "255.255.255.0", Router: "192.168.1.1", DNS: []string{"192.168.1.1"}}, nil
 	}
 	server, err := New(Options{ConfigPath: configPath, Addr: "127.0.0.1:61767", StoreDir: filepath.Join(dir, "store"), Runner: fakeRunner{}, NetworkRunner: network, ConfigRunner: fakeConfigurationRunner{}, DiscoverNetwork: discover, ListInterfaces: func(context.Context) ([]macosnetwork.InterfaceOption, error) {
-		return []macosnetwork.InterfaceOption{{Interface: "en0", NetworkService: "Wi-Fi"}, {Interface: "en7", NetworkService: "USB LAN"}}, nil
-	}, DiscoverNeighbors: func(context.Context, string) ([]macosnetwork.Neighbor, error) { return []macosnetwork.Neighbor{}, nil }, PingRouter: func(context.Context, string) error { return nil }, Static: http.NotFoundHandler(), Credentials: &memoryCredentialStore{}})
+		return []macosnetwork.InterfaceOption{{Interface: "en0", NetworkService: "Wi-Fi", IPv6LinkLocal: "fe80::100"}, {Interface: "en7", NetworkService: "USB LAN", IPv6LinkLocal: "fe80::700"}}, nil
+	}, DiscoverNeighbors: func(context.Context, string) ([]macosnetwork.Neighbor, error) { return []macosnetwork.Neighbor{}, nil }, DiscoverTailscale: func(context.Context) (TailscaleDiscoveryResponse, error) {
+		return TailscaleDiscoveryResponse{}, errors.New("Tailscale unavailable in test")
+	}, PingRouter: func(context.Context, string) error { return nil }, Static: http.NotFoundHandler(), Credentials: &memoryCredentialStore{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1415,13 +2644,36 @@ runtime:
 	return server, network
 }
 
+func newReadyMihomoTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/version":
+			_, _ = w.Write([]byte(`{"version":"test","meta":true}`))
+		case "/configs":
+			_, _ = w.Write([]byte(`{"tun":{"enable":true,"device":"utun-test"}}`))
+		case "/proxies", "/providers/proxies", "/providers/rules":
+			_, _ = w.Write([]byte(`{"proxies":{},"providers":{}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
 type fakeRunner struct{}
 
 func (fakeRunner) Run(_ context.Context, _, _ string) error { return nil }
+func (fakeRunner) StartPolicyWorkspace(_ context.Context, _ string, _ PolicyWorkspaceInput) error {
+	return nil
+}
 
 type recordingActionRunner struct {
-	action string
-	count  int
+	action    string
+	count     int
+	workspace *PolicyWorkspaceInput
 }
 
 func (r *recordingActionRunner) Run(_ context.Context, action, _ string) error {
@@ -1430,10 +2682,21 @@ func (r *recordingActionRunner) Run(_ context.Context, action, _ string) error {
 	return nil
 }
 
+func (r *recordingActionRunner) StartPolicyWorkspace(_ context.Context, _ string, input PolicyWorkspaceInput) error {
+	r.action = "start"
+	r.count++
+	r.workspace = &input
+	return nil
+}
+
 type actionRunnerFunc func(context.Context, string, string) error
 
 func (f actionRunnerFunc) Run(ctx context.Context, action, configPath string) error {
 	return f(ctx, action, configPath)
+}
+
+func (f actionRunnerFunc) StartPolicyWorkspace(ctx context.Context, configPath string, _ PolicyWorkspaceInput) error {
+	return f(ctx, "start", configPath)
 }
 
 func waitForStoredOperation(t *testing.T, server *Server, id, state string) Operation {
@@ -1456,7 +2719,31 @@ type fakeConfigurationRunner struct {
 	profileReloaded bool
 }
 
-func (f fakeConfigurationRunner) ApplyProfile(_ context.Context, _, revision string, _ []byte) (ProfileApplyResult, error) {
+type recordingConfigurationRunner struct {
+	fakeConfigurationRunner
+	profilePayload []byte
+	sourceDigest   string
+	overlayDigest  string
+}
+
+type recordingTailscaleConfigurationRunner struct {
+	fakeConfigurationRunner
+	called bool
+}
+
+func (f *recordingTailscaleConfigurationRunner) ApplyTailscale(_ context.Context, _, revision string, _ []byte) (ProfileApplyResult, error) {
+	f.called = true
+	return ProfileApplyResult{Revision: revision + "-tailscale", Reloaded: true}, nil
+}
+
+func (f *recordingConfigurationRunner) ApplyProfile(_ context.Context, _, revision string, payload []byte, sourceDigest, overlayDigest string) (ProfileApplyResult, error) {
+	f.profilePayload = append([]byte(nil), payload...)
+	f.sourceDigest = sourceDigest
+	f.overlayDigest = overlayDigest
+	return ProfileApplyResult{Revision: revision + "-applied"}, nil
+}
+
+func (f fakeConfigurationRunner) ApplyProfile(_ context.Context, _, revision string, _ []byte, _, _ string) (ProfileApplyResult, error) {
 	if f.profileErr != nil {
 		return ProfileApplyResult{}, f.profileErr
 	}
@@ -1474,6 +2761,14 @@ func (fakeConfigurationRunner) ApplyDevicePolicy(_ context.Context, _, _ string,
 
 func (fakeConfigurationRunner) ApplyControlConfig(_ context.Context, path, revision string, payload []byte) (string, error) {
 	return applyControlConfig(path, revision, payload)
+}
+
+func (fakeConfigurationRunner) ApplyTailscale(_ context.Context, _, revision string, _ []byte) (ProfileApplyResult, error) {
+	return ProfileApplyResult{Revision: revision + "-tailscale"}, nil
+}
+
+func (fakeConfigurationRunner) ForgetTailscaleIdentity(_ context.Context, _, revision string) (string, error) {
+	return revision, nil
 }
 
 type fakeNetworkRunner struct {

@@ -7,18 +7,18 @@ places this notice and the referenced license texts under
 
 ## mihomo
 
-- Version: `1.19.27`
+- Upstream base version: `1.19.30`
+- Distributed OpenSurge build version: `1.19.30-opensurge.1`
 - License: `GPL-3.0-only`
-- Distributed forms (each architecture-specific installer contains the matching binary):
-  - Apple Silicon: unmodified upstream `mihomo-darwin-arm64-v1.19.27.gz`
-    - Binary SHA-256:
-      `3617c9d8a5a55aecfe1ebd0f55ff59f2706c8ad68fd65c6c4e5f7cf2b74263f1`
-  - Intel: unmodified upstream `mihomo-darwin-amd64-compatible-v1.19.27.gz`
-    - Binary SHA-256:
-      `ddfafe6993e0adf97420d126d5ce7868113174630ccbf36d4a1bee2784085172`
+- Distributed form: architecture-specific binaries compiled from the pinned
+  upstream source with the OpenSurge packet-listener patch stored under
+  `patches/mihomo`. The listener reuses mihomo's existing gVisor/sing-tun data
+  plane for the OpenSurge downstream IPv6 packet broker.
+- Source archive SHA-256:
+  `971dd4533e4e2c3dad7473e8115200da8c0d7471b4b61da54da896345c5b3850`
 - Upstream: <https://github.com/MetaCubeX/mihomo>
 - Corresponding source:
-  <https://github.com/MetaCubeX/mihomo/tree/5184081ac327394d9e15fa5d5f9f4a61e723fd94>
+  <https://github.com/MetaCubeX/mihomo/tree/ac017cdd246ce8bd547653d927e7bf77d7ee73d5>
 - License text: [`LICENSE`](LICENSE)
 
 ## dnsmasq
@@ -41,6 +41,14 @@ places this notice and the referenced license texts under
 - Upstream: <https://github.com/go-yaml/yaml/tree/v3.0.1>
 - License texts: [`third_party/licenses/yaml-v3-LICENSE`](third_party/licenses/yaml-v3-LICENSE)
   and [`third_party/licenses/Apache-2.0.txt`](third_party/licenses/Apache-2.0.txt)
+
+## github.com/metacubex/bbolt
+
+- Version: `v0.0.0-20260706163408-d4ec34ad7c48`, matching the pinned Mihomo cache implementation
+- Use: read-only recovery of device selector choices from the core's cache
+- License: MIT
+- Upstream: <https://github.com/metacubex/bbolt/tree/d4ec34ad7c48>
+- License text: [`third_party/licenses/bbolt-MIT.txt`](third_party/licenses/bbolt-MIT.txt)
 
 ## React, React DOM, and scheduler
 

@@ -8,6 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 	"open-mihomo-gateway/internal/config"
+	"open-mihomo-gateway/internal/device"
 )
 
 func TestRenderConfig(t *testing.T) {
@@ -22,26 +23,43 @@ func TestRenderConfig(t *testing.T) {
 		"external-controller: 127.0.0.1:9090",
 		"profile:",
 		"  store-selected: true",
+		"  store-fake-ip: true",
 		"geox-url:",
 		"https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb",
 		"enhanced-mode: fake-ip",
+		`name: "open-surge/mac-mode-tcp"`,
+		`name: "open-surge/mac-mode-udp"`,
+		`- "PASS"`,
+		"hidden: true",
 		"- MATCH,DIRECT",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("rendered config missing %q:\n%s", want, rendered)
 		}
 	}
-	if strings.Contains(rendered, "proxy-groups:") {
-		t.Fatalf("rendered config contains an unnecessary DIRECT proxy group:\n%s", rendered)
-	}
 	if strings.Contains(rendered, "open-surge-egress") {
 		t.Fatalf("rendered config enables upstream proxy by default:\n%s", rendered)
+	}
+	if strings.Contains(rendered, LocalRoutingGlobalGroup) {
+		t.Fatalf("rendered config exposes global mode without a proxy candidate:\n%s", rendered)
 	}
 	if strings.Contains(rendered, "redir-port:") {
 		t.Fatalf("rendered config enables redir-port by default:\n%s", rendered)
 	}
 	if strings.Contains(rendered, "tun:") {
 		t.Fatalf("rendered config enables tun by default:\n%s", rendered)
+	}
+}
+
+func TestRenderConfigCanDisableFakeIPPersistence(t *testing.T) {
+	cfg := config.Default()
+	cfg.Mihomo.StoreFakeIP = false
+	rendered, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatalf("RenderConfig() error = %v", err)
+	}
+	if !strings.Contains(rendered, "  store-fake-ip: false") {
+		t.Fatalf("rendered config did not disable fake-IP persistence:\n%s", rendered)
 	}
 }
 
@@ -79,6 +97,137 @@ func TestRenderConfigWithUpstreamProxy(t *testing.T) {
 	}
 	if strings.Contains(rendered, "18080proxy-groups") {
 		t.Fatalf("rendered config glues port and proxy group:\n%s", rendered)
+	}
+}
+
+func TestRenderConfigWithManagedTailscaleTargetsAndExitNode(t *testing.T) {
+	dir := t.TempDir()
+	authKeyPath := filepath.Join(dir, "tailscale-auth-key")
+	if err := os.WriteFile(authKeyPath, []byte("tskey-auth-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := device.CompilePolicyBundle(device.PolicySet{
+		Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home", EgressMode: device.EgressModeDedicated}},
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{config.TailscaleProxyName}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.DevicePolicy.Bundle = &bundle
+	cfg.Tailscale = config.TailscaleConfig{
+		Enabled:                true,
+		DisplayName:            "Home Tailnet",
+		Hostname:               "opensurge-home",
+		ControlURL:             "https://controlplane.tailscale.com",
+		AuthKeyFile:            authKeyPath,
+		StateDir:               filepath.Join(dir, "tailscale-state"),
+		AcceptRoutes:           true,
+		MagicDNSSuffixes:       []string{"home.example.ts.net"},
+		PeerCIDRs:              []string{"100.82.10.7/32"},
+		SubnetRoutes:           []string{"10.20.0.0/16"},
+		AllowMac:               true,
+		AllowedDevices:         []string{"phone"},
+		ExitNode:               "100.90.3.4",
+		ExitNodeAllowLANAccess: true,
+	}
+	rendered, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`name: "open-surge/tailscale"`,
+		`name: open-surge/tailscale-exit`,
+		`- "open-surge/tailscale"`,
+		`- "open-surge/tailscale-exit"`,
+		"type: tailscale",
+		`auth-key: "tskey-auth-secret"`,
+		`state-dir: "` + cfg.Tailscale.StateDir + `"`,
+		`exit-node: "100.90.3.4"`,
+		"exit-node-allow-lan-access: true",
+		"route-address:",
+		"    - 100.82.10.7/32\n    - 10.20.0.0/16",
+		"AND,((IN-TYPE,TUN),(SRC-IP-CIDR,198.18.0.1/32),(DOMAIN-SUFFIX,home.example.ts.net)),open-surge/tailscale",
+		"AND,((SRC-IP-CIDR,192.168.50.101/32),(IP-CIDR,10.20.0.0/16)),open-surge/tailscale",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered Tailscale config missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "route-exclude-address:") {
+		t.Fatalf("custom Tailscale routes must pre-apply exclusions so exact peer routes stay distinct:\n%s", rendered)
+	}
+	assertOrdered(t, rendered,
+		"AND,((SRC-IP-CIDR,192.168.50.101/32),(IP-CIDR,10.20.0.0/16)),open-surge/tailscale",
+		"IP-CIDR,10.20.0.0/16,REJECT",
+		"AND,((SRC-IP-CIDR,192.168.50.101/32),(IP-CIDR,10.0.0.0/8)),DIRECT",
+	)
+}
+
+func TestRenderConfigFallsBackWhenTailscaleExitNodeWasRemoved(t *testing.T) {
+	bundle, err := device.CompilePolicyBundle(device.PolicySet{
+		Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home", EgressMode: device.EgressModeDedicated}},
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{config.TailscaleProxyName}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.DevicePolicy.Bundle = &bundle
+
+	rendered, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered, "device/phone/default") || strings.Contains(rendered, config.TailscaleProxyName) {
+		t.Fatalf("removed Tailscale exit still emitted: %s", rendered)
+	}
+}
+
+func TestRenderConfigAcceptsFirstClassTailscaleExitGroup(t *testing.T) {
+	bundle, err := device.CompilePolicyBundle(device.PolicySet{
+		Devices:  []device.ManagedDevice{{ID: "phone", MAC: "aa:bb:cc:dd:ee:01", IPv4: "192.168.50.101", Profile: "home", EgressMode: device.EgressModeDedicated}},
+		Profiles: []device.Profile{{ID: "home", DefaultPolicies: []string{config.TailscaleExitGroupName}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	authKeyPath := filepath.Join(dir, "tailscale-auth-key")
+	if err := os.WriteFile(authKeyPath, []byte("tskey-auth-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.DevicePolicy.Bundle = &bundle
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.ExitNode = "100.90.3.4"
+	cfg.Tailscale.AuthKeyFile = authKeyPath
+	cfg.Tailscale.StateDir = filepath.Join(dir, "tailscale-state")
+	if _, err := RenderConfig(cfg); err != nil {
+		t.Fatalf("RenderConfig() rejected the Tailscale Exit Node group: %v", err)
+	}
+}
+
+func TestRenderConfigUsesPersistedTailscaleIdentityWithoutAuthKey(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "tailscale-state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "tailscaled.state"), []byte("state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Tailscale.Enabled = true
+	cfg.Tailscale.AuthKeyFile = filepath.Join(dir, "missing-auth-key")
+	cfg.Tailscale.StateDir = stateDir
+	rendered, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered, "auth-key:") {
+		t.Fatalf("persisted identity should not require an auth key:\n%s", rendered)
 	}
 }
 
@@ -175,6 +324,69 @@ tun:
 	} {
 		if strings.Contains(rendered, notWant) {
 			t.Fatalf("rendered config kept unwanted profile/default value %q:\n%s", notWant, rendered)
+		}
+	}
+}
+
+func TestRenderConfigAddsManagedTailscaleToImportedProfile(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "profile.yaml")
+	authKeyPath := filepath.Join(dir, "tailscale-auth-key")
+	if err := os.WriteFile(profilePath, []byte("proxies: []\nrules:\n  - MATCH,DIRECT\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authKeyPath, []byte("tskey-auth-imported\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Mihomo.ProfileMode = config.MihomoProfileModeImported
+	cfg.Mihomo.Profile = profilePath
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.Tailscale = config.TailscaleConfig{
+		Enabled:          true,
+		DisplayName:      "Home Tailnet",
+		Hostname:         "opensurge-home",
+		ControlURL:       "https://controlplane.tailscale.com",
+		AuthKeyFile:      authKeyPath,
+		StateDir:         filepath.Join(dir, "tailscale-state"),
+		MagicDNSSuffixes: []string{"home.example.ts.net"},
+		AllowMac:         true,
+	}
+
+	rendered, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`name: "open-surge/tailscale"`,
+		"type: tailscale",
+		`auth-key: "tskey-auth-imported"`,
+		"AND,((IN-TYPE,TUN),(SRC-IP-CIDR,198.18.0.1/32),(DOMAIN-SUFFIX,home.example.ts.net)),open-surge/tailscale",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("imported Tailscale config missing %q:\n%s", want, rendered)
+		}
+	}
+	assertOrdered(t, rendered,
+		"AND,((IN-TYPE,TUN),(SRC-IP-CIDR,198.18.0.1/32),(DOMAIN-SUFFIX,home.example.ts.net)),open-surge/tailscale",
+		"MATCH,DIRECT",
+	)
+	if strings.Contains(rendered, config.TailscaleExitGroupName) {
+		t.Fatalf("Tailnet-only imported profile unexpectedly contains an Exit Node group:\n%s", rendered)
+	}
+
+	cfg.Tailscale.ExitNode = "100.90.3.4"
+	rendered, err = RenderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"name: " + config.TailscaleExitGroupName,
+		`- "` + config.TailscaleProxyName + `"`,
+		`- "` + config.TailscaleExitGroupName + `"`,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("imported Tailscale Exit Node config missing %q:\n%s", want, rendered)
 		}
 	}
 }
@@ -512,8 +724,8 @@ func TestRenderConfigSupportsIssue7FlowStyleRules(t *testing.T) {
 			t.Fatalf("rendered %s config is invalid YAML: %v\n%s", style, err, rendered)
 		}
 		decodedRules[style] = decoded.Rules
-		if strings.Join(decoded.Rules, "\n") != strings.Join(want, "\n") {
-			t.Fatalf("%s rules = %#v, want %#v", style, decoded.Rules, want)
+		if len(decoded.Rules) < len(want) || strings.Join(decoded.Rules[len(decoded.Rules)-len(want):], "\n") != strings.Join(want, "\n") {
+			t.Fatalf("%s rules do not preserve imported suffix = %#v, want suffix %#v", style, decoded.Rules, want)
 		}
 	}
 	if strings.Join(decodedRules["flow"], "\n") != strings.Join(decodedRules["block"], "\n") {
@@ -565,7 +777,7 @@ rules: ['RULE-SET,imported,Global', 'MATCH,DIRECT']
 	if err := yaml.Unmarshal([]byte(rendered), &decoded); err != nil {
 		t.Fatalf("rendered config is invalid YAML: %v\n%s", err, rendered)
 	}
-	if len(decoded.ProxyGroups) != 3 {
+	if len(decoded.ProxyGroups) != 6 {
 		t.Fatalf("proxy groups = %#v", decoded.ProxyGroups)
 	}
 	if decoded.ProxyGroups[0].Name != "Global" ||
@@ -575,6 +787,18 @@ rules: ['RULE-SET,imported,Global', 'MATCH,DIRECT']
 	}
 	if decoded.RuleProviders["imported"] == nil || decoded.RuleProviders["open-surge-ruleset-streaming"] == nil {
 		t.Fatalf("rule providers = %#v", decoded.RuleProviders)
+	}
+	for _, name := range []string{LocalRoutingGlobalGroup, LocalRoutingTCPGroup, LocalRoutingUDPGroup, "device/phone/default", "device/phone/streaming"} {
+		found := false
+		for _, group := range decoded.ProxyGroups {
+			if group.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("proxy groups missing %q: %#v", name, decoded.ProxyGroups)
+		}
 	}
 	assertOrdered(t, strings.Join(decoded.Rules, "\n"),
 		"RULE-SET,open-surge-ruleset-streaming",
@@ -607,7 +831,7 @@ func TestRenderConfigRejectsImportedRuleAfterTerminalMatchWhenDevicePolicyEnable
 	}
 }
 
-func TestRenderConfigRejectsImportedPolicyNamespaceCollisionsAndUnknownTargets(t *testing.T) {
+func TestRenderConfigRejectsImportedPolicyNamespaceCollisions(t *testing.T) {
 	tests := []struct {
 		name    string
 		profile string
@@ -625,15 +849,6 @@ rules:
 `,
 			policy: `{"profiles":[{"id":"home","default_policies":["DIRECT"]}],"devices":[{"id":"phone","mac":"aa:bb:cc:dd:ee:01","ipv4":"192.168.50.101","profile":"home"}]}`,
 			want:   "occupies reserved device/ namespace",
-		},
-		{
-			name: "unknown policy target",
-			profile: `proxies: []
-rules:
-  - MATCH,DIRECT
-`,
-			policy: `{"profiles":[{"id":"home","default_policies":["Missing"]}],"devices":[{"id":"phone","mac":"aa:bb:cc:dd:ee:01","ipv4":"192.168.50.101","profile":"home"}]}`,
-			want:   "unknown imported proxy or group \"Missing\"",
 		},
 		{
 			name: "generated provider collision",
@@ -668,6 +883,110 @@ rules:
 				t.Fatalf("RenderConfig() error = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestRenderConfigAddsDownstreamIPv6PacketListenerAndDeviceIdentity(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "devices.json")
+	policy := `{"profiles":[{"id":"home","default_policies":["DIRECT"]}],"devices":[{"id":"phone","mac":"aa:bb:cc:dd:ee:01","ipv4":"192.168.50.101","profile":"home","egress_mode":"dedicated"},{"id":"dormant","mac":"aa:bb:cc:dd:ee:02","ipv4":"192.168.60.101","profile":"home","egress_mode":"dedicated"}]}`
+	if err := os.WriteFile(policyPath, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Runtime.Dir = dir
+	cfg.Mihomo.Config = filepath.Join(dir, "mihomo.yaml")
+	cfg.DevicePolicy.File = policyPath
+	cfg.DNS.IPv6 = true
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.Transparent.TUNIPv6 = config.TUNIPv6Always
+	cfg.UpstreamProxy.Enabled = true
+	cfg.UpstreamProxy.Name = "lab-socks"
+	cfg.UpstreamProxy.Type = "socks5"
+	cfg.UpstreamProxy.Server = "127.0.0.1"
+	cfg.UpstreamProxy.Port = 18080
+	cfg.UpstreamProxy.MatchDomain = "example.com"
+	rendered, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"ipv6: true",
+		"fake-ip-range6: " + config.MihomoFakeIPv6Range,
+		"- " + config.MihomoTUNIPv6,
+		"type: opensurge-packet",
+		"name: " + config.IPv6PacketListenerName,
+		`"aa:bb:cc:dd:ee:01": "device:phone"`,
+		"IN-USER,device:phone",
+		"IP-CIDR6," + config.DownstreamIPv6Prefix,
+		"    udp: true",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered IPv6 mihomo config missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "IP-CIDR6,fc00::/7") {
+		t.Fatalf("fake IPv6 ULA would be forced DIRECT:\n%s", rendered)
+	}
+	for _, dormant := range []string{"aa:bb:cc:dd:ee:02", "device:dormant", "192.168.60.101"} {
+		if strings.Contains(rendered, dormant) {
+			t.Fatalf("dormant device leaked into IPv4 or IPv6 mihomo policy as %q:\n%s", dormant, rendered)
+		}
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal([]byte(rendered), &document); err != nil {
+		t.Fatalf("rendered IPv6 config is invalid YAML: %v\n%s", err, rendered)
+	}
+}
+
+func TestRenderConfigRejectsIPv6BeforeRulesForRouterBypassDevice(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "devices.json")
+	policy := `{
+  "profiles": [{"id":"home","default_policies":["DIRECT"],"rules":[{"id":"phone-rule","match":{"domains":["phone.example"]},"action":"DIRECT"}]}],
+  "devices": [
+    {"id":"console","mac":"aa:bb:cc:dd:ee:05","ipv4":"192.168.50.105","profile":"home","gateway_target":"upstream_router","egress_mode":"dedicated"},
+    {"id":"phone","mac":"aa:bb:cc:dd:ee:01","ipv4":"192.168.50.101","profile":"home","egress_mode":"inherit_global"}
+  ]
+}`
+	if err := os.WriteFile(policyPath, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Runtime.Dir = dir
+	cfg.Mihomo.Config = filepath.Join(dir, "mihomo.yaml")
+	cfg.DevicePolicy.File = policyPath
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.Transparent.TUNIPv6 = config.TUNIPv6Always
+
+	rendered, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bypassReject := "AND,((IN-TYPE,TUN),(IN-USER,device:console)),REJECT"
+	phoneRule := "AND,((IN-USER,device:phone),(DOMAIN-SUFFIX,phone.example)),DIRECT"
+	for _, want := range []string{
+		`"aa:bb:cc:dd:ee:05": "device:console"`,
+		`"aa:bb:cc:dd:ee:01": "device:phone"`,
+		bypassReject,
+		phoneRule,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered router-bypass IPv6 config missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "AND,((IN-TYPE,TUN),(IN-USER,device:phone)),REJECT") {
+		t.Fatalf("non-bypass device IPv6 was rejected:\n%s", rendered)
+	}
+	assertOrdered(t, rendered, bypassReject, "IN-TYPE,TUN", phoneRule, "MATCH,DIRECT")
+
+	cfg.Transparent.TUNIPv6 = config.TUNIPv6Off
+	rendered, err = RenderConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered, bypassReject) || strings.Contains(rendered, "type: opensurge-packet") {
+		t.Fatalf("disabled downstream IPv6 emitted packet listener or bypass reject:\n%s", rendered)
 	}
 }
 

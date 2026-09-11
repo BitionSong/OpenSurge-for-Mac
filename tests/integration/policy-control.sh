@@ -7,11 +7,13 @@ cd "$ROOT"
 BASE_DIR="$ROOT/runtime/integration/policy-control"
 WORK_DIR="${OMG_POLICY_CONTROL_WORK_DIR:-$BASE_DIR/run-$$}"
 CONFIG="$WORK_DIR/config.yaml"
+IPV6_CONFIG="$WORK_DIR/config-local-ipv6.yaml"
 PROFILE="$WORK_DIR/profile.yaml"
 PROVIDER="$WORK_DIR/provider.yaml"
 REMOTE_PROVIDER="$WORK_DIR/remote-provider.yaml"
 DEVICE_POLICY="$WORK_DIR/device-policy.json"
 MIHOMO_CONFIG="$WORK_DIR/mihomo.yaml"
+IPV6_MIHOMO_CONFIG="$WORK_DIR/mihomo-local-ipv6.yaml"
 MIHOMO_LOG="$WORK_DIR/logs/mihomo.log"
 OMG_BIN="$WORK_DIR/omg"
 EGRESS_PROBE_BIN="$WORK_DIR/egress-probe"
@@ -137,6 +139,30 @@ runtime:
 device_policy:
   file: "$DEVICE_POLICY"
 EOF
+
+  cat >"$IPV6_CONFIG" <<EOF
+mihomo:
+  binary: "$MIHOMO_BINARY"
+  config: "$IPV6_MIHOMO_CONFIG"
+  profile_mode: "imported"
+  profile: "$PROFILE"
+  mixed_port: $MIXED_PORT
+  api_addr: "$API_ADDR"
+  secret: ""
+
+dns:
+  ipv6: true
+
+transparent:
+  mode: "tun"
+  tun_ipv6: "off"
+
+runtime:
+  dir: "$WORK_DIR"
+
+device_policy:
+  file: "$DEVICE_POLICY"
+EOF
 }
 
 build_omg() {
@@ -249,6 +275,10 @@ section "validate mihomo config"
 "$OMG_BIN" validate-mihomo --config "$CONFIG" --format json
 assert_file_contains "$MIHOMO_CONFIG" "store-selected: true"
 assert_file_contains "$MIHOMO_CONFIG" 'proxies: ["demo-proxy", DIRECT]'
+assert_file_contains "$MIHOMO_CONFIG" "name: open-surge/mac-global"
+assert_file_contains "$MIHOMO_CONFIG" "name: open-surge/mac-mode-tcp"
+assert_file_contains "$MIHOMO_CONFIG" "name: open-surge/mac-mode-udp"
+assert_file_contains "$MIHOMO_CONFIG" "AND,((IN-TYPE,SOCKS/HTTP),(SRC-IP-CIDR,127.0.0.0/8),(NETWORK,TCP)),open-surge/mac-mode-tcp"
 assert_file_contains "$MIHOMO_CONFIG" "name: device/integration-dedicated/default"
 assert_file_contains "$MIHOMO_CONFIG" "AND,((SRC-IP-CIDR,192.168.50.101/32),(IP-CIDR,192.168.0.0/16)),DIRECT"
 assert_file_contains "$MIHOMO_CONFIG" "SRC-IP-CIDR,192.168.50.101/32,device/integration-dedicated/default"
@@ -256,6 +286,20 @@ if grep -Fq -- "device/integration-inherited/default" "$MIHOMO_CONFIG"; then
   echo "inherit_global integration fixture unexpectedly generated a default selector" >&2
   exit 1
 fi
+
+section "validate local fake-AAAA identity rules"
+"$OMG_BIN" validate-mihomo --config "$IPV6_CONFIG" --format json
+assert_file_contains "$IPV6_MIHOMO_CONFIG" "AND,((IN-TYPE,TUN),(IN-NAME,DEFAULT-TUN),(SRC-IP-CIDR,fdfe:dcba:9876::1/128),(NETWORK,TCP)),open-surge/mac-mode-tcp"
+assert_file_contains "$IPV6_MIHOMO_CONFIG" "AND,((IN-TYPE,TUN),(IN-NAME,DEFAULT-TUN),(SRC-IP-CIDR,fdfe:dcba:9876::1/128),(NETWORK,UDP)),open-surge/mac-mode-udp"
+for forbidden in \
+  "SRC-IP-CIDR,fdfe:dcba:9876::/64" \
+  "SRC-IP-CIDR,fdfe:dcba:9878::/64" \
+  "IN-NAME,opensurge-ipv6"; do
+  if grep -Fq -- "$forbidden" "$IPV6_MIHOMO_CONFIG"; then
+    echo "local fake-AAAA identity rules crossed an IPv6 isolation boundary: $forbidden" >&2
+    exit 1
+  fi
+done
 
 section "start mihomo"
 start_mihomo "initial start"
@@ -268,6 +312,30 @@ assert_file_contains "$WORK_DIR/policies-before.json" '"name": "Proxy"'
 assert_file_contains "$WORK_DIR/policies-before.json" '"selected": "demo-proxy"'
 assert_file_contains "$WORK_DIR/policies-before.json" '"DIRECT"'
 assert_file_contains "$WORK_DIR/policies-before.json" '"remote-provider-proxy"'
+if grep -Fq "open-surge/mac-" "$WORK_DIR/policies-before.json"; then
+  echo "generic policies exposed local-routing internal groups or options" >&2
+  cat "$WORK_DIR/policies-before.json" >&2
+  exit 1
+fi
+
+section "local Mac routing controller"
+"$OMG_BIN" local-routing --config "$CONFIG" --format json >"$WORK_DIR/local-routing-rule.json"
+cat "$WORK_DIR/local-routing-rule.json"
+assert_file_contains "$WORK_DIR/local-routing-rule.json" '"mode": "rule"'
+assert_file_contains "$WORK_DIR/local-routing-rule.json" '"loopback_explicit_proxy"'
+
+"$OMG_BIN" local-routing-set --config "$CONFIG" --mode global --policy egress-proxy --format json >"$WORK_DIR/local-routing-global.json"
+cat "$WORK_DIR/local-routing-global.json"
+assert_file_contains "$WORK_DIR/local-routing-global.json" '"mode": "global"'
+assert_file_contains "$WORK_DIR/local-routing-global.json" '"selected": "egress-proxy"'
+assert_file_contains "$WORK_DIR/local-routing-global.json" '"udp_behavior": "reject"'
+
+if "$OMG_BIN" policy-select --config "$CONFIG" --group GLOBAL --policy open-surge/mac-global --format json >"$WORK_DIR/local-routing-indirect.out" 2>"$WORK_DIR/local-routing-indirect.err"; then
+  echo "generic GLOBAL selector accepted an internal local-routing group" >&2
+  cat "$WORK_DIR/local-routing-indirect.out" >&2
+  exit 1
+fi
+assert_file_contains "$WORK_DIR/local-routing-indirect.err" 'is not a member of group \"GLOBAL\"'
 
 section "reject unknown policy"
 if "$OMG_BIN" policy-select --config "$CONFIG" --group Proxy --policy Missing --format json >"$WORK_DIR/policy-select-invalid.out" 2>"$WORK_DIR/policy-select-invalid.json"; then
@@ -303,6 +371,13 @@ assert_file_contains "$WORK_DIR/policies-restored.json" '"name": "Proxy"'
 assert_file_contains "$WORK_DIR/policies-restored.json" '"selected": "DIRECT"'
 assert_file_contains "$WORK_DIR/policies-restored.json" '"DIRECT"'
 assert_file_contains "$WORK_DIR/policies-restored.json" '"remote-provider-proxy"'
+"$OMG_BIN" local-routing --config "$CONFIG" --format json >"$WORK_DIR/local-routing-restart-restored.json"
+assert_file_contains "$WORK_DIR/local-routing-restart-restored.json" '"mode": "global"'
+assert_file_contains "$WORK_DIR/local-routing-restart-restored.json" '"selected": "egress-proxy"'
+"$OMG_BIN" local-routing-set --config "$CONFIG" --mode direct --format json >"$WORK_DIR/local-routing-direct.json"
+assert_file_contains "$WORK_DIR/local-routing-direct.json" '"mode": "direct"'
+"$OMG_BIN" local-routing-set --config "$CONFIG" --mode rule --format json >"$WORK_DIR/local-routing-restored.json"
+assert_file_contains "$WORK_DIR/local-routing-restored.json" '"mode": "rule"'
 
 section "verify policy egress switch"
 curl --noproxy '' --proxy "http://127.0.0.1:$MIXED_PORT" --fail --silent --show-error --max-time 5 \
@@ -326,9 +401,14 @@ curl --noproxy '' --proxy "http://127.0.0.1:$MIXED_PORT" --fail --silent --show-
 cat "$WORK_DIR/egress-proxy.out"
 assert_file_contains "$WORK_DIR/egress-proxy.out" "origin-ok"
 assert_file_contains "$WORK_DIR/egress/origin.log" "GET /egress-proxy"
-assert_file_contains "$WORK_DIR/egress/proxy.log" "CONNECT 127.0.0.1:$EGRESS_ORIGIN_PORT"
-assert_file_contains "$MIHOMO_LOG" "using EgressSwitch[DIRECT]"
-assert_file_contains "$MIHOMO_LOG" "using EgressSwitch[egress-proxy]"
+if [[ -s "$WORK_DIR/egress/proxy.log" ]]; then
+  echo "local/private destination guard unexpectedly used the controlled proxy" >&2
+  cat "$WORK_DIR/egress/proxy.log" >&2
+  exit 1
+fi
+assert_file_contains "$MIHOMO_LOG" "SrcIPCIDR,127.0.0.0/8"
+assert_file_contains "$MIHOMO_LOG" "IPCIDR,127.0.0.0/8"
+assert_file_contains "$MIHOMO_LOG" "using DIRECT"
 
 "$OMG_BIN" policies --config "$CONFIG" --format json >"$WORK_DIR/policies-egress.json"
 cat "$WORK_DIR/policies-egress.json"
@@ -357,6 +437,11 @@ assert_file_contains "$WORK_DIR/providers.json" '"name": "remote-provider"'
 assert_file_contains "$WORK_DIR/providers.json" '"name": "remote-provider-proxy"'
 assert_file_contains "$WORK_DIR/providers.json" '"rule_providers"'
 assert_file_contains "$WORK_DIR/egress/origin.log" "GET /remote-provider.yaml"
+if grep -Fq '"name": "open-surge/mac-' "$WORK_DIR/providers.json"; then
+  echo "generic providers exposed local-routing internal groups" >&2
+  cat "$WORK_DIR/providers.json" >&2
+  exit 1
+fi
 
 section "update remote provider"
 cat >"$REMOTE_PROVIDER" <<'EOF'
@@ -426,6 +511,73 @@ assert_file_contains "$WORK_DIR/snapshot.json" '"name": "demo-provider"'
 assert_file_contains "$WORK_DIR/snapshot.json" '"name": "provider-updated"'
 assert_file_contains "$WORK_DIR/snapshot.json" '"name": "remote-provider"'
 assert_file_contains "$WORK_DIR/snapshot.json" '"name": "remote-provider-updated"'
+
+section "missing device outbounds preserve defaults and route bindings"
+stop_mihomo
+cat >"$PROFILE" <<'EOF'
+proxy-groups:
+  - name: VanishingExit
+    type: select
+    proxies: [DIRECT]
+  - name: SurvivingExit
+    type: select
+    proxies: [DIRECT]
+rules: ['MATCH,DIRECT']
+EOF
+cp "$PROFILE" "$WORK_DIR/profile-with-device-exits.yaml"
+cat >"$DEVICE_POLICY" <<'EOF'
+{
+  "profiles": [{"id":"integration-egress","default_policies":["DIRECT","VanishingExit","SurvivingExit"],"rules":[
+    {"id":"template","match":{"template":"media"},"action":"VanishingExit"},
+    {"id":"ruleset","match":{"rule_sets":["media"]},"policies":["DIRECT","VanishingExit"]},
+    {"id":"valid","match":{"domains":["blocked.example"]},"action":"REJECT"}
+  ]}],
+  "devices": [
+    {"id":"integration-dedicated","mac":"aa:bb:cc:dd:ee:01","ipv4":"192.168.50.101","profile":"integration-egress","egress_mode":"dedicated"},
+    {"id":"integration-retained","mac":"aa:bb:cc:dd:ee:02","ipv4":"192.168.50.102","profile":"integration-egress","egress_mode":"dedicated"}
+  ],
+  "rule_sets":[{"id":"media","behavior":"domain","payload":["media.example"]}],
+  "templates":[{"id":"media","rule_sets":["media"]}]
+}
+EOF
+cp "$DEVICE_POLICY" "$WORK_DIR/device-policy-original.json"
+"$OMG_BIN" validate-mihomo --config "$CONFIG" --format json
+start_mihomo "device exits before source change"
+"$OMG_BIN" policy-select --config "$CONFIG" --group device/integration-dedicated/default --policy VanishingExit --format json >"$WORK_DIR/device-missing-selected.json"
+"$OMG_BIN" policy-select --config "$CONFIG" --group device/integration-dedicated/ruleset --policy VanishingExit --format json >"$WORK_DIR/ruleset-missing-selected.json"
+"$OMG_BIN" policy-select --config "$CONFIG" --group device/integration-retained/default --policy SurvivingExit --format json >"$WORK_DIR/device-retained-selected.json"
+stop_mihomo
+cat >"$PROFILE" <<'EOF'
+proxy-groups:
+  - name: SurvivingExit
+    type: select
+    proxies: [DIRECT]
+rules: ['MATCH,DIRECT']
+EOF
+"$OMG_BIN" validate-mihomo --config "$CONFIG" --format json >"$WORK_DIR/missing-egress-validation.json"
+if grep -Fq 'VanishingExit' "$MIHOMO_CONFIG" ||
+   grep -Fq 'device/integration-dedicated/default' "$MIHOMO_CONFIG" ||
+   grep -Fq 'device/integration-dedicated/ruleset' "$MIHOMO_CONFIG"; then
+  echo "missing selected device or ruleset egress was still rendered" >&2
+  exit 1
+fi
+assert_file_contains "$MIHOMO_CONFIG" 'DOMAIN-SUFFIX,blocked.example'
+assert_file_contains "$MIHOMO_CONFIG" 'device/integration-retained/ruleset'
+start_mihomo "missing device exits fall back without blocking the core"
+"$OMG_BIN" policies --config "$CONFIG" --format json >"$WORK_DIR/missing-egress-live.json"
+assert_file_contains "$WORK_DIR/missing-egress-live.json" '"name": "device/integration-retained/default"'
+grep -A 2 -F '"name": "device/integration-retained/default"' "$WORK_DIR/missing-egress-live.json" | grep -Fq '"selected": "SurvivingExit"'
+cmp "$DEVICE_POLICY" "$WORK_DIR/device-policy-original.json"
+stop_mihomo
+cp "$WORK_DIR/profile-with-device-exits.yaml" "$PROFILE"
+"$OMG_BIN" validate-mihomo --config "$CONFIG" --format json >"$WORK_DIR/restored-egress-validation.json"
+assert_file_contains "$MIHOMO_CONFIG" 'device/integration-dedicated/default'
+assert_file_contains "$MIHOMO_CONFIG" 'device/integration-dedicated/ruleset'
+start_mihomo "restored source reactivates original device and rule-set selections"
+"$OMG_BIN" policies --config "$CONFIG" --format json >"$WORK_DIR/restored-egress-live.json"
+grep -A 2 -F '"name": "device/integration-dedicated/default"' "$WORK_DIR/restored-egress-live.json" | grep -Fq '"selected": "VanishingExit"'
+grep -A 2 -F '"name": "device/integration-dedicated/ruleset"' "$WORK_DIR/restored-egress-live.json" | grep -Fq '"selected": "VanishingExit"'
+cmp "$DEVICE_POLICY" "$WORK_DIR/device-policy-original.json"
 
 section "done"
 printf 'policy-control integration passed\n'

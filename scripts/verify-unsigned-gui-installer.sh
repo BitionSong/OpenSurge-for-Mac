@@ -5,9 +5,10 @@ PKG="${1:-}"
 EXPECTED_VERSION="${2:-}"
 EXPECTED_ARCH="${3:-arm64}"
 EXPECTED_MINIMUM_MACOS="${4:-13.0}"
+EXPECTED_RELEASE_TAG="${5:-v$EXPECTED_VERSION}"
 
 if [[ ! -f "$PKG" || -z "$EXPECTED_VERSION" || -z "$EXPECTED_ARCH" ]]; then
-  echo "usage: $0 /path/to/OpenSurge.pkg VERSION [ARCH]" >&2
+  echo "usage: $0 /path/to/OpenSurge.pkg VERSION [ARCH] [MINIMUM_MACOS] [RELEASE_TAG]" >&2
   exit 2
 fi
 
@@ -37,6 +38,7 @@ trap 'rm -rf "$work_dir"' EXIT
 expanded="$work_dir/expanded"
 payload="$work_dir/payload"
 pkgutil --expand "$PKG" "$expanded"
+scripts="$expanded/Scripts"
 
 package_info="$expanded/PackageInfo"
 grep -Fq "version=\"$EXPECTED_VERSION\"" "$package_info" || {
@@ -58,8 +60,13 @@ grep -Fq "CFBundleShortVersionString=\"$EXPECTED_VERSION\"" "$package_info" || {
 
 mkdir -p "$payload"
 (cd "$payload" && gzip -dc "$expanded/Payload" | cpio -idm --quiet)
+[[ -d "$scripts" ]] || {
+  echo "installer package scripts are missing" >&2
+  exit 1
+}
 
 executables=(
+  "$scripts/omg-recovery"
   "$payload/Applications/OpenSurge.app/Contents/MacOS/OpenSurgeMenuBar"
   "$payload/Library/Application Support/OpenSurge/bin/omg"
   "$payload/Library/Application Support/OpenSurge/bin/mihomo"
@@ -75,6 +82,10 @@ for bundle_name_key in CFBundleName CFBundleDisplayName; do
     exit 1
   }
 done
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :OpenSurgeReleaseTag' "$payload/Applications/OpenSurge.app/Contents/Info.plist")" == "$EXPECTED_RELEASE_TAG" ]] || {
+  echo "packaged app release tag does not match $EXPECTED_RELEASE_TAG" >&2
+  exit 1
+}
 version_not_newer_than() {
   local actual=$1 maximum=$2
   local actual_major=${actual%%.*} actual_minor=${actual#*.}
@@ -94,4 +105,4 @@ for executable in "${executables[@]}"; do
   }
 done
 
-echo "Verified unsigned OpenSurge $EXPECTED_VERSION installer for $EXPECTED_ARCH (macOS $EXPECTED_MINIMUM_MACOS+)"
+echo "Verified unsigned OpenSurge $EXPECTED_RELEASE_TAG installer for $EXPECTED_ARCH (macOS $EXPECTED_MINIMUM_MACOS+)"

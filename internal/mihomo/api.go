@@ -21,6 +21,18 @@ type Version struct {
 	Meta    bool   `json:"meta"`
 }
 
+type TUNRuntimeState struct {
+	Enabled bool   `json:"enabled"`
+	Device  string `json:"device,omitempty"`
+}
+
+type runtimeConfigResponse struct {
+	TUN *struct {
+		Enable bool   `json:"enable"`
+		Device string `json:"device"`
+	} `json:"tun"`
+}
+
 type ProxyGroup struct {
 	Name     string   `json:"name"`
 	Type     string   `json:"type"`
@@ -28,7 +40,13 @@ type ProxyGroup struct {
 	Options  []string `json:"options"`
 }
 
-const DefaultProxyDelayTestURL = "https://www.gstatic.com/generate_204"
+const (
+	DefaultProxyDelayTestURL             = "https://www.gstatic.com/generate_204"
+	DefaultTailscaleWarmupURL            = "http://100.100.100.100/"
+	DefaultTailscaleExitNodeTestURL      = "http://1.1.1.1/cdn-cgi/trace"
+	DefaultTailscaleExitNodeTestTimeout  = 15 * time.Second
+	defaultTailscaleTailnetWarmupTimeout = 4 * time.Second
+)
 
 type ProxyHealthSnapshot struct {
 	TestURL string        `json:"test_url"`
@@ -36,15 +54,17 @@ type ProxyHealthSnapshot struct {
 }
 
 type ProxyHealth struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	Selected  string `json:"selected,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	UDP       bool   `json:"udp"`
-	Status    string `json:"status"`
-	DelayMS   int    `json:"delay_ms,omitempty"`
-	TestedAt  string `json:"tested_at,omitempty"`
-	Probeable bool   `json:"probeable"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name,omitempty"`
+	Type        string `json:"type"`
+	Role        string `json:"role,omitempty"`
+	Selected    string `json:"selected,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	UDP         bool   `json:"udp"`
+	Status      string `json:"status"`
+	DelayMS     int    `json:"delay_ms,omitempty"`
+	TestedAt    string `json:"tested_at,omitempty"`
+	Probeable   bool   `json:"probeable"`
 }
 
 type ProxyDelayResult struct {
@@ -180,6 +200,11 @@ func FetchVersion(ctx context.Context, cfg config.Config) (Version, error) {
 	return fetchVersionWithClient(ctx, cfg, client)
 }
 
+func FetchTUNRuntimeState(ctx context.Context, cfg config.Config) (TUNRuntimeState, error) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	return fetchTUNRuntimeStateWithClient(ctx, cfg, client)
+}
+
 func FetchProxyGroups(ctx context.Context, cfg config.Config) ([]ProxyGroup, error) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	return fetchProxyGroupsWithClient(ctx, cfg, client)
@@ -201,6 +226,32 @@ func MeasureProxyDelay(ctx context.Context, cfg config.Config, proxyName, testUR
 	return measureProxyDelayWithClient(ctx, cfg, client, proxyName, testURL, timeout)
 }
 
+// WarmTailscale deliberately sends one best-effort request through the managed
+// outbound. mihomo initializes its embedded Tailscale node lazily on the first
+// dial, so this moves that work into gateway startup instead of waiting for a
+// user's first Tailnet request. A failed target probe still exercises the
+// outbound initialization path and must not make the gateway lifecycle fail.
+func WarmTailscale(ctx context.Context, cfg config.Config) ProxyDelayResult {
+	testURL := tailscaleWarmupURL(cfg)
+	timeout := tailscaleWarmupTimeout(cfg)
+	client := &http.Client{Timeout: timeout + time.Second}
+	return measureProxyDelayWithClient(ctx, cfg, client, config.TailscaleProxyName, testURL, timeout)
+}
+
+func tailscaleWarmupURL(cfg config.Config) string {
+	if cfg.Tailscale.ExitNode != "" {
+		return DefaultTailscaleExitNodeTestURL
+	}
+	return DefaultTailscaleWarmupURL
+}
+
+func tailscaleWarmupTimeout(cfg config.Config) time.Duration {
+	if cfg.Tailscale.ExitNode != "" {
+		return DefaultTailscaleExitNodeTestTimeout
+	}
+	return defaultTailscaleTailnetWarmupTimeout
+}
+
 func SelectProxyGroup(ctx context.Context, cfg config.Config, groupName, selected string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
 	return selectProxyGroupWithClient(ctx, cfg, client, groupName, selected)
@@ -209,6 +260,11 @@ func SelectProxyGroup(ctx context.Context, cfg config.Config, groupName, selecte
 func FetchConnections(ctx context.Context, cfg config.Config) (ConnectionsSnapshot, error) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	return fetchConnectionsWithClient(ctx, cfg, client)
+}
+
+func CloseConnections(ctx context.Context, cfg config.Config, connectionIDs []string) (int, error) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	return closeConnectionsWithClient(ctx, cfg, client, connectionIDs)
 }
 
 func FetchProviders(ctx context.Context, cfg config.Config) (ProvidersSnapshot, error) {
@@ -244,6 +300,32 @@ func fetchVersionWithClient(ctx context.Context, cfg config.Config, client *http
 		return Version{}, err
 	}
 	return version, nil
+}
+
+func fetchTUNRuntimeStateWithClient(ctx context.Context, cfg config.Config, client *http.Client) (TUNRuntimeState, error) {
+	req, err := newAPIRequest(ctx, cfg, http.MethodGet, "/configs", nil)
+	if err != nil {
+		return TUNRuntimeState{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return TUNRuntimeState{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return TUNRuntimeState{}, fmt.Errorf("mihomo API returned %s", resp.Status)
+	}
+	var body runtimeConfigResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		if errors.Is(err, io.EOF) {
+			return TUNRuntimeState{}, fmt.Errorf("empty mihomo API response")
+		}
+		return TUNRuntimeState{}, err
+	}
+	if body.TUN == nil {
+		return TUNRuntimeState{}, fmt.Errorf("mihomo runtime config did not report TUN state")
+	}
+	return TUNRuntimeState{Enabled: body.TUN.Enable, Device: body.TUN.Device}, nil
 }
 
 func fetchProxyGroupsWithClient(ctx context.Context, cfg config.Config, client *http.Client) ([]ProxyGroup, error) {
@@ -293,7 +375,22 @@ func fetchProxyHealthWithClient(ctx context.Context, cfg config.Config, client *
 			Status:    "untested",
 			Probeable: proxyIsProbeable(proxy.Type),
 		}
-		if !health.Probeable {
+		if health.Name == config.TailscaleProxyName && cfg.Tailscale.Enabled {
+			health.DisplayName = cfg.Tailscale.DisplayName
+			health.Type = "Tailscale"
+			health.Role = "tailnet"
+			if cfg.Tailscale.ExitNode != "" {
+				health.Role = "exit_node"
+			} else {
+				health.Probeable = false
+				health.Status = "available_on_demand"
+			}
+		}
+		if health.Name == config.TailscaleExitGroupName && cfg.Tailscale.Enabled && cfg.Tailscale.ExitNode != "" {
+			health.DisplayName = cfg.Tailscale.DisplayName + " · Exit Node"
+			health.Role = "exit_node"
+		}
+		if !health.Probeable && health.Role != "tailnet" {
 			health.Status = "not_applicable"
 		}
 		if health.Probeable && len(proxy.History) > 0 {
@@ -441,6 +538,49 @@ func fetchConnectionsWithClient(ctx context.Context, cfg config.Config, client *
 		DownloadTotal: body.DownloadTotal,
 		Connections:   connections,
 	}, nil
+}
+
+func closeConnectionsWithClient(ctx context.Context, cfg config.Config, client *http.Client, connectionIDs []string) (int, error) {
+	closed := 0
+	seen := make(map[string]struct{}, len(connectionIDs))
+	var closeErrors []error
+	for _, connectionID := range connectionIDs {
+		connectionID = strings.TrimSpace(connectionID)
+		if connectionID == "" {
+			continue
+		}
+		if _, exists := seen[connectionID]; exists {
+			continue
+		}
+		seen[connectionID] = struct{}{}
+
+		req, err := newAPIRequest(ctx, cfg, http.MethodDelete, "/connections/"+url.PathEscape(connectionID), nil)
+		if err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close connection %q: %w", connectionID, err))
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close connection %q: %w", connectionID, err))
+			continue
+		}
+		_, readErr := io.Copy(io.Discard, resp.Body)
+		closeErr := resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			closeErrors = append(closeErrors, fmt.Errorf("close connection %q: mihomo API returned %s", connectionID, resp.Status))
+			continue
+		}
+		if readErr != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close connection %q response: %w", connectionID, readErr))
+			continue
+		}
+		if closeErr != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close connection %q response: %w", connectionID, closeErr))
+			continue
+		}
+		closed++
+	}
+	return closed, errors.Join(closeErrors...)
 }
 
 func fetchProvidersWithClient(ctx context.Context, cfg config.Config, client *http.Client) (ProvidersSnapshot, error) {

@@ -36,6 +36,25 @@ provider mappings therefore have the same semantics. The imported source
 snapshot remains byte-for-byte unchanged; only the generated runtime config may
 normalize YAML presentation.
 
+The user-editable global overlay is stored separately from imported snapshots
+and uses explicit `add`, `replace`, group `patch`, rule prepend/tail, and DNS
+merge/append operations. Implicit name replacement, dangling overlay-created
+references, a non-terminal extra `MATCH`, reserved OpenSurge namespaces, and
+gateway-owned fields are rejected. Saving or refreshing produces a draft and a
+new effective preview; only source apply runs the authoritative mihomo
+validation and changes desired/running configuration. The desired config keeps
+the raw source and overlay digests as composition metadata.
+
+The Web GUI deliberately presents a narrower ordinary workflow. The existing
+local YAML chooser/dropzone remains the only complete-profile file import.
+Global Overlay is placed after the imported-source list and collapsed by
+default; its ordinary editor contains only prepended high-priority rules and
+proxy additions from share links, with a small HTTP/SOCKS5 form. Share links do
+not create profile sources. Tail rules, providers, group operations, DNS fields,
+and replacements are expert Overlay YAML operations. The full backend schema is
+retained so previously stored expert operations are neither hidden without a
+count nor discarded by the simplified editor.
+
 OpenSurge continues to render and own gateway-critical fields, including:
 
 - `mixed-port`
@@ -43,6 +62,8 @@ OpenSurge continues to render and own gateway-critical fields, including:
 - `bind-address`
 - `external-controller`
 - `profile.store-selected: true`
+- configurable `profile.store-fake-ip`, defaulting to `true` through
+  `mihomo.store_fake_ip`
 - DNS enablement, listener, IPv4-only mode, and fake-ip mode/range
 - TUN settings and LAN/private route exclusions
 - runtime config path
@@ -73,11 +94,11 @@ starts mihomo without dnsmasq, pf, or TUN, switches the imported fixture's
 `Proxy` group to `DIRECT`, restarts mihomo in the same runtime directory,
 requires the `DIRECT` selection to be restored through `profile.store-selected`,
 verifies file and HTTP proxy-provider updates change live provider and policy
-group state, and proves one local mixed-port request can be switched from
-`DIRECT` to a controlled HTTP CONNECT proxy by changing an `EgressSwitch`
-selection. The HTTP provider is served by a local fixture, so this is still a
-control-plane/API gate, not proof of TUN capture, whole-LAN routing, or real
-remote proxy egress.
+group state, verifies source-scoped local/private guards keep a local
+mixed-port destination `DIRECT`, and exercises the dedicated local-routing
+selectors plus their generic-policy isolation. The HTTP provider is served by
+a local fixture, so this is still a control-plane/API gate, not proof of TUN
+capture, whole-LAN routing, or real remote proxy egress.
 
 Use `make lab-test-tun-imported-profile` for a reproducible TUN lab gate that
 starts OpenSurge with an imported profile fixture. The fixture keeps

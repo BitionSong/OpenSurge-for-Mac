@@ -8,6 +8,7 @@ import (
 	"gopkg.in/yaml.v3"
 	"open-mihomo-gateway/internal/config"
 	"open-mihomo-gateway/internal/device"
+	"open-mihomo-gateway/internal/lan"
 )
 
 type policySections struct {
@@ -17,75 +18,116 @@ type policySections struct {
 	preRules  []string
 	dedicated []string
 	defaults  []string
+	ipv6      bool
+}
+
+// RenderManagedBaseProfile supplies the user-owned portion of a managed
+// configuration as an importable profile for global overlay composition.
+// Device, local-routing and Tailscale sections are added only by the final
+// RenderConfig pass, after the overlay has been validated.
+func RenderManagedBaseProfile(cfg config.Config) (string, error) {
+	cfg.Tailscale.Enabled = false
+	return composeManagedPolicySections(cfg, policySections{}, localRoutingGeneratedPolicy{})
 }
 
 func renderPolicySections(cfg config.Config, imported *importedProfile) (string, error) {
-	sections, err := loadPolicySections(cfg.DevicePolicy.Bundle, cfg.DevicePolicy.File)
+	scope, err := cfg.LANScope()
 	if err != nil {
 		return "", err
 	}
+	sections, err := loadPolicySections(cfg.DevicePolicy.Bundle, cfg.DevicePolicy.File, scope, cfg.Gateway.Mode == config.GatewayModeSameLAN, cfg.Transparent.TUNIPv6 != config.TUNIPv6Off)
+	if err != nil {
+		return "", err
+	}
+	localRouting := buildLocalRoutingPolicy(cfg, imported)
 	if cfg.Mihomo.ProfileMode == config.MihomoProfileModeImported {
 		if imported == nil {
 			return "", fmt.Errorf("imported mihomo profile was not loaded")
 		}
-		if err := validateImportedPolicySections(imported.inventory, sections); err != nil {
+		if err := validateImportedPolicySections(cfg, imported.inventory, sections); err != nil {
 			return "", err
 		}
-		return composeImportedPolicySections(imported, sections)
+		return composeImportedPolicySections(cfg, imported, sections, localRouting)
 	}
 	if err := validateManagedPolicySections(cfg, sections); err != nil {
 		return "", err
 	}
-	return composeManagedPolicySections(cfg, sections), nil
+	return composeManagedPolicySections(cfg, sections, localRouting)
 }
 
-func loadPolicySections(bundle *device.PolicyBundle, path string) (policySections, error) {
+func loadPolicySections(bundle *device.PolicyBundle, path string, scope lan.Scope, ipOnlyDevicesActive bool, ipv6 bool) (policySections, error) {
 	if bundle == nil && strings.TrimSpace(path) == "" {
 		return policySections{}, nil
 	}
 	if bundle == nil {
-		loaded, err := device.LoadPolicyBundle(path)
+		loaded, err := device.LoadPolicyBundleForLAN(path, scope, ipOnlyDevicesActive)
 		if err != nil {
 			return policySections{}, err
 		}
 		bundle = &loaded
 	}
-	return policySections{
+	sections := policySections{
 		bundle:    bundle,
 		groups:    bundle.Compiled.SelectorGroups,
 		providers: bundle.Compiled.RuleProviders,
 		preRules:  bundle.Compiled.OverrideRules,
 		dedicated: bundle.Compiled.DedicatedRules,
 		defaults:  bundle.Compiled.DefaultRules,
-	}, nil
+		ipv6:      ipv6,
+	}
+	if ipv6 {
+		sections.preRules = addIPv6IdentityRules(sections.preRules, bundle.Compiled.Devices)
+		sections.dedicated = addIPv6IdentityRules(sections.dedicated, bundle.Compiled.Devices)
+		sections.defaults = addIPv6IdentityRules(sections.defaults, bundle.Compiled.Devices)
+	}
+	return sections, nil
 }
 
-func composeManagedPolicySections(cfg config.Config, policy policySections) string {
+func composeManagedPolicySections(cfg config.Config, policy policySections, localRouting localRoutingGeneratedPolicy) (string, error) {
 	var out strings.Builder
-	if cfg.UpstreamProxy.Enabled {
+	tailscaleExitGroups := tailscaleExitSelectorGroups(cfg)
+	if cfg.UpstreamProxy.Enabled || cfg.Tailscale.Enabled {
 		out.WriteString("proxies:\n")
-		out.WriteString("  - name: " + yamlQuote(cfg.UpstreamProxy.Name) + "\n")
-		out.WriteString("    type: " + cfg.UpstreamProxy.Type + "\n")
-		out.WriteString("    server: " + yamlQuote(cfg.UpstreamProxy.Server) + "\n")
-		out.WriteString(fmt.Sprintf("    port: %d\n", cfg.UpstreamProxy.Port))
-		if cfg.UpstreamProxy.Username != "" {
-			out.WriteString("    username: " + yamlQuote(cfg.UpstreamProxy.Username) + "\n")
+		if cfg.UpstreamProxy.Enabled {
+			out.WriteString("  - name: " + yamlQuote(cfg.UpstreamProxy.Name) + "\n")
+			out.WriteString("    type: " + cfg.UpstreamProxy.Type + "\n")
+			if cfg.UpstreamProxy.Type == "socks5" {
+				out.WriteString("    udp: true\n")
+			}
+			out.WriteString("    server: " + yamlQuote(cfg.UpstreamProxy.Server) + "\n")
+			out.WriteString(fmt.Sprintf("    port: %d\n", cfg.UpstreamProxy.Port))
+			if cfg.UpstreamProxy.Username != "" {
+				out.WriteString("    username: " + yamlQuote(cfg.UpstreamProxy.Username) + "\n")
+			}
+			if cfg.UpstreamProxy.Password != "" {
+				out.WriteString("    password: " + yamlQuote(cfg.UpstreamProxy.Password) + "\n")
+			}
 		}
-		if cfg.UpstreamProxy.Password != "" {
-			out.WriteString("    password: " + yamlQuote(cfg.UpstreamProxy.Password) + "\n")
+		tailscaleProxy, err := renderManagedTailscaleProxy(cfg)
+		if err != nil {
+			return "", err
 		}
+		out.WriteString(tailscaleProxy)
 		out.WriteString("\n")
 	} else {
 		out.WriteString("proxies: []\n\n")
 	}
 
-	managedGroups := []device.SelectorGroup(nil)
-	if cfg.UpstreamProxy.Enabled {
-		managedGroups = append(managedGroups, device.SelectorGroup{Name: "open-surge-egress", Policies: []string{cfg.UpstreamProxy.Name}})
-	}
-	managedGroups = append(managedGroups, policy.groups...)
-	if len(managedGroups) > 0 {
-		out.WriteString(renderSelectorGroups(managedGroups))
+	if cfg.UpstreamProxy.Enabled || len(tailscaleExitGroups) > 0 || len(localRouting.Groups) > 0 || len(policy.groups) > 0 {
+		out.WriteString("proxy-groups:\n")
+		if cfg.UpstreamProxy.Enabled {
+			out.WriteString(renderSelectorGroupItems([]device.SelectorGroup{{Name: "open-surge-egress", Policies: []string{cfg.UpstreamProxy.Name}}}))
+			out.WriteString("\n")
+		}
+		if len(tailscaleExitGroups) > 0 {
+			out.WriteString(renderSelectorGroupItems(tailscaleExitGroups))
+			out.WriteString("\n")
+		}
+		out.WriteString(renderLocalRoutingGroupItems(localRouting.Groups))
+		if len(policy.groups) > 0 {
+			out.WriteString("\n")
+			out.WriteString(renderSelectorGroupItems(policy.groups))
+		}
 		out.WriteString("\n")
 	}
 	if len(policy.providers) > 0 {
@@ -93,7 +135,10 @@ func composeManagedPolicySections(cfg config.Config, policy policySections) stri
 		out.WriteString("\n")
 	}
 
-	rules := orderedDevicePreRules(policy)
+	rules := routerBypassIPv6RejectRules(policy)
+	rules = append(rules, renderTailscaleRules(cfg, policy)...)
+	rules = append(rules, localRouting.Rules...)
+	rules = append(rules, orderedDevicePreRules(policy)...)
 	if cfg.UpstreamProxy.Enabled {
 		rules = append(rules, "DOMAIN,"+cfg.UpstreamProxy.MatchDomain+",open-surge-egress")
 	}
@@ -101,20 +146,59 @@ func composeManagedPolicySections(cfg config.Config, policy policySections) stri
 	rules = append(rules, "MATCH,DIRECT")
 	out.WriteString("rules:\n")
 	writeRuleLines(&out, rules)
-	return out.String()
+	return out.String(), nil
 }
 
-func composeImportedPolicySections(imported *importedProfile, policy policySections) (string, error) {
+func composeImportedPolicySections(cfg config.Config, imported *importedProfile, policy policySections, localRouting localRoutingGeneratedPolicy) (string, error) {
+	if err := appendImportedTailscaleExitCandidates(imported, cfg); err != nil {
+		return "", err
+	}
+	if err := appendImportedTailscaleProxy(imported, cfg); err != nil {
+		return "", err
+	}
+	appendImportedSelectorGroups(imported, tailscaleExitSelectorGroups(cfg))
+	appendImportedLocalRoutingGroups(imported, localRouting.Groups)
 	if len(policy.groups) > 0 {
 		appendImportedSelectorGroups(imported, policy.groups)
 	}
 	if len(policy.providers) > 0 {
 		appendImportedRuleProviders(imported, policy.providers)
 	}
-	if err := composeImportedRules(imported.sections["rules"], orderedDevicePreRules(policy), policy.defaults); err != nil {
+	preRules := routerBypassIPv6RejectRules(policy)
+	preRules = append(preRules, renderTailscaleRules(cfg, policy)...)
+	preRules = append(preRules, localRouting.Rules...)
+	preRules = append(preRules, orderedDevicePreRules(policy)...)
+	if err := composeImportedRules(imported.sections["rules"], preRules, policy.defaults); err != nil {
 		return "", err
 	}
 	return renderImportedProfileSections(imported)
+}
+
+func appendImportedLocalRoutingGroups(imported *importedProfile, groups []localRoutingGeneratedGroup) {
+	section := ensureImportedSection(imported, "proxy-groups", yaml.SequenceNode, "!!seq")
+	section.Style &^= yaml.FlowStyle
+	for _, group := range groups {
+		body := mappingNode(
+			stringNode("name"), stringNode(group.Name),
+			stringNode("type"), stringNode("select"),
+		)
+		if len(group.Policies) > 0 {
+			policies := make([]*yaml.Node, 0, len(group.Policies))
+			for _, policy := range group.Policies {
+				policies = append(policies, quotedStringNode(policy))
+			}
+			body.Content = append(body.Content, stringNode("proxies"), sequenceNode(policies...))
+		}
+		if len(group.Providers) > 0 {
+			providers := make([]*yaml.Node, 0, len(group.Providers))
+			for _, provider := range group.Providers {
+				providers = append(providers, quotedStringNode(provider))
+			}
+			body.Content = append(body.Content, stringNode("use"), sequenceNode(providers...))
+		}
+		body.Content = append(body.Content, stringNode("hidden"), boolNode(true))
+		section.Content = append(section.Content, body)
+	}
 }
 
 func appendImportedSelectorGroups(imported *importedProfile, groups []device.SelectorGroup) {
@@ -228,6 +312,29 @@ var dedicatedLocalCIDRs = []string{
 	"224.0.0.0/4",
 }
 
+// DeviceInboundUser returns the delimiter-free identity shared by the packet
+// listener, device rules, and connection attribution. Mihomo's IN-USER rule
+// treats '/' as a separator between multiple accepted users, so it cannot use
+// the device/<id>/... selector namespace directly.
+func DeviceInboundUser(deviceID string) string { return "device:" + deviceID }
+
+// Router bypass is IPv4-only. Keep the packet-listener identity solely to
+// reject IPv6 before local-Mac, imported, global, or ordinary device rules can
+// select an OpenSurge egress for this device.
+func routerBypassIPv6RejectRules(policy policySections) []string {
+	if policy.bundle == nil || !policy.ipv6 {
+		return nil
+	}
+	rules := []string{}
+	for _, managed := range policy.bundle.Compiled.Devices {
+		if managed.GatewayTarget != device.GatewayTargetUpstreamRouter || managed.MAC == "" {
+			continue
+		}
+		rules = append(rules, fmt.Sprintf("AND,((IN-TYPE,TUN),(IN-USER,%s)),REJECT", DeviceInboundUser(managed.ID)))
+	}
+	return rules
+}
+
 // Dedicated device egress is a public-Internet routing choice. Keep local,
 // link-local, carrier-grade NAT, and multicast destinations direct before any
 // device-owned override or catch-all selector so gateway and LAN access cannot
@@ -242,6 +349,15 @@ func orderedDevicePreRules(policy policySections) []string {
 			for _, cidr := range dedicatedLocalCIDRs {
 				rules = append(rules, fmt.Sprintf("AND,((SRC-IP-CIDR,%s/32),(IP-CIDR,%s)),DIRECT", managed.IPv4, cidr))
 			}
+			if policy.ipv6 && managed.MAC != "" {
+				user := DeviceInboundUser(managed.ID)
+				// Do not direct the whole ULA space: Mihomo's fake IPv6 pool is
+				// itself ULA. The downstream /64 is the only product-owned ULA
+				// segment that is always local.
+				for _, cidr := range []string{config.DownstreamIPv6Prefix, "fe80::/10", "ff00::/8"} {
+					rules = append(rules, fmt.Sprintf("AND,((IN-USER,%s),(IP-CIDR6,%s)),DIRECT", user, cidr))
+				}
+			}
 		}
 	}
 	rules = append(rules, policy.preRules...)
@@ -249,14 +365,41 @@ func orderedDevicePreRules(policy policySections) []string {
 	return rules
 }
 
-func validateImportedPolicySections(inventory importedProfileInventory, policy policySections) error {
-	if policy.bundle == nil {
-		return nil
+func addIPv6IdentityRules(rules []string, devices []device.CompiledDevice) []string {
+	if len(rules) == 0 || len(devices) == 0 {
+		return rules
 	}
+	out := make([]string, 0, len(rules)*2)
+	for _, rule := range rules {
+		out = append(out, rule)
+		for _, managed := range devices {
+			if managed.MAC == "" {
+				continue
+			}
+			needle := "SRC-IP-CIDR," + managed.IPv4 + "/32"
+			if strings.Contains(rule, needle) {
+				out = append(out, strings.ReplaceAll(rule, needle, "IN-USER,"+DeviceInboundUser(managed.ID)))
+				break
+			}
+		}
+	}
+	return out
+}
+
+func validateImportedPolicySections(cfg config.Config, inventory importedProfileInventory, policy policySections) error {
 	for name := range inventory.targets {
+		if name == config.TailscaleProxyName || name == config.TailscaleExitGroupName {
+			return fmt.Errorf("imported mihomo profile target %q occupies reserved OpenSurge Tailscale target", name)
+		}
+		if IsLocalRoutingGroup(name) {
+			return fmt.Errorf("imported mihomo profile target %q occupies reserved %s namespace", name, LocalRoutingGroupPrefix)
+		}
 		if strings.HasPrefix(name, "device/") {
 			return fmt.Errorf("imported mihomo profile target %q occupies reserved device/ namespace", name)
 		}
+	}
+	if policy.bundle == nil {
+		return nil
 	}
 	for name := range inventory.ruleProviders {
 		if strings.HasPrefix(name, "open-surge-ruleset-") {
@@ -277,6 +420,12 @@ func validateImportedPolicySections(inventory importedProfileInventory, policy p
 		if builtinPolicyTarget(target) {
 			continue
 		}
+		if target == config.TailscaleProxyName || target == config.TailscaleExitGroupName {
+			if cfg.Tailscale.Enabled && cfg.Tailscale.ExitNode != "" {
+				continue
+			}
+			return tailscaleExitNodeStillSelectedError()
+		}
 		if _, exists := inventory.targets[target]; !exists {
 			return fmt.Errorf("device policy references unknown imported proxy or group %q", target)
 		}
@@ -293,13 +442,24 @@ func validateManagedPolicySections(cfg config.Config, policy policySections) err
 		available[cfg.UpstreamProxy.Name] = true
 		available["open-surge-egress"] = true
 	}
+	if cfg.Tailscale.Enabled && cfg.Tailscale.ExitNode != "" {
+		available[config.TailscaleProxyName] = true
+		available[config.TailscaleExitGroupName] = true
+	}
 	for _, target := range append(append([]string(nil), policy.bundle.Compiled.SelectorTargets...), policy.bundle.Compiled.ActionTargets...) {
 		if builtinPolicyTarget(target) || available[target] {
 			continue
 		}
+		if target == config.TailscaleProxyName || target == config.TailscaleExitGroupName {
+			return tailscaleExitNodeStillSelectedError()
+		}
 		return fmt.Errorf("device policy references unknown managed proxy or group %q", target)
 	}
 	return nil
+}
+
+func tailscaleExitNodeStillSelectedError() error {
+	return fmt.Errorf("a device route still selects the Tailscale Exit Node; choose another route for that device before disabling Tailscale or removing its Exit Node")
 }
 
 func builtinPolicyTarget(target string) bool {
@@ -324,6 +484,28 @@ func renderSelectorGroupItems(groups []device.SelectorGroup) string {
 		for _, policy := range group.Policies {
 			out.WriteString("      - " + yamlQuote(policy) + "\n")
 		}
+	}
+	return strings.TrimRight(out.String(), "\n")
+}
+
+func renderLocalRoutingGroupItems(groups []localRoutingGeneratedGroup) string {
+	var out strings.Builder
+	for _, group := range groups {
+		out.WriteString("  - name: " + yamlQuote(group.Name) + "\n")
+		out.WriteString("    type: select\n")
+		if len(group.Policies) > 0 {
+			out.WriteString("    proxies:\n")
+			for _, policy := range group.Policies {
+				out.WriteString("      - " + yamlQuote(policy) + "\n")
+			}
+		}
+		if len(group.Providers) > 0 {
+			out.WriteString("    use:\n")
+			for _, provider := range group.Providers {
+				out.WriteString("      - " + yamlQuote(provider) + "\n")
+			}
+		}
+		out.WriteString("    hidden: true\n")
 	}
 	return strings.TrimRight(out.String(), "\n")
 }

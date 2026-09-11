@@ -1,23 +1,26 @@
 package config
 
-import "open-mihomo-gateway/internal/device"
-
 import (
 	"fmt"
 	"net"
 	"path/filepath"
+
+	"open-mihomo-gateway/internal/device"
+	"open-mihomo-gateway/internal/lan"
 )
 
 type Config struct {
-	Gateway       GatewayConfig
-	DHCP          DHCPConfig
-	DevicePolicy  DevicePolicyConfig
-	DNS           DNSConfig
-	Mihomo        MihomoConfig
-	PF            PFConfig
-	Transparent   TransparentConfig
-	UpstreamProxy UpstreamProxyConfig
-	Runtime       RuntimeConfig
+	Gateway          GatewayConfig
+	DHCP             DHCPConfig
+	DevicePolicy     DevicePolicyConfig
+	DNS              DNSConfig
+	Mihomo           MihomoConfig
+	Tailscale        TailscaleConfig
+	PF               PFConfig
+	Transparent      TransparentConfig
+	LocalSystemProxy LocalSystemProxyConfig
+	UpstreamProxy    UpstreamProxyConfig
+	Runtime          RuntimeConfig
 }
 
 // DevicePolicyConfig points at the optional JSON control-plane file that
@@ -26,40 +29,79 @@ type DevicePolicyConfig struct {
 	File          string
 	ProtectedIPv4 []string
 	Bundle        *device.PolicyBundle
+	// SelectionCachePath stays bound to the original core work directory when
+	// a candidate is rendered in a temporary validation directory. Not persisted.
+	SelectionCachePath string
 }
 
 type GatewayConfig struct {
-	Mode              string
-	Interface         string
-	LANIP             string
+	Mode      string
+	Interface string
+	LANIP     string
+	// LANPrefixLen is the real subnet prefix of the downstream LAN. Zero means
+	// the historical /24 assumption, so configs written before this field
+	// existed keep behaving the same way.
+	LANPrefixLen      int
 	UpstreamInterface string
 }
 
 type DHCPConfig struct {
-	Binary     string
-	Enabled    bool
-	RangeStart string
-	RangeEnd   string
-	LeaseTime  string
-	Domain     string
+	Binary        string
+	Enabled       bool
+	RangeStart    string
+	RangeEnd      string
+	LeaseTime     string
+	Domain        string
+	BypassGateway string
+	BypassDNS     []string
 }
 
 type DNSConfig struct {
 	Listen   string
 	Port     int
 	Upstream string
+	IPv6     bool
 }
 
 type MihomoConfig struct {
-	Binary      string
-	Config      string
-	ProfileMode string
-	Profile     string
-	MixedPort   int
-	RedirPort   int
-	APIAddr     string
-	Secret      string
+	Binary               string
+	Config               string
+	ProfileMode          string
+	Profile              string
+	ProfileSourceDigest  string
+	ProfileOverlayDigest string
+	StoreFakeIP          bool
+	MixedPort            int
+	RedirPort            int
+	APIAddr              string
+	Secret               string
 }
+
+// TailscaleConfig describes the single OpenSurge-managed Tailscale outbound.
+// The auth key is deliberately stored in a separate root-owned file so API
+// responses and the ordinary gateway configuration never disclose it.
+type TailscaleConfig struct {
+	Enabled                bool
+	DisplayName            string
+	Hostname               string
+	ControlURL             string
+	AuthKeyFile            string
+	StateDir               string
+	AcceptRoutes           bool
+	MagicDNSSuffixes       []string
+	PeerCIDRs              []string
+	SubnetRoutes           []string
+	AllowMac               bool
+	AllowAllDevices        bool
+	AllowedDevices         []string
+	ExitNode               string
+	ExitNodeAllowLANAccess bool
+}
+
+const (
+	TailscaleProxyName     = "open-surge/tailscale"
+	TailscaleExitGroupName = "open-surge/tailscale-exit"
+)
 
 type PFConfig struct {
 	AnchorName    string
@@ -75,6 +117,25 @@ const (
 const (
 	TransparentModeOff = "off"
 	TransparentModeTUN = "tun"
+)
+
+const (
+	TUNIPv6Off    = "off"
+	TUNIPv6Auto   = "auto"
+	TUNIPv6Always = "always"
+)
+
+// The three IPv6 ranges are deliberately disjoint. Downstream clients use the
+// LAN /64, fake-IP answers use another /64 so clients do not attempt on-link
+// neighbour discovery for synthetic destinations, and the host TUN keeps its
+// own tiny point-to-point range.
+const (
+	MihomoFakeIPv6Range        = "fdfe:dcba:9876::/64"
+	MihomoTUNIPv6              = "fdfe:dcba:9877::1/126"
+	DownstreamIPv6Prefix       = "fdfe:dcba:9878::/64"
+	DownstreamIPv6Gateway      = "fdfe:dcba:9878::1"
+	IPv6PacketListenerName     = "opensurge-ipv6"
+	IPv6PacketBrokerSubcommand = "ipv6-packet"
 )
 
 // MihomoDNSUpstream is the dnsmasq upstream that preserves mihomo fake-IP and
@@ -94,10 +155,25 @@ type TransparentConfig struct {
 	TUNAutoRoute           bool
 	TUNAutoDetectInterface bool
 	TUNStrictRoute         bool
+	TUNIPv6                string
+	IPv6SharedL2Ready      bool
+	IPv6PacketBrokerBinary string
+	IPv6PacketMTU          int
+}
+
+// LocalSystemProxyConfig enables an opt-in compatibility layer for local Mac
+// applications that honor the macOS HTTP/HTTPS proxy settings. The endpoint
+// is derived from Mihomo.MixedPort and is not independently configurable.
+type LocalSystemProxyConfig struct {
+	Enabled bool
 }
 
 func (c TransparentConfig) TUNEnabled() bool {
 	return c.Mode == TransparentModeTUN
+}
+
+func (c TransparentConfig) IPv6Requested() bool {
+	return c.TUNIPv6 != TUNIPv6Off
 }
 
 func (c GatewayConfig) SameLAN() bool {
@@ -125,6 +201,7 @@ func Default() Config {
 			Mode:              GatewayModeIsolatedLAN,
 			Interface:         "en0",
 			LANIP:             "192.168.50.1",
+			LANPrefixLen:      lan.DefaultPrefixLen,
 			UpstreamInterface: "en0",
 		},
 		DHCP: DHCPConfig{
@@ -134,22 +211,40 @@ func Default() Config {
 			RangeEnd:   "192.168.50.200",
 			LeaseTime:  "12h",
 			Domain:     "lan",
+			BypassDNS:  []string{},
 		},
 		DevicePolicy: DevicePolicyConfig{},
 		DNS: DNSConfig{
 			Listen:   "192.168.50.1",
 			Port:     53,
 			Upstream: MihomoDNSUpstream,
+			IPv6:     false,
 		},
 		Mihomo: MihomoConfig{
 			Binary:      "./bin/mihomo",
 			Config:      "./runtime/mihomo.yaml",
 			ProfileMode: MihomoProfileModeManaged,
 			Profile:     "",
+			StoreFakeIP: true,
 			MixedPort:   7890,
 			RedirPort:   0,
 			APIAddr:     "127.0.0.1:9090",
 			Secret:      "",
+		},
+		Tailscale: TailscaleConfig{
+			Enabled:          false,
+			DisplayName:      "Tailnet",
+			Hostname:         "opensurge-mac",
+			ControlURL:       "https://controlplane.tailscale.com",
+			AuthKeyFile:      "./data/tailscale-auth-key",
+			StateDir:         "./data/tailscale",
+			AcceptRoutes:     false,
+			AllowMac:         true,
+			AllowAllDevices:  false,
+			MagicDNSSuffixes: []string{},
+			PeerCIDRs:        []string{},
+			SubnetRoutes:     []string{},
+			AllowedDevices:   []string{},
 		},
 		PF: PFConfig{
 			AnchorName:    "com.apple/open_mihomo_gateway",
@@ -162,7 +257,12 @@ func Default() Config {
 			TUNAutoRoute:           true,
 			TUNAutoDetectInterface: false,
 			TUNStrictRoute:         false,
+			TUNIPv6:                TUNIPv6Off,
+			IPv6SharedL2Ready:      false,
+			IPv6PacketBrokerBinary: "opensurge-network",
+			IPv6PacketMTU:          1500,
 		},
+		LocalSystemProxy: LocalSystemProxyConfig{Enabled: false},
 		UpstreamProxy: UpstreamProxyConfig{
 			Enabled:     false,
 			Name:        "real-device-egress",
@@ -185,10 +285,21 @@ func (c Config) RuntimePath(name string) string {
 	return filepath.Join(c.Runtime.Dir, name)
 }
 
-func (c Config) LANPrefix24() (string, error) {
-	ip := c.LANIP().To4()
-	if ip == nil {
-		return "", fmt.Errorf("gateway.lan_ip must be an IPv4 address")
+// LANScope resolves the downstream LAN from gateway.lan_ip and
+// gateway.lan_prefix_len. Every subnet decision goes through it so pf NAT,
+// mihomo route exclusion, DHCP ranges, and device addresses cannot disagree.
+func (c Config) LANScope() (lan.Scope, error) {
+	scope, err := lan.NewScope(c.Gateway.LANIP, c.Gateway.LANPrefixLen)
+	if err != nil {
+		return lan.Scope{}, fmt.Errorf("gateway.lan_ip / gateway.lan_prefix_len: %w", err)
 	}
-	return fmt.Sprintf("%d.%d.%d.0/24", ip[0], ip[1], ip[2]), nil
+	return scope, nil
+}
+
+func (c Config) LANPrefix() (string, error) {
+	scope, err := c.LANScope()
+	if err != nil {
+		return "", err
+	}
+	return scope.String(), nil
 }

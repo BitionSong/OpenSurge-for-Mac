@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"open-mihomo-gateway/internal/config"
+	"open-mihomo-gateway/internal/device"
 )
 
 // Prepare creates the root-owned applied configuration tree used by the
@@ -31,6 +32,7 @@ func Prepare(sourcePath, root string) (config.Config, error) {
 	cfg.DHCP.Binary = filepath.Join(root, "bin", "dnsmasq")
 	cfg.Mihomo.Binary = filepath.Join(root, "bin", "mihomo")
 	cfg.Mihomo.Config = filepath.Join(root, "runtime", "mihomo.yaml")
+	cfg.Transparent.IPv6PacketBrokerBinary = filepath.Join(root, "bin", "opensurge-network")
 	cfg.Runtime.Dir = filepath.Join(root, "runtime")
 	if cfg.Mihomo.ProfileMode == config.MihomoProfileModeImported {
 		destination := filepath.Join(root, "data", "imported-profile.yaml")
@@ -46,11 +48,46 @@ func Prepare(sourcePath, root string) (config.Config, error) {
 		}
 		cfg.DevicePolicy.File = destination
 		cfg.DevicePolicy.Bundle = nil
+	} else {
+		cfg.DevicePolicy.File = filepath.Join(root, "data", "device-policy.json")
+		if _, err := device.CreateEmptyPolicyFile(cfg.DevicePolicy.File); err != nil {
+			return config.Config{}, fmt.Errorf("initialize device policy: %w", err)
+		}
 	}
 	if err := config.Validate(cfg); err != nil {
 		return config.Config{}, err
 	}
 	return cfg, nil
+}
+
+// EnableDevicePolicy upgrades a legacy installed configuration that has no
+// policy path. Existing configured paths and policy documents are preserved.
+func EnableDevicePolicy(configPath string) error {
+	cfg, err := config.LoadRuntime(configPath)
+	if err != nil {
+		return err
+	}
+	if cfg.DevicePolicy.File != "" {
+		return nil
+	}
+	cfg.DevicePolicy.File = filepath.Join(filepath.Dir(configPath), "data", "device-policy.json")
+	created, err := device.CreateEmptyPolicyFile(cfg.DevicePolicy.File)
+	if err != nil {
+		return err
+	}
+	if err := config.Validate(cfg); err != nil {
+		if created {
+			_ = os.Remove(cfg.DevicePolicy.File)
+		}
+		return err
+	}
+	if err := Write(cfg, configPath); err != nil {
+		if created {
+			_ = os.Remove(cfg.DevicePolicy.File)
+		}
+		return err
+	}
+	return nil
 }
 
 func ValidatePackageSource(sourcePath string) error {
@@ -62,7 +99,7 @@ func ValidatePackageSource(sourcePath string) error {
 		return fmt.Errorf("installer seed config must use a managed profile; import profiles after installation")
 	}
 	if cfg.DevicePolicy.File != "" {
-		return fmt.Errorf("installer seed config must not reference a device policy file; configure it after installation")
+		return fmt.Errorf("installer seed config must not reference a device policy file; installation creates the managed policy")
 	}
 	return nil
 }

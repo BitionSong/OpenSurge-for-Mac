@@ -34,6 +34,63 @@ lab 会把 gateway 保持在 macOS 上，并用 socket_vmnet 网络中的 Lima �
 测试它。它验证 DHCP、DNS、ICMP/NAT、直连 HTTPS、通过 mihomo `mixed-port`
 的显式代理 HTTPS，以及清理行为。
 
+root-required Lab 目标应在同一个 TTY 里用 `sudo -v && make <lab-target>` 启动。
+macOS sudo 缓存既会过期，也可能因 TTY/执行上下文不同而无法被脚本中的 `sudo -n`
+复用；长时间连续跑多个门禁时，每个目标前都重新验证。除非运行环境明确需要无人值守，
+不要把临时凭据问题扩大成宽泛的免密 sudo；仓库提供的可选规则也只限 root-owned
+network helper 的三个固定子命令，不能代替网关测试所需的 sudo 缓存。
+冷 `lab-up` 可能比 sudo ticket 活得更久，因此它完成后必须再次验证再启动测试；长门禁
+结束后的 `lab-down` 同理。VM 停止但 helper stop 报 `sudo: a password is required` 时，
+应把它视为不完整清理并重新执行带 `sudo -v` 的 `lab-down`。
+
+Apple Silicon 上的 Codex/agent 终端可能经 Rosetta 运行，使 `uname -m` 显示
+`x86_64` 并触发安装器架构拒绝。确认 `sysctl.proc_translated=1` 和
+`hw.optional.arm64=1` 后，用
+`/usr/bin/arch -arm64 /bin/bash ./tests/lab/install-host-deps.sh` 运行安装器；Intel Mac
+不能使用这条绕行命令。
+
+第一次 `lab-up` 包含固定镜像下载和 guest 依赖安装，不能和持久化 VM 的后续启动耗时
+直接比较。正常清理使用 `lab-down` 保留磁盘，只有损坏或有意重建时使用 `lab-destroy`。
+guest 的数据面 DNS 在一次测试后会指向 `192.168.50.1`；而下一次 `lab-up` 时被测网关
+尚未运行，所以 provisioning 必须先恢复 Lima 控制面 DNS，并在依赖已齐全时跳过 apt，
+否则会表现为 UDP/53 connection refused 与很慢的 boot scripts。
+冷重建保持串行 provisioning，稳定复用的 VM 则并行启动；这样既不让两个 apt 任务争抢
+上游带宽，又避免日常启动累加两次独立 guest boot 时间。
+修改 `tests/lab/lima/client.yaml` 会使 Lima 按精确配置比较删除并重建对应
+VM，这是有意的冷启动。VZ 冷启动可能在约两分钟内没有新输出，然后从
+vsock SSH 回退到 usernet forwarder 并进入 `READY`；不要只因为这段静默就杀掉进程。
+先看 `runtime/tools/lima/bin/limactl list` 和 `~/.lima/<client>/ha.stderr.log`。
+
+Lab 环境问题必须与数据面失败分开记录：
+
+- 启动和清理会把 guest `/etc/resolv.conf` 恢复到 Lima 控制网关，并保证本机
+  hostname 可解析。如果 provisioning 报 `sudo: unable to resolve host` 或仍向已停止的
+  `192.168.50.1` 查询，先运行 guest helper 的 `restore-control`，不要把它算作
+  IPv6 数据面结果。
+- `omg0` 由 `/etc/systemd/network/05-open-mihomo-gateway-lab.network` 单一接管。
+  `networkctl status omg0` 应显示该文件；重复 IPv4/IPv6 默认路由通常意味着
+  netplan 和手工 DHCP/RA 同时在管理接口。IPv6 READY 信号还必须排除
+  `tentative` / `dadfailed` 地址，并要求正的 `preferred_lft`。
+- 自动 RA 模式不保证 `/etc/resolv.conf` 直接出现 IPv6 nameserver。IPv6 client
+  probe 应在没有显式 IPv6 nameserver 时使用 `omg0` IPv6 默认路由的 link-local
+  next hop，并附加接口 scope；空的 HTTP/3 client evidence 通常先检查这一点。
+- quic-go 在最小 guest 中可能报告无法把 UDP receive buffer 增大到建议值。若随后有
+  `CLIENT_IPV6_HTTP3_OK`，这是吞吐告警而不是握手失败；这个功能门槛不证明 QUIC 性能。
+- `runtime/lab/proxy.env` 中不可达的旧代理和专用 `/private/tmp` Go module
+  cache 残缺都是 patched Mihomo 的构建前故障。脚本会对 Go mirror 绕过旧代理，
+  并在日志确认是该专用 cache 的缺文件后清理并重试一次。先查
+  `runtime/lab/logs/mihomo-build.log`，不要进入数据面调试。
+- agent 沙箱中的 `sysctl kern.bootsessionuuid` / `kern.boottime` 或
+  `sysctl.proc_translated: operation not permitted` 是执行环境权限信号。需要
+  host-network 结论时，在已批准的同一 PTY 重跑对应门槛。
+- Lima 停止 VZ 时可能在红色日志中打印 `use of closed network connection`。
+  如果后续同时出现 `has shut down` 和 `lab network stopped`，这是 hostagent 关闭
+  listener 后的收尾噪声，不是清理失败。
+
+不要仅凭启动耗时把默认 `1 CPU / 512 MiB` 判定为不足。先采集 guest 的 available
+memory、load、CPU idle/iowait 和 OOM 记录；如果 CPU 主要 idle、内存仍可用且没有 OOM，
+应优先排查 DNS、下载和重复 provisioning，而不是增加 VM 常驻资源。
+
 ## 策略控制面门槛
 
 运行：
@@ -46,11 +103,71 @@ make policy-control-test
 也不需要 sudo。它用 imported profile fixture 验证 `policies`、`policy-select`、
 `connections`、`providers`、`provider-update` 和聚合 `snapshot` 能通过 live
 external-controller API 工作，并会重启 mihomo 证明 `profile.store-selected` 可以
-恢复选中的策略。它还会启动本机 origin 和受控 HTTP CONNECT proxy，证明
-`EgressSwitch` 可以把一次 mixed-port 请求从 `DIRECT` 切到受控代理。它适合策略组
-控制、file/HTTP provider 状态读取和刷新、机器可读 CLI、mihomo API wrapper 和
-`profile.store-selected` 相关改动；不要用它宣称 DHCP、DNS 下发、TUN 透明代理、
-same-LAN、真实设备路径或真实远端代理出口已验证。
+恢复选中的策略。它还通过真实核心的缓存选择、来源删除/恢复、配置校验和进程重启，
+验证设备默认出口与规则集/模版绑定的失效回退、有效候选保留、原始设置保留和恢复。
+这些断言不代替下游 TUN 流量验证。它还验证本机/私网 mixed-port 目标保持 `DIRECT`、专用
+local-routing 控制器协调三种模式、HTTP-only Global 的 UDP fail-closed，以及普通
+policy 接口不泄露内部组。它适合策略组控制、file/HTTP provider 状态读取和刷新、
+机器可读 CLI、mihomo API wrapper 和 `profile.store-selected` 相关改动；不要用它
+宣称 DHCP、DNS 下发、TUN 透明代理、same-LAN、真实设备路径或真实远端代理出口已验证。
+
+## 下游 IPv6 门槛
+
+运行：
+
+```sh
+make lab-test-ipv6-userspace
+make lab-test-ipv6-same-wifi
+make lab-test-ipv6-same-lan
+```
+
+前两条分别覆盖独立下游 LAN 与同 LAN DHCP 全屋接管：两台客户端必须获得
+`fdfe:dcba:9878::/64` SLAAC 地址、Medium 优先级 OpenSurge IPv6 默认路由和 RDNSS。
+其中 same-WiFi 门槛把第一台客户端配置为 IPv4 主路由绕行，要求设备状态报告
+`ipv6_blocked`、不生成 selector，并让 IPv6 TCP 命中最前置的 packet-listener
+`TUN + InUser REJECT`；第二台
+客户端仍须继续完成 IPv6 TCP、UDP 与 QUIC carrier 的 `DIRECT` 路径。
+第三条覆盖选择性旁路由：客户端手工使用不同 ULA，并把 Mac link-local 地址同时作为默认网关和 DNS，
+dnsmasq 配置中不得出现 RA。随后三条门槛都要求无显式代理的 IPv6 TCP、受控 UDP
+request/response、1200-byte QUIC Initial-shaped UDP carrier 和真实 HTTP/3-only
+request/response 通过本机 fixture 出现在 patched Mihomo 的 `opensurge-packet` 路径，
+并按两台客户端各自的 MAC/InUser 命中不同设备策略。HTTP/3 client 没有
+TCP/HTTP/2 fallback；它分别要求 `DIRECT` 和受控 SOCKS5 UDP 出口完成 QUIC TLS 与
+HTTP/3 GET，并要求 HTTP-only 出口记录 UDP `REJECT`、origin 与 CONNECT proxy 均无
+请求。TCP origin 必须收到实际 HTTP request，UDP fixture 必须返回固定答案，HTTP/3
+origin 必须记录 `HTTP/3.0`，不依赖公网上游作为唯一捕获证据。最后必须停止网关，验证
+自动模式的 RA/default route 或旁路由手工配置，以及 gateway alias、broker、
+socket/ready file 和 runtime state 被撤销。RFC 4862 允许客户端暂时保留
+deprecated/等待过期的 SLAAC 地址，因此门槛不要求地址瞬间消失。
+
+QUIC-shaped 项只证明 UDP carrier 和策略命中；HTTP/3-only fixture 证明的是三个本机
+受控出口场景，不等于所有 QUIC/HTTP3 版本、0-RTT、连接迁移、公网节点或代理组合。单元测试或直接
+Unix packet injection 可以证明 gVisor 与设备身份，但不能替代 macOS BPF、真实 RA 和
+停止撤销的 host-network 证据。
+
+真实订阅和公网 IPv6 出口使用独立的补充门槛：
+
+```sh
+sudo -v && \
+  OMG_LAB_IPV6_REAL_PROFILE=/absolute/path/to/profile.yaml \
+  make lab-test-ipv6-imported-egress
+```
+
+它不能取代 `lab-test-ipv6-userspace` 的受控 origin/UDP fixture。补充门槛把订阅复制到
+mode `0600` 的 Lab runtime，使用 `tun_ipv6: auto` 并要求
+`native_ipv6_available: true` / `ipv6_reason: native_ipv6_available`；先证明一台 VM 的
+MAC/InUser 域名 `REJECT`，再让它完成 IPv6-only HTTPS、IPv6 UDP DNS 回包和 QUIC
+形态 UDP 的 `DIRECT` 命中，并要求 Mac 基线和 VM HTTPS 回显分别属于当前上游接口的
+GUA；不同 socket 允许选择不同的 IPv6 隐私地址。之后选择一个不泄露名称、且已通过
+SOCKS5 UDP ASSOCIATE 公网 IPv6 DNS 回包的真实叶子节点，让另一台 VM 完成
+fake-AAAA HTTPS、真实 IPv6 字面地址 HTTPS、IPv6 UDP DNS 回包和 QUIC 形态 UDP 的
+`GLOBAL` 命中。VM 的 ULA 是真实下游 IPv6 包，但不是运营商委派的 GUA；`DIRECT` 是
+Mihomo/gVisor 从 Mac 发起新 socket，不是 ULA 原样转发。
+
+这个门槛只能输出脱敏 artifact。订阅副本、生成的 Mihomo 配置、原始 Mihomo 日志、
+selector/API 输出和 cache 都不得进入 artifact；保留文件必须再接受订阅 server、凭据和
+较长节点名 marker 扫描。只有确认网关停止成功后才删除 runtime secret；停止失败时保留
+mode `0600` 的恢复材料并把门槛判为失败。
 
 ## 真实设备 smoke
 
@@ -74,14 +191,14 @@ DHCP/DNS 并通过 Mac 网关出站。它不替代 `make lab-test` / `make lab-t
 
 当前进度快照来自 `docs/agent-wiki/sources/validation/real-device-smoke.md`。
 截至 2026-07-06 CST，本轮已经验证 explicit/off runner、TUN runner 和最小
-proxy egress runner 可以在物理下游 LAN 启动，真实 Pixel 手机可以获得
+proxy egress runner 可以在物理下游 LAN 启动，真实 Android 终端可以获得
 `192.168.50.100-200` 范围租约且 router/DNS 为 `192.168.50.1`。手机侧无代理
 直连 HTTPS/NAT、显式 `192.168.50.1:17890` HTTP proxy HTTPS、TUN 模式下无
 显式代理 HTTPS，以及本机受控 upstream proxy 命中 `open-surge-egress` 均已完成
 一次 smoke；Mac 侧能对应看到租约、DNS 查询、fake-ip 查询、`mihomo.log` 中的
 客户端目标连接，以及受控代理日志中的 `CONNECT example.com:443`。`stop` 清理
 范围包括释放下游接口上的 `192.168.50.1` 测试 LAN IP，避免后续 virtual LAN lab
-把 `192.168.50.0/24` 回程路由选到真实设备接口。
+把 `192.168.48.0/22` 的重叠回程路由选到真实设备接口。
 
 explicit 模式的关键验收信号是：
 
@@ -176,7 +293,7 @@ DoH/Private Relay、UDP/QUIC、imported profile 或策略组切换。Android 镜
 而不是把人工浏览器页面成功当成完整自动化证据。
 
 same-LAN 的真实代理出口可以先用最小 `upstream_proxy` 切片验证，不必先导入完整
-订阅。2026-07-09 已用 `api.ipify.org`、Pixel 测试手机和 LAN HTTP 代理完成这一
+订阅。2026-07-09 已用 `api.ipify.org`、下游测试终端和 LAN HTTP 代理完成这一
 层：Android 默认路由经 Mac、Android 显式代理为空、`dnsmasq.log` 看到 Android 源
 IP 查询 `api.ipify.org`、`mihomo.log` 显示
 `Domain(api.ipify.org) using open-surge-egress[same-lan-http-egress]`，Android
@@ -222,8 +339,9 @@ make lab-test-tun
 
 - `sudo -v` 和 lab target 在同一个终端/TTY 里连续执行。sudo ticket 不是跨
   agent exec 会话可靠共享的状态。
-- `192.168.50.1` 只配置在当前 lab bridge 上。真实设备 smoke 也会使用这个地址；
-  如果 `en7` 等接口残留 `192.168.50.1/24`，macOS 可能把 lab client 回程路由到
+- `192.168.50.1` 只配置在当前 lab bridge 上；virtual LAN 使用 `/22`，真实设备
+  smoke 默认仍使用 `/24`。如果 `en7` 等接口残留 `192.168.50.1/24`，macOS 可能把
+  重叠范围内的 lab client 回程路由到
   错误接口，表现为 TUN DNS timeout。先运行 `make real-device-stop` 或删除重复
   地址。
 
@@ -235,6 +353,12 @@ make lab-test-tun
 - 成功时输出 `transparent TUN log observed for example.com:443`；
 - gateway 被停止，`runtime/lab/state.json` 被移除；
 - artifacts 写入 `artifacts/lab`。
+
+`make lab-test-tun` 的标准配置保持 `local_system_proxy.enabled: false`，因此它能证明
+TUN 主路径没有回归，但不能证明系统代理协同已应用，也不能证明它解决某个真实 Network
+Extension 冲突。该兼容层需要额外的真实 Mac 验收：记录原 HTTP/HTTPS/PAC/自动发现状态，
+让冲突扩展保持启用，证明 TUN-only 失败、协同开关成功恢复目标应用访问，再停止网关并
+确认原状态恢复。只完成 mock `networksetup` 单元测试时必须明确写为未运行真实兼容验收。
 
 修改 mihomo profile 导入或 OpenSurge gateway overlay 行为时，优先使用：
 
@@ -265,6 +389,55 @@ Lab 中的受控 CONNECT proxy 必须把上游 DNS 查询和 TCP socket 都绑�
 interface。否则 proxy 自己的连接会再次进入正在测试的 TUN，或者把 mihomo fake-IP
 错误地发到物理接口，产生递归或 TLS timeout，而不是有效的出口切换证据。
 
+策略准备态与 App 候选启动的真实接管使用 `make lab-test-policy-workspace`。
+它复用 imported-egress Lab 的 HTTP Provider、受控 CONNECT proxy 和两台客户端，
+把夹具转为仅全局附加配置，检查预览与选择不写 desired 或基础恢复记录，再调用
+App 共用的 `DirectRunner.StartPolicyWorkspace`。门槛要求最终校验阶段仅一次、
+准备态进程与记录退出、工作目录和原生节点选择保留，然后验证 DIRECT/Provider
+两种 TUN 流量及停止清理。普通 `make test` 跳过该 root 用例；它不证明原生 App UI
+或真实 Tailnet Exit Node 公网出口。CLI 持久化配置路径仍由原 imported-egress 门槛覆盖。
+
+准备态的出口失效回归可单独运行：
+
+```sh
+OMG_PREPARED_MIHOMO_BINARY="$PWD/runtime/tools/bin/mihomo" \
+  go test ./internal/controlapi -run 'TestPolicyWorkspaceMissingDeviceEgressRealCore$' -count=1
+```
+
+它验证规则集和模版出口删除后的连续预览、默认出口回退与原选择恢复，只启动随机
+loopback controller 的准备态核心，不接管 TUN、DHCP 或 pf，不能替代上面的接管门槛。
+
+## Mac 本机模式隔离门槛
+
+运行：
+
+```sh
+make lab-test-tun-local-routing
+```
+
+当改动 `open-surge/mac-*` selector、本机 TUN/显式代理身份、规则 / 全局 / 直连语义，
+或本机与下游隔离时使用。门槛使用 imported TUN egress fixture 和受控 CONNECT proxy：
+
+1. Rule 模式下，本机继续进入 `TunEgress` 网关规则；
+2. Global 模式下，本机 TCP 使用受控代理，而下游客户端仍按 `TunEgress[DIRECT]`；
+3. Direct 模式下，本机保持 `DIRECT`，而下游客户端仍可按
+   `TunEgress[egress-proxy]` 使用受控代理；
+4. HTTP-only Global 出口令本机 UDP 状态明确为 `reject`；
+5. 普通 `policies` 输出不暴露 `open-surge/mac-*` 内部组。
+
+该门槛同时要求 `mihomo.log` 中本机 TUN source 为 `198.18.0.1`，下游仍保留自己的
+LAN IPv4。`make test`、`make web-test` 或 `make policy-control-test` 都不能替代这条
+真实 host-network/TUN 隔离证据。
+
+该门槛同时启用 `dns.ipv6: true`。无原生上游 IPv6 时，它向 TEST-NET-1
+发送受控 fake-AAAA TCP 与 QUIC 探针，证明流量以 `DEFAULT-TUN`、
+`fdfe:dcba:9876::1` 命中 `open-surge/mac-mode-*`：Rule 继续到导入规则，
+Direct 命中 `DIRECT`，Global 的 TCP 走所选出口而 HTTP-only UDP 明确命中
+`REJECT`。生成配置还必须只包含
+`DEFAULT-TUN + fdfe:dcba:9876::1/128`，不得扩大到 fake-IP `/64`、
+下游 `/64`、`fc00::/7` 或 `opensurge-ipv6`。再结合下游 IPv6 门槛中
+`opensurge-ipv6` / `IN-USER` 仍保持设备策略的证据，才能完成本机与下游隔离结论。
+
 ## 每设备策略门槛
 
 运行：
@@ -274,8 +447,9 @@ make lab-test-tun-device-policy
 ```
 
 当改动 MAC 绑定 DHCP reservation、设备路由模式、每设备 selector 或设备规则覆盖的
-数据路径时，使用此门槛。它使用两个 Lima VM，验证两个设备获得 `.101`/`.102` 固定
-IPv4，先证明 `dedicated` 设备的 default selector 位于全局 `MATCH` 之前，再证明
+数据路径时，使用此门槛。它让 bridge 与 DHCP 客户端实际使用 `/22`，并验证两个 Lima
+VM 跨第三段获得 `192.168.50.101`/`192.168.51.102` 固定 IPv4；先证明 `dedicated`
+设备的 default selector 位于全局 `MATCH` 之前，再证明
 `inherit_global` 设备没有 default selector 且走全局 `MATCH`；随后通过 reload 把后者改成
 独立模式，验证两台设备可独立选择不同 TUN egress，并验证设备专属 IP `REJECT`。它还断言 applied policy snapshot/state digest、`omg devices` 的
 `policy_identity_ready`/`lease_match` 对真实租约成立、desired 文件修改后的 drift，
@@ -283,11 +457,18 @@ IPv4，先证明 `dedicated` 设备的 default selector 位于全局 `MATCH` 之
 selector 隔离；同时要求设备默认 selector 指向 HTTP-only outbound 时 UDP/443 命中
 `REJECT` fallback 而非 fall through 到全局 `MATCH,DIRECT`。它证明设备身份、跟随与
 独立模式、默认出口、安全 reload、UDP fail-closed 和覆盖规则的真实 LAN/TUN 数据路径。
+同一 fixture 还保留一条旧 LAN 带 MAC 登记，要求完整 desired 仍在，而 compiled/applied
+设备列表、dnsmasq、Mihomo IPv4 规则/selector 和 IPv6 MAC 身份均排除它。
+门槛还会让两台客户端各建立一条持久连接；切换第一台设备 selector 后，通过真实 Control
+API 刷新该设备连接。第一台设备的旧连接必须消失，第二台设备连接必须保留，第一台设备
+随后建立的新连接必须使用当前 selector。
 
 大型 rule-provider、模板与 domain/IP/protocol/port 组合只改变配置编译时，
-`make test` 提供相应覆盖；不需要为每条操作者定义的规则运行 Lab。当前设备身份
-边界是 MAC 绑定 IPv4 DHCP reservation 加 IPv4 `SRC-IP-CIDR`，不是 IPv6 或 mihomo
-内的 MAC 匹配。
+`make test` 提供相应覆盖；不需要为每条操作者定义的规则运行 Lab。系统 TUN 的设备
+身份边界是 MAC 绑定 IPv4 DHCP reservation 加 IPv4 `SRC-IP-CIDR`；下游 IPv6 则由
+packet path 把观察到的 source MAC 映射为 patched Mihomo 的 `IN-USER(device:<id>)`。
+后者是路由归属，不是防 MAC spoofing 认证；`upstream_router` 设备只用它命中最高优先级
+IPv6 `REJECT`。
 
 2026-07-11 已在 P1-1..P1-5 修复（commit `7b14586`）后运行此门槛并通过：两个 VM
 拿到 `.101`/`.102` 固定租约且 `omg devices` identity 就绪，UDP
@@ -312,6 +493,48 @@ make same-wifi-dhcp-verify-device-policy-recovery
 截至本实现落地时该 gate 尚未在本轮真机运行；因此 same-WiFi per-device 只能标记为
 Experimental / cooperative IPv4，不能借用 virtual lab 的通过记录宣称已验收。
 
+## Tailscale 出站门槛
+
+运行：
+
+```sh
+OMG_LAB_TAILSCALE_PEER_AUTH_KEY_FILE=/private/path/peer.key \
+OMG_LAB_TAILSCALE_OPEN_SURGE_AUTH_KEY_FILE=/private/path/managed.key \
+make lab-test-tailscale
+```
+
+首次设置包含 peer VM 与 managed tsnet 两次独立注册：one-off key 需要两个仓库外、
+mode `0600` 的文件；reusable、非 Ephemeral key 可以让两个变量指向同一个文件。
+身份持久化后，后续运行不再需要相应 key；reusable key 主要服务于销毁状态后的自动
+重建。这个门槛只在 Mac 原生 Tailscale App
+`BackendState=Running` 且没有启用 Exit Node 时继续，并要求：
+
+- 独立 `omg-lab-ts-peer` 只有 Lima NAT/control NIC，没有 `omg0`，默认路由不经过
+  `tailscale0`；
+- Control API 从本机 App 自动发现该 peer、布尔型在线提示和 MagicDNS 后缀；在线字段
+  只作为 advisory 元数据，实际可达性由后续 TCP/UDP fixture 判定；
+- 第一台下游 VM 对 peer 精确 IPv4 的 TCP/UDP request-response，以及完整 MagicDNS
+  名称的 TCP，都命中 `open-surge/tailscale`；
+- 第二台下游 VM 对相同 peer IP/MagicDNS 的 TCP/UDP 都命中 `REJECT`，不能 fall
+  through 到 `DIRECT` 后借用 Mac 原生 Tailscale route；
+- peer fixture 只观察到授权请求，且这些请求来自同一个 managed Tailnet 地址，不能
+  等于 Mac 原生 App 的 Tailnet IPv4；
+- 网关启动前 peer 的现有 route 必须选择 `utun`，含 Auth Key 的 `mihomo.yaml` 在
+  root 写入前后都必须保持 mode `0600`；
+- 停止网关后清除 runtime state；artifact 不包含 Auth Key、完整 Mihomo 配置、原始
+  Mihomo/fixture log、Tailnet 地址或 tsnet state。
+
+这条门槛允许宣称 peer IPv4、MagicDNS、TCP/UDP、来源授权和未授权 fail-closed 已在
+真实 Tailnet + macOS TUN 路径验证。它不允许宣称 subnet router、Exit Node 公网出口、
+Headscale、真实远端 LAN 或全部 NAT traversal/DERP 组合已验证。Lima peer underlay
+通过 Mac 当前普通上游是允许的；判定应用路径依赖 peer 观察到的 managed source 与
+Mihomo action log，不依赖 underlay 出口 IP。
+
+实际远端 LAN 的端口测试见
+[Tailscale 4via6 子网 smoke](../../sources/validation/tailscale-4via6-subnet-smoke.md)。
+该记录区分 Mac 本机、下游手机和远端路由器证据；同一 Mac 兼任 Exit Node 与
+Subnet Router 时，精确子网路由成功不等于公网默认出口或所有下游设备已验证。
+
 ## same-WiFi 上游断链恢复门槛
 
 Mac 与下游客户端共用同一个 Wi-Fi 接口时，普通连通性 smoke 不足以证明上游断链恢复。
@@ -327,9 +550,18 @@ Mac 与下游客户端共用同一个 Wi-Fi 接口时，普通连通性 smoke �
 5. 重复 DIRECT 与代理出口探针，要求均恢复，并确认旧日志已归档；
 6. 最后完成 same-WiFi stop 与路由器 DHCP、Mac DHCP、客户端自动获取恢复门槛。
 
-`make test` 只证明独立恢复动作的状态事务和接口边界。普通 `make lab-test-tun` 使用虚拟
-LAN，不能代替物理 Wi-Fi 断开/重关联证据；在上述真实门槛未运行前，不得宣称自动恢复或
-根因已经彻底修复。
+`make test` 只证明独立恢复动作、单次自动触发和生命周期互斥的状态事务与接口边界。
+普通 `make lab-test-tun` 使用虚拟 LAN，不能代替物理 Wi-Fi 断开/重关联证据；在上述真实
+门槛未运行前，只能说明自动恢复机制已经实现，不能宣称物理链路恢复或根因已经彻底验收。
+
+## 合盖运行门槛
+
+单元测试必须覆盖默认关闭且不持久化、Helper lease 丢失、外部 `SleepDisabled` 拒绝接管、
+ownership marker 引用计数和上次异常运行的 marker reconciliation。pkg 静态检查必须确认
+升级与卸载只在 marker 存在时恢复睡眠。它们不证明特定 Mac 型号和 macOS 版本在电池/电源
+下的真实合盖行为；正式宣称前还需在安装包环境分别验证开关启用时合盖保持运行、关闭时
+恢复合盖睡眠、Control Service kill、Helper kill 与系统重启后的恢复，并记录 `pmset -g`
+中的 `SleepDisabled` 证据。测试机必须保持通风，不能把合盖运行中的机器放入包内。
 
 ## 结论纪律
 

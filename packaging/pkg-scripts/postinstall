@@ -12,6 +12,7 @@ if [[ ! -f "$ROOT/config.yaml" ]]; then
   "$ROOT/bin/opensurge-install-config" --source "$ROOT/share/config.yaml" --root "$ROOT" --output "$ROOT/config.yaml"
 else
   echo "Preserving existing OpenSurge config and data during upgrade: $ROOT/config.yaml"
+  "$ROOT/bin/opensurge-install-config" --source "$ROOT/config.yaml" --enable-device-policy
 fi
 chown -R root:"$GROUP" "$ROOT" /Library/Logs/OpenSurge /var/run/opensurge
 chmod 0750 "$ROOT/bin" /Library/Logs/OpenSurge /var/run/opensurge

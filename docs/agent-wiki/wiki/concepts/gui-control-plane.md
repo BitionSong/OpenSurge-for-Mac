@@ -1,13 +1,57 @@
 # GUI 控制面
 
 OpenSurge 的完整 GUI 是 `web/` 中的 React 应用，菜单栏 App 是
-`apps/menubar/` 中由 AppKit 管理生命周期和状态项、由 SwiftUI 渲染状态面板的只读
+`apps/menubar/` 中由 AppKit 管理生命周期和状态项、由 SwiftUI 渲染状态面板的轻量
 launcher。两者都只访问 `cmd/opensurge-control` 提供的 loopback API；业务规则继续位于
 Go gateway、device、mihomo 和 runtime 包中。
 
+原生应用图标由 `apps/menubar/Resources/OpenSurgeAppIcon.png` 经
+`scripts/build-menubar-app.sh` 等比生成各档 `.icns` 资源。1024 × 1024 源图已包含
+透明留白：白色底板主体宽约 824 px、每侧留白约 100 px；构建时不要再次补同样的边距。
+此比例用于传统 `.icns` 的视觉对齐，不是所有 macOS 图标格式的通用尺寸契约。
+未来采用 Icon Composer 时应按其模板重新校准并验证系统实际渲染。菜单栏状态项使用
+独立的 `OpenSurgeMenuBarIcon.png`，显示尺寸为 18 × 18 pt，不跟随应用图标的留白调整。
+
 菜单栏 App 不提供 start/stop 或策略切换。它只消费 `/api/v1/menubar`，显示网关、
-客户端、drift 和恢复状态，并通过一次性 bootstrap URL 打开 Web GUI。不要把菜单栏
-演变成第二控制面。
+客户端、drift 和恢复状态，并通过一次性 bootstrap URL 打开 Web GUI。唯一独立动作是
+与网关状态无关的临时“合盖保持运行”开关；不要借此把菜单栏演变成第二套网关控制面。
+
+界面语言同样保持单一设置入口：Web GUI 的侧栏提供“跟随系统 / 简体中文 / English”，
+菜单栏面板不再增加第二个选择器。默认值是 `system`；用户没有选择过语言时，Web 按浏览器
+第一语言、菜单栏按 `Locale.preferredLanguages` 的第一项决定显示语言，所有 `zh-*` 偏好
+使用简体中文，其他语言回退到 English。Web 通过受认证的
+`GET/PUT /api/v1/ui-preferences` 保存 `system | zh-Hans | en`，Control Service 将该偏好以
+`0600` 写入用户数据目录的 `preferences.json`，并在 overview、menubar 与 state event 中
+返回同一值。浏览器 localStorage 只用于避免首屏闪烁，不是第二份权威偏好；菜单栏通过现有
+状态轮询最终同步 Web 的选择，在取得第一份状态前仍按本机语言显示。网络模式的三张拓扑图
+使用 React 内联 SVG，共享主题色并通过同一文案目录翻译 `<title>`、`<desc>` 与图内标签，
+不要恢复成明暗主题各一套、无法随语言变化的静态 SVG。
+新增或合并的 Web GUI 页面必须把所有面向用户的中文传入统一 `t()`
+目录，不能只翻译导航和旧页面。`make web-test` 中的 `check-i18n.mjs`
+是覆盖门槛；新功能的英文组件测试还应展开主要对话框/预览，断言可见
+内容不再包含 CJK 字符，避免仅首屏看起来已翻译。
+
+睡眠开关默认关闭、不写 preference，只由 Control Service 内存中的 lease 表示本次运行
+意图。菜单栏与 Web GUI 都调用 `PUT /api/v1/sleep-prevention`；Control Service 保持到 root
+Helper 的长连接，连接 EOF、完整退出或服务崩溃都会释放。普通 `caffeinate` 的 idle sleep
+assertion 不能覆盖 lid close，因此 Helper 使用系统级 `pmset -a disablesleep`。启用前若
+`SleepDisabled` 已由外部设置为 1，Helper 拒绝接管；只有创建了 root-owned marker 后才
+会在释放时写回 0。marker 位于持久的系统 runtime 目录，必须先于 `pmset` 写入，确保系统
+重启、Helper 重启、pkg 升级和卸载能识别并恢复 OpenSurge 遗留的临时接管。UI 必须提示
+耗电、发热和不要放入不通风包内。
+
+两端不能缓存独立的开关意图。PUT 成功后应立即采用响应中的 lease 状态；Web SSE 的
+`state` 变化签名包含 `sleep_prevention`，因此菜单栏切换会促使已打开的 Web GUI 刷新。
+菜单栏打开时的快速轮询和 Web overview 定时读取负责最终收敛，并且较早发出的状态请求
+不得覆盖较新的 PUT 结果。
+
+版本发现属于原生 App 生命周期而不是网关控制面。菜单栏 App 打开时至多每 24 小时查询
+一次本仓库 GitHub `releases/latest`，也提供手动检查；只比较稳定版语义版本并校验返回的
+下载页仍位于 `YTwsy/OpenSurge-for-Mac`。发现新版本后只打开对应 Release 页面，不下载
+PKG、不请求管理员权限，也不触发 gateway、Control Service 或 Helper 生命周期动作。
+打包时额外写入完整 `OpenSurgeReleaseTag`；比较遵循
+`0.1.24-rc.1 < 0.1.24`，因此 RC 不会降级到旧 stable，同版本 stable 发布后仍会提示。
+旧包没有该 key 时才回退到 `CFBundleShortVersionString`。
 
 菜单栏 App 使用纯 AppKit `NSApplication` 生命周期，不声明占位的 SwiftUI `Settings`
 Scene；否则这个由系统管理、可恢复的空窗口可能在部分 macOS 环境中被显示。状态面板使用
@@ -31,10 +75,43 @@ SwiftUI 面板显式使用 active control appearance，状态栏按钮以持久 
 给动画留出 window 创建宽限期并确认真实 window；超时后执行一次非阻塞兜底展示并清除
 pending，不能留下永久卡住状态。macOS 13 仅保留兼容的旧 activation fallback。
 
+不要再尝试"把面板 focus 工作推迟到展开动画结束之后"这一类改法。`codex/release-v0.1.24`
+上曾连续提交四版实现：无条件 activation fallback、把展开推迟到 reopen 激活、用
+`popoverDidShow` 作为动画完成信号、以及用固定 settle 时间窗跳过
+`makeKeyAndOrderFront`。它们都没有修复实际报告的展开异常，反而引入了新的问题，已被
+整体回退到 `0932641`。若要重开这个方向，先给出可复现的 WindowServer 级证据和真机
+验收，不要只依赖单元测试与 `scripts/check-menubar.sh`。
+
 Web GUI 总览页的“启动网关”与“停止网关”只导航到 `network` 页面，不得直接调用
 gateway start/stop API。真实生命周期动作留在网络页，使 topology、plan blocker、DHCP
 接管与恢复状态在用户确认前保持可见。“启动网关”只切换页面，不改变当前滚动位置；
 “停止网关”切换页面后滚动到页面底部，完整露出恢复状态机的当前操作按钮。
+
+策略页不再依赖网关已经启动。运行中读取真实运行 core；停止时由 root Helper 通过长连接
+lease 维持一个仅开放随机、带 secret 的 loopback Controller 的 prepared mihomo。页面从同一
+workspace API 获取最终策略组、选择与健康状态，因此 Provider、全局附加节点和 Tailscale
+Exit Node 都以最终合成结果出现，选择写入与下一次网关共用的 mihomo cache。prepared core
+不能开启 mixed/SOCKS/HTTP 业务端口、DNS listener、TUN、DHCP、pf、forwarding 或 IPv6
+packet ingress；Control Service 退出/断连、Helper 重启以及真实 gateway start/stop 都必须
+回收或交接它，且不能根据未验证 PID 杀进程。
+
+没有导入 mihomo YAML 也是策略页的一等状态。启用的全局附加配置以 OpenSurge 的 managed
+最小 profile 为基底，可以独立添加节点、`select` 组与规则。停止态策略页的 read/select/test
+只生成准备态产物并使用原有选择/测速缓存，不修改 desired 或基础恢复记录。用户可以不打开策略页，
+直接从 Web GUI 启动；Control Service 会把服务器端读取的同一来源/附加配置快照交给 Helper，
+Helper 在一个跨进程 lifecycle lock 内合成候选，由 Manager 解析最终网络参数、渲染并执行
+一次真实 `mihomo -t`，成功后才提交 desired 并接管网络；失败不能退回旧配置启动。策略页因此是可选的预览、选择与测速入口，
+不是启动前置步骤。来源、附加配置或 Tailscale 任一为空都必须返回正常的空/部分策略快照，
+而不是崩溃。运行中仍只展示 applied core，不能因为轮询策略页而把尚未显式应用的草稿热重载
+进当前网关。`sudo omg start` 只启动已经持久化的 root-owned desired 配置，不读取用户 Control
+Store 中的 Web 草稿。仅附加配置的运行中草稿通过下一次 App 启动采用。
+候选错误必须显示具体原因并清除旧成功快照；Provider 首次加载尚无节点属于正常空状态。
+
+workspace 请求同时携带 Control Service 捕获的 gateway running/stopped 状态。Helper 在跨进程
+lifecycle lock 内重新读取 state；若 CLI 或另一客户端已经完成 start/stop，本次 read/select/test
+或 start 必须返回刷新/重试，而不能跨状态复用快照。HTTP/file Provider 沿用既有相对、绝对
+和缺省路径解释，不做通用缓存重命名。新合成产物、选择缓存与 Tailscale 身份共用固定的
+受信任工作目录；composition base metadata 位于 runtime 控制目录，并只随显式提交更新。
 
 网络页对 `same_wifi_dhcp` 保留带恢复证据的完整状态机；`same_lan` 与 `isolated_lan`
 使用独立“网关运行控制”卡片直接调用 start/stop operation。未保存配置必须阻止启动，
@@ -44,6 +121,15 @@ gateway start/stop API。真实生命周期动作留在网络页，使 topology�
 菜单栏 indicator 先判断需要用户处理的 recovery，再判断 gateway 是否明确 `stopped`；
 只有正在运行或 degraded 的 gateway 才把 drift/doctor failure 表示为“运行异常”。停止状态
 下的 runtime doctor failure 或待应用配置不能覆盖“OpenSurge 网关已停止”。
+
+Doctor 包含真实 `mihomo -t`，单次配置验证最长可到 90 秒，因此不得从
+`/api/v1/overview`、`/api/v1/menubar`、SSE 或其他轮询热路径同步执行。Web 诊断页通过
+`POST /api/v1/doctor` 显式启动 Control Service 内的 single-flight 后台检查，再用
+`GET /api/v1/doctor` 读取运行状态和缓存结果；重复请求只能观察同一份进行中的任务。
+缓存以主配置、设备策略与 imported profile 摘要共同标识，配置变化后只能显示为旧结果，
+不能继续影响当前菜单栏健康状态。这个只读 Doctor 缓存不参与 start/reload 放行；两者仍须
+执行各自的真实预检与 TUN readiness，不能用历史 Doctor 成功结果替代。
+
 进程刚启动且尚未取得第一份状态时使用独立的 connecting 状态和 OpenSurge 品牌图标；真实
 请求失败后进入 unreachable，但仍使用更低透明度的品牌图标和明确的无障碍文案区分。初装
 期间不能因为 Control Service 启动稍慢而退回看起来像旧版图标的 `network.slash`。
@@ -105,6 +191,23 @@ OFFER 探测不可用，认证后的 Web GUI 提供带断网警告和显式人�
 如果用户明确选择长期保持静态 IPv4，网关成功停止后也可跳过路由器 DHCP 探测与 Mac
 自动 DHCP 恢复，直接进入 `complete_static`。该动作不调用 `ProbeDHCP` 或 `SetDHCP`，必须
 保留持久化说明，并提示其他客户端需要有效静态配置或另一个 DHCP 服务器。
+
+初次启动、停止、重载、Mihomo 恢复，以及设备策略/来源/Tailscale 配置应用，复用全局
+operation 进度卡。客户端提交即显示等待状态，后续 `phase`、`phase_started_at`、
+`notices` 来自 Go 生命周期实际边界；只显示阶段与耗时，不模拟百分比。进度卡在页面
+切换后继续显示，刷新时只恢复未完成操作，不重新弹出旧成功记录。网络页的 DHCP 接管
+client acceptance 不会被“启动完成”替代。
+
+Helper 请求可选 `watch_progress`：新 Helper 先发送带 `progress` 的 JSON 帧，最后仍
+返回原有结果；旧客户端不请求该字段时只收到最终帧，新客户端也兼容旧 Helper 的单帧
+响应。进度写入超时后停止观察，不能因为 UI 断开而阻塞网络清理。同步配置 API 仍保持
+原请求/响应契约，可用 `X-OpenSurge-Operation-ID` 关联进行中的记录；该字段不是重放
+授权，重复 ID 拒绝，ID 仅允许 1–128 个字母、数字、连字符或下划线。
+
+同一操作共享状态轮询；读取失败可重试 GET，但不得自动重试原 POST/PUT。浏览器断连
+或等待超时应显示“结果尚未确认”，保留原 ID 供重新查询和诊断，不将其当作网关已停止、
+已失败或应该重新启动。认证失效继续遵守停止轮询与 SSE 的既有边界。
+
 订阅完整 URL 存在用户应用支持目录的独立 `credentials/sources.json`，目录权限为 `0700`、
 文件权限为 `0600`；公开 sources JSON 只保留脱敏 origin，API、日志和诊断不得返回刷新
 凭据。升级只尝试一次从旧 `com.opensurge.sources` Keychain 项迁移，并无论成功或失败都
@@ -156,6 +259,14 @@ source 是同步的两阶段事务：先写候选并做真实校验，再通过�
 展示接口、LAN IPv4、接管模式和 desired/applied 状态；不要从 `recovery.topology` 猜当前
 模式，也不要再增加一条重复的网络上下文条。
 
+来源列表只公开经过管理目录校验的 `snapshot_display_path`，继续清空原始
+`snapshot_path` 与订阅取回地址。复制完整路径、Finder 定位和导出副本分别通过受认证的
+来源文件接口执行；动作前必须同时校验 source ID、digest、规范化路径、私有权限和文件
+内容摘要，不能把任意持久化路径交给 Finder。管理快照只读，导出副本写入 Control Service
+用户数据目录下的 `exports/`，目录权限 `0700`、文件权限 `0600`，命名包含来源名、摘要短值
+和时间戳且不得覆盖旧文件。导出成功后用用户会话中的 Finder 选中新文件；如果 Finder
+调用失败，已经写出的副本必须保留，并在错误反馈中给出其显示路径。
+
 局域网 DHCP 接管 start 后还有 `client_validated` 阶段：要求 active lease、DHCPACK、客户端源 IP
 DNS 与 mihomo TUN 日志，并保存用户对网关/DNS、无显式代理和 IPv6 绕过警告的确认。
 Web GUI 允许用户显式进入 `client_validation_skipped`，然后继续 stop；这只是解除流程阻塞，
@@ -186,26 +297,47 @@ Mac 执行 `networksetup -setdhcp` 后，DHCP 租约与 router 字段可能短�
 冒充 DHCP 恢复，也不触发任何网络 runner。
 
 网络配置通过 revisioned `GET/PUT /api/v1/config` 修改；只允许 topology、DHCP/DNS、
-TUN 和 device-policy 初始化字段，运行中或 `prepared` 之后的 recovery 时拒绝。所有
+TUN、本机系统代理协同和 device-policy 初始化字段，运行中或 `prepared` 之后的 recovery 时拒绝。所有
 production 写入经 helper 落到 root-owned config。`/events` 发送真实
 config/gateway/drift/recovery 变化，诊断接口返回连接与脱敏后的短日志尾部。
 上下游接口字段通过只读 `GET /api/v1/network/interfaces` 提供 macOS 网络服务候选，
 但仍保留可输入形式以支持没有列入网络服务顺序的 bridge、VLAN 或临时接口。
+安装器初始网络字段尚未保存为用户配置时，选择 `same_lan` 或 `same_wifi_dhcp` 会通过只读
+`GET /api/v1/network/defaults` 读取当前 IPv4 默认路由对应的网络服务，把同一接口、当前
+IPv4、子网前缀与 `dns.listen` 写入前端草稿；`same_wifi_dhcp` 还会在该网段内生成避开
+Mac、路由器和受保护地址的建议池。同一条路径还挂在网络页的「根据当前网络重新填入」
+按钮上，供 Mac 换网络后手工对齐。建议不自动保存、不执行 `networksetup`，
+已有配置也不得被静默覆盖。
+`isolated_lan` 不使用这条建议路径，继续由操作者手工配置独立下游接口和子网。
 `same_lan` 不运行 DHCP 服务，因此地址池与租期整组必须禁用并明确标记为运行时不使用；
 保留字段值只用于日后切换 topology，不能暗示当前模式会应用它们。
 配置填写提示应作为表单内的低强调步骤说明，保存区与最后一组字段保持明确间距，并显示
-当前已保存或存在未保存修改，避免按钮紧贴字段卡片。
+当前已保存或存在未保存修改，避免按钮紧贴字段卡片。设备页的未保存修改与已保存待重载
+状态使用同一套底部浮动操作条；保存后直接从“保存设备配置”切换为“应用并重载网关”，
+不把待重载提示移回页面顶部。
 
-设备页的主交互必须区分绿色“即时生效”和黄色“需重载”。前者只允许切换已应用的非
-`device/` 全局组和 `device/<id>/<slot>`；后者编辑 desired 设备身份、路由模式、候选与规则。
-设备路由模式是 `inherit_global`（跟随本机/全局规则）或 `dedicated`（公网流量优先设备
-default selector，本地/私网保持直连）；缺失字段显示旧版兼容状态并要求显式迁移。
-全局组说明不得暗示 macOS system proxy 或统一 fallback。DHCP 模式的登记面板复用
+设备页先显示独立的 Mac 本机模式卡片；它只调用 `GET/POST /api/v1/local-routing`，
+在规则 / 全局 / 直连之间协调 `open-surge/mac-*` 隐藏 selector。卡片必须说明只影响
+TUN/本机显式代理的新连接，且自身不修改 macOS system proxy 或下游设备。系统代理只由
+Desired 网络配置中默认关闭、仅 TUN 可用的独立兼容开关管理。
+
+下游设备交互继续区分绿色“即时生效”和黄色“需重载”。前者只允许切换已应用的
+`device/<id>/<slot>`；后者编辑 desired 设备身份、路由模式、候选与规则。设备路由模式
+是 `inherit_global`（跟随 imported/managed 网关规则，不跟随 Mac 本机开关）或
+`dedicated`（公网流量优先设备 default selector，本地/私网保持直连）；缺失字段显示
+旧版兼容状态并要求显式迁移。DHCP 模式的登记面板复用
 OpenSurge lease 自动填写 hostname、MAC 与 IPv4；`same_lan` 则列出 mihomo 当前观察到且
-与 gateway 同 `/24` 的源 IPv4，并用 macOS ARP 邻居表尽力补 MAC。只有当前经过 Mac 的
+与 gateway 同网段的源 IPv4，并用 macOS ARP 邻居表尽力补 MAC。只有当前经过 Mac 的
 设备会出现，ARP/流量观察不得显示为 DHCP 验证。登记默认创建 `<device-id>-policy` 私有 Profile；首次
-编辑共享/Template Profile 时将解析后内容复制为无 Template 的设备私有 Profile。
-Profiles/Templates/Rule Sets 作为高级复用机制默认折叠。
+编辑共享/旧式 Template Profile 时将解析后内容复制为设备私有 Profile。
+主界面不把 Profile 作为复用对象：默认展开的“规则库”只显示规则集、无出口分流模版和
+设备分流。设备卡的“编辑设备分流”直接打开对应设备；旧的独立设备规则卡片和
+“高级 / 复用”卡片不再渲染。
+
+设备卡自身提供整设备管理：「编辑身份与路由」复用登记面板并预填现有身份，「删除设备」
+同时清理该设备的私有 Profile。两者都只改本地草稿，仍走同一次“保存设备配置”。设备
+policy 是整文档提交，因此这些入口是操作者修正身份的唯一途径；`out_of_lan_devices`
+标记的设备只能在这里改地址或删除，界面必须把这条出路说清楚。
 
 策略页承担完整节点健康中心：`GET /api/v1/proxy-health` 汇总 mihomo `/proxies`，
 `POST /api/v1/proxy-health/tests` 只允许探测当前 snapshot 中的 leaf proxy，并使用固定
@@ -216,7 +348,9 @@ Mac 上 mihomo 到检测地址的节点可达性，不是下游设备数据面�
 连通性页使用后端固定 catalog，避免把任意 URL 探测变成 SSRF 接口。
 `POST /api/v1/connectivity/tests` 从 Control Service 经 applied runtime mixed-port 发起
 三轮请求，并在请求仍活跃时尽力关联 mihomo connection 的 rule、rule payload 和 chain。
-它能证明 applied 全局规则路径，不证明设备 `SRC-IP-CIDR`、DHCP、DNS 或 TUN。页面把
+loopback 来源会进入当前 Mac 本机模式，因此 scope 是 `local_mac_runtime`；它证明
+applied 配置 + 本机运行路径，不证明下游网关规则、设备 `SRC-IP-CIDR`、DHCP、DNS 或
+TUN。页面把
 Net.Coffee 明确标为浏览器本机外部检测，并把尚无真实客户端发起器的“设备端检测”显示
 为不可用，不能把三种 scope 合并为一个模糊的“网络正常”。
 
@@ -232,6 +366,17 @@ Desired 网络配置默认把 `dns.upstream` 显示为 `127.0.0.1#1053`，形成
 路径。`1.1.1.1` 只作为显式调试预设；TUN 的 `dns-hijack any:53` 仍可能捕获该查询，
 因此 UI 不把它描述为可靠的直连或 TUN bypass。
 
+上游 DNS、`transparent.mode` 与 `mihomo.store_fake_ip` 位于默认折叠的“高级 Mihomo /
+DNS 设置”。`store_fake_ip` 对新配置和缺少该字段的旧配置默认开启，并生成
+`profile.store-fake-ip: true`；旧 schema-v1 客户端省略该字段时，Control API 必须保留
+现值，不能静默关闭。关闭开关只影响后续运行配置，不会清除已经保存的映射。缓存清理应
+作为独立显式动作，不能与 `fake-ip-filter` 或持久化开关混为一谈。
+
+Desired 网络配置同时提供 `local_system_proxy.enabled`。文案必须说明 SafeDNS、DNS
+Proxy/内容过滤等已知用途、只覆盖遵循系统代理的 Mac 应用、不替代 TUN、不影响下游设备，
+以及已有 HTTP/HTTPS proxy、PAC 或自动发现时启动会 fail closed。关闭 TUN 时前端应同时
+关闭并禁用该开关，后端验证仍作为最终边界。
+
 用户可见产品文案把 `same_wifi_dhcp` 称为“局域网 DHCP 接管”，因为该协作式二层
 拓扑可由 Wi-Fi 或以太网承载；`same_wifi_dhcp` 仅作为现有配置枚举和 runner 名称保留。
 
@@ -243,7 +388,9 @@ bundle identifier 与 launchd label 保持既有技术命名。生产 pkg 把 ap
 `/Library/Application Support/OpenSurge` / `PrivilegedHelperTools` 下；用户级 Control
 Service 只通过 admin 组只读访问 applied 状态，通过 helper 执行固定 privileged 动作。
 打包时 `OPENSURGE_VERSION` 必须同时写入 pkg receipt 与菜单栏 App 的 short version，
-`OPENSURGE_BUILD_NUMBER` 写入 App build number，避免新安装包继续携带旧的 bundle 版本标识。
+`OPENSURGE_BUILD_NUMBER` 写入 App build number，`OPENSURGE_RELEASE_TAG` 写入完整 stable/RC
+tag；tag 的基础版本必须与 pkg 版本一致，避免新安装包继续携带旧的 bundle 版本标识，或让
+RC 丢失其预发布身份。
 没有 Apple Developer 身份的 GitHub tag workflow 会产生 Apple Silicon 与 Intel 两个
 架构专用的 unsigned 正式 Release 安装包：文件名分别带 `arm64-unsigned.pkg` 与
 `x86_64-unsigned.pkg`，发布同时提供合并的 SHA-256 清单和每个 pkg 的 GitHub artifact
@@ -251,9 +398,13 @@ attestation。正式 Release 只表示 GitHub 发布通道稳定，不得把 Git
 Developer ID 签名或 notarization，也不得指导用户全局关闭 Gatekeeper 或递归移除
 quarantine；安装仍使用系统设置针对单个包的“仍要打开”。
 
-pkg 升级必须在覆盖 payload 前执行 recovery 门禁，并按 Control Service/菜单栏退出、
-旧版 `omg stop`、root helper bootout 的顺序清理运行进程。recovery 非 `idle`/`complete`/
-`complete_static` 或旧版网关停止失败时直接拒绝升级；`complete_static` 是明确保留 Mac
+pkg 升级必须在覆盖 payload 前执行 recovery 门禁。进程清理必须先终止菜单栏 App，阻断
+其“Control Service 不可用时自动 bootstrap”的恢复路径，再循环 bootout 精确的用户级
+Control Service 并重新扫描已安装可执行文件；等待期间新出现的受信 PID 也必须再次清理，
+避免一次迟到的 `launchctl bootstrap` 令首次安装失败。完成 GUI/Control 清理后，才执行
+新安装包脚本目录内携带的当前版本 recovery CLI 和 root helper bootout；不得依赖即将被
+替换版本的 `omg stop` 处理跨重启 runtime。recovery 非 `idle`/`complete`/
+`complete_static` 或网关安全清理失败时直接拒绝升级；`complete_static` 是明确保留 Mac
 静态 IPv4 的终态，不应被误判为恢复未完成。postinstall 不得覆盖已有 `config.yaml`，导入源、
 设备策略和 runtime 记录也必须跨升级保留。
 

@@ -78,6 +78,17 @@ func TestLoadImportedProfileSectionsRewritesProviderPaths(t *testing.T) {
   absolute:
     type: file
     path: /var/tmp/proxies.yaml
+  cached:
+    type: http
+    url: https://example.com/proxies.yaml
+    path: ./providers/cached.yaml
+  pathless:
+    type: http
+    url: https://example.com/pathless.yaml
+  absolute-cache:
+    type: http
+    url: https://example.com/absolute.yaml
+    path: /var/tmp/shared-provider.yaml
 rule-providers:
   cn:
     type: file
@@ -103,12 +114,83 @@ rules:
 		`path: "` + filepath.Join(dir, "providers", "quoted.yaml") + `"`,
 		`path: '` + filepath.Join(dir, "providers", "cn.yaml") + `'`,
 		"path: /var/tmp/proxies.yaml",
-		"path: https://example.com/rules.yaml",
 		"- RULE-SET,cn,DIRECT",
 	} {
 		if !strings.Contains(sections, want) {
 			t.Fatalf("imported sections missing %q:\n%s", want, sections)
 		}
+	}
+	var decoded struct {
+		ProxyProviders map[string]struct {
+			Path string `yaml:"path"`
+		} `yaml:"proxy-providers"`
+		RuleProviders map[string]struct {
+			Path string `yaml:"path"`
+		} `yaml:"rule-providers"`
+	}
+	if err := yaml.Unmarshal([]byte(sections), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{
+		"cached":   filepath.Join(dir, "providers", "cached.yaml"),
+		"pathless": "", "absolute-cache": "/var/tmp/shared-provider.yaml",
+	} {
+		if got := decoded.ProxyProviders[name].Path; got != want {
+			t.Fatalf("%s provider path=%q, want %q", name, got, want)
+		}
+	}
+	if got := decoded.RuleProviders["remote"].Path; got != "https://example.com/rules.yaml" {
+		t.Fatalf("URL-shaped provider path changed: %q", got)
+	}
+}
+
+func TestLoadImportedProfileSectionsPreservesProviderPathsAcrossContentChanges(t *testing.T) {
+	dir := t.TempDir()
+	makeProfile := func(name, url string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		body := `proxy-providers:
+  remote: {type: http, url: "` + url + `", path: ./provider.yaml}
+  local: {type: file, path: ./provider.yaml}
+rule-providers:
+  remote-rules: {type: http, behavior: domain, format: mrs, url: "` + url + `/rules", path: ./rules.mrs}
+rules: ['MATCH,DIRECT']
+`
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	decode := func(path string) (string, string, string) {
+		t.Helper()
+		rendered, err := LoadImportedProfileSections(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var document struct {
+			ProxyProviders map[string]struct {
+				Path string `yaml:"path"`
+			} `yaml:"proxy-providers"`
+			RuleProviders map[string]struct {
+				Path string `yaml:"path"`
+			} `yaml:"rule-providers"`
+		}
+		if err := yaml.Unmarshal([]byte(rendered), &document); err != nil {
+			t.Fatal(err)
+		}
+		return document.ProxyProviders["remote"].Path, document.ProxyProviders["local"].Path, document.RuleProviders["remote-rules"].Path
+	}
+	remoteA, localA, rulesA := decode(makeProfile("a.yaml", "https://a.example"))
+	remoteB, localB, rulesB := decode(makeProfile("b.yaml", "https://b.example"))
+	if remoteA != remoteB || rulesA != rulesB {
+		t.Fatalf("profile content change moved HTTP caches: proxy=%q/%q rule=%q/%q", remoteA, remoteB, rulesA, rulesB)
+	}
+	wantLocal := filepath.Join(dir, "provider.yaml")
+	if localA != wantLocal || localB != wantLocal {
+		t.Fatalf("type:file provider moved from existing profile-relative path: %q %q", localA, localB)
+	}
+	if filepath.Ext(rulesA) != ".mrs" || filepath.Ext(rulesB) != ".mrs" {
+		t.Fatalf("rule-provider cache lost declared MRS format: %q %q", rulesA, rulesB)
 	}
 }
 
@@ -332,5 +414,38 @@ func TestInspectImportedProfileUsesSemanticTerminalMatchValidation(t *testing.T)
 		if _, err := InspectImportedProfile([]byte(body)); err == nil {
 			t.Fatalf("InspectImportedProfile(%q) succeeded", body)
 		}
+	}
+}
+
+func TestInspectImportedProfileRejectsLocalRoutingNamespaceDefinitionsAndReferences(t *testing.T) {
+	tests := map[string]string{
+		"proxy definition": `proxies:
+  - name: open-surge/mac-global
+    type: direct
+rules: ["MATCH,DIRECT"]
+`,
+		"provider definition": `proxy-providers:
+  open-surge/mac-provider:
+    type: inline
+    payload: []
+rules: ["MATCH,DIRECT"]
+`,
+		"group candidate": `proxy-groups:
+  - name: Main
+    type: select
+    proxies: [DIRECT, open-surge/mac-global]
+rules: ["MATCH,DIRECT"]
+`,
+		"rule target": `rules:
+  - DOMAIN,example.com,open-surge/mac-mode-tcp
+  - MATCH,DIRECT
+`,
+	}
+	for name, profile := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := InspectImportedProfile([]byte(profile)); err == nil || !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("InspectImportedProfile() error = %v", err)
+			}
+		})
 	}
 }

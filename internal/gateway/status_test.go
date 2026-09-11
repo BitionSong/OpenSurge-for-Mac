@@ -1,8 +1,17 @@
 package gateway
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"open-mihomo-gateway/internal/config"
+	"open-mihomo-gateway/internal/runtime"
 )
 
 func TestStatusFormatLabelsDNSOnlyMode(t *testing.T) {
@@ -34,5 +43,156 @@ func TestStatusFormatLabelsDHCPMode(t *testing.T) {
 	got := status.Format()
 	if !strings.Contains(got, "DHCP: running") {
 		t.Fatalf("status did not preserve DHCP label:\n%s", got)
+	}
+}
+
+func TestStatusFormatIncludesTUNInterfaceAndError(t *testing.T) {
+	status := Status{
+		TUN:          "failed",
+		TUNInterface: "utun7",
+		TUNError:     "mihomo runtime config reports TUN disabled",
+	}
+	got := status.Format()
+	if !strings.Contains(got, "TUN: failed (utun7): mihomo runtime config reports TUN disabled") {
+		t.Fatalf("status did not expose TUN failure details:\n%s", got)
+	}
+}
+
+func TestStatusDegradesWhenRunningMihomoReportsTUNDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/version":
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": "v1.19.27", "meta": true})
+		case "/configs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tun": map[string]any{"enable": false, "device": "utun123"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.Runtime.Dir = t.TempDir()
+	cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	cfg.Mihomo.APIAddr = server.URL
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.DHCP.Enabled = true
+	paths := runtime.NewPaths(cfg)
+	if err := runtime.Ensure(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SaveState(paths.StateFile, runtime.State{PIDMihomo: os.Getpid(), PIDDNSMasq: os.Getpid(), StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := New(cfg).Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Gateway != "degraded" || status.TUN != "failed" || status.TUNInterface != "utun123" || status.TUNError == "" {
+		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestStatusKeepsGatewayRunningWhenTUNRuntimeStateIsTemporarilyUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/version":
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": "v1.19.27", "meta": true})
+		case "/configs":
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.Runtime.Dir = t.TempDir()
+	cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	cfg.Mihomo.APIAddr = server.URL
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	cfg.DHCP.Enabled = true
+	paths := runtime.NewPaths(cfg)
+	if err := runtime.Ensure(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SaveState(paths.StateFile, runtime.State{PIDMihomo: os.Getpid(), PIDDNSMasq: os.Getpid(), StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := New(cfg).Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Gateway != "running" || status.TUN != "unknown" || status.TUNError == "" {
+		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestStatusExposesControllerRefusalForRunningMihomo(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	apiAddr := server.URL
+	server.Close()
+
+	cfg := config.Default()
+	cfg.Runtime.Dir = t.TempDir()
+	cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	cfg.Mihomo.APIAddr = apiAddr
+	cfg.Transparent.Mode = config.TransparentModeOff
+	cfg.DHCP.Enabled = true
+	paths := runtime.NewPaths(cfg)
+	if err := runtime.Ensure(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SaveState(paths.StateFile, runtime.State{PIDMihomo: os.Getpid(), PIDDNSMasq: os.Getpid(), StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := New(cfg).Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Mihomo != "running" || !strings.Contains(status.MihomoError, "connection refused") {
+		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestStatusMarksPreviousBootRuntimeInterruptedWithoutProbingReusedPID(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "must not probe stale runtime", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.Runtime.Dir = t.TempDir()
+	cfg.Mihomo.Config = filepath.Join(cfg.Runtime.Dir, "mihomo.yaml")
+	cfg.Mihomo.APIAddr = server.URL
+	cfg.Transparent.Mode = config.TransparentModeTUN
+	paths := runtime.NewPaths(cfg)
+	if err := runtime.Ensure(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.SaveState(paths.StateFile, runtime.State{
+		PIDMihomo:      os.Getpid(),
+		PIDDNSMasq:     os.Getpid(),
+		BootSessionID:  "previous-boot-session",
+		PFAnchorLoaded: true,
+		StartedAt:      time.Now().Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := New(cfg).Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Gateway != "degraded" || status.RuntimeState != "interrupted" || status.Mihomo != "stopped" || status.PFAnchor != "unloaded" {
+		t.Fatalf("status = %#v", status)
+	}
+	if requests != 0 {
+		t.Fatalf("stale runtime made %d mihomo API requests", requests)
 	}
 }

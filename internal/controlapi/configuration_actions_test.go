@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -12,8 +13,48 @@ import (
 	"testing"
 
 	"open-mihomo-gateway/internal/config"
+	"open-mihomo-gateway/internal/gateway"
 	"open-mihomo-gateway/internal/mihomo"
+	"open-mihomo-gateway/internal/runtime"
 )
+
+func TestConfigurationUpdateRunsUnderSharedLifecycleLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := config.Default()
+	cfg.Runtime.Dir = filepath.Join(dir, "runtime")
+	if err := writeAtomic(path, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	if err := withConfigurationLifecycleLock(path, func() error {
+		called = true
+		busy, err := gateway.LifecycleOperationInProgress(cfg)
+		if err != nil {
+			return err
+		}
+		if !busy {
+			t.Fatal("configuration mutation ran outside the gateway lifecycle lock")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("configuration mutation did not run")
+	}
+
+	lock, err := runtime.AcquireLifecycleLock(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	called = false
+	err = withConfigurationLifecycleLock(path, func() error { called = true; return nil })
+	if !errors.Is(err, runtime.ErrLifecycleOperationInProgress) || called {
+		t.Fatalf("concurrent configuration mutation err=%v called=%t", err, called)
+	}
+}
 
 func TestApplyProfileReloadsRunningGateway(t *testing.T) {
 	configPath, original := writeProfileApplyTestConfig(t)
@@ -36,7 +77,7 @@ func TestApplyProfileReloadsRunningGateway(t *testing.T) {
 			return nil
 		},
 	}
-	result, err := applyProfile(t.Context(), configPath, fileDigest(configPath), profileApplyFixture(), deps)
+	result, err := applyProfile(t.Context(), configPath, fileDigest(configPath), profileApplyFixture(), profileApplySourceDigest(), profileApplyOverlayDigest(), deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +91,9 @@ func TestApplyProfileReloadsRunningGateway(t *testing.T) {
 	digest, err := config.MihomoProfileDigest(cfg)
 	if err != nil || digest != fileDigestBytes(profileApplyFixture()) {
 		t.Fatalf("profile digest=%q err=%v", digest, err)
+	}
+	if cfg.Mihomo.ProfileSourceDigest != profileApplySourceDigest() || cfg.Mihomo.ProfileOverlayDigest != profileApplyOverlayDigest() {
+		t.Fatalf("composition metadata = %#v", cfg.Mihomo)
 	}
 }
 
@@ -75,7 +119,7 @@ func TestApplyProfileRestoresPreviousConfigAndGatewayAfterReloadFailure(t *testi
 			return nil
 		},
 	}
-	_, err := applyProfile(t.Context(), configPath, fileDigest(configPath), profileApplyFixture(), deps)
+	_, err := applyProfile(t.Context(), configPath, fileDigest(configPath), profileApplyFixture(), profileApplySourceDigest(), profileApplyOverlayDigest(), deps)
 	if err == nil || !strings.Contains(err.Error(), "previous config restored") || !strings.Contains(err.Error(), "previous running gateway preserved or restored") {
 		t.Fatalf("error = %v", err)
 	}
@@ -110,7 +154,7 @@ func TestApplyProfileLeavesStoppedGatewayPendingForNextStart(t *testing.T) {
 			return nil
 		},
 	}
-	result, err := applyProfile(t.Context(), configPath, fileDigest(configPath), profileApplyFixture(), deps)
+	result, err := applyProfile(t.Context(), configPath, fileDigest(configPath), profileApplyFixture(), profileApplySourceDigest(), "", deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +191,7 @@ rules: ['DOMAIN,example.com,Main', 'MATCH,DIRECT']
 			return nil
 		},
 	}
-	result, err := applyProfile(t.Context(), configPath, fileDigest(configPath), payload, deps)
+	result, err := applyProfile(t.Context(), configPath, fileDigest(configPath), payload, profileApplySourceDigest(), profileApplyOverlayDigest(), deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +231,7 @@ func TestApplyProfileValidationFailureCleansCandidateAndPreservesConfig(t *testi
 			return nil
 		},
 	}
-	if _, err := applyProfile(t.Context(), configPath, fileDigest(configPath), payload, deps); err == nil || !strings.Contains(err.Error(), "candidate render failed") {
+	if _, err := applyProfile(t.Context(), configPath, fileDigest(configPath), payload, profileApplySourceDigest(), profileApplyOverlayDigest(), deps); err == nil || !strings.Contains(err.Error(), "candidate render failed") {
 		t.Fatalf("applyProfile() error = %v", err)
 	}
 	current, err := os.ReadFile(configPath)
@@ -200,6 +244,156 @@ func TestApplyProfileValidationFailureCleansCandidateAndPreservesConfig(t *testi
 	profilePath := filepath.Join(filepath.Dir(configPath), "data", "imported-profile-"+fileDigestBytes(payload)[:16]+".yaml")
 	if _, err := os.Stat(profilePath); !os.IsNotExist(err) {
 		t.Fatalf("failed candidate profile remains: %v", err)
+	}
+}
+
+func TestApplyTailscaleStoresWriteOnlyAuthKeyAndNormalizesTargets(t *testing.T) {
+	configPath, _ := writeProfileApplyTestConfig(t)
+	input := TailscaleUpdateRequest{TailscaleSettings: TailscaleSettings{
+		Enabled:          true,
+		DisplayName:      " Home Tailnet ",
+		Hostname:         "OpenSurge-Home",
+		ControlURL:       "https://controlplane.tailscale.com/",
+		MagicDNSSuffixes: []string{"*.HOME.example.ts.net", "home.example.ts.net"},
+		PeerCIDRs:        []string{"100.82.10.7"},
+		AllowMac:         true,
+	}, AuthKey: "tskey-auth-private"}
+	payload, _ := json.Marshal(input)
+	validated := false
+	deps := profileApplyDeps{
+		geteuid: func() int { return 0 },
+		validate: func(candidate config.Config) error {
+			validated = true
+			if candidate.Tailscale.PeerCIDRs[0] != "100.82.10.7/32" || candidate.Tailscale.MagicDNSSuffixes[0] != "home.example.ts.net" {
+				t.Fatalf("candidate Tailscale settings = %#v", candidate.Tailscale)
+			}
+			return nil
+		},
+		stateExists: func(config.Config) (bool, error) { return false, nil },
+		reload: func(context.Context, config.Config) error {
+			t.Fatal("reload called for stopped gateway")
+			return nil
+		},
+		start: func(context.Context, config.Config) error { return nil },
+	}
+	result, err := applyTailscale(t.Context(), configPath, fileDigest(configPath), payload, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validated || result.Reloaded || result.Revision == "" {
+		t.Fatalf("result=%#v validated=%v", result, validated)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Tailscale.Enabled || cfg.Tailscale.Hostname != "opensurge-home" || cfg.Tailscale.ControlURL != "https://controlplane.tailscale.com" {
+		t.Fatalf("saved Tailscale settings = %#v", cfg.Tailscale)
+	}
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(configData, []byte("tskey-auth-private")) {
+		t.Fatal("write-only auth key leaked into gateway config")
+	}
+	authData, err := os.ReadFile(cfg.Tailscale.AuthKeyFile)
+	if err != nil || strings.TrimSpace(string(authData)) != "tskey-auth-private" {
+		t.Fatalf("stored auth key = %q err=%v", authData, err)
+	}
+	if info, err := os.Stat(cfg.Tailscale.AuthKeyFile); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("auth key mode = %v err=%v", info.Mode().Perm(), err)
+	}
+}
+
+func TestApplyTailscaleReloadFailureRestoresConfigAndAuthKey(t *testing.T) {
+	configPath, original := writeProfileApplyTestConfig(t)
+	authKeyPath, _ := tailscaleManagedPaths(configPath)
+	if err := writeAtomic(authKeyPath, []byte("old-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(TailscaleUpdateRequest{TailscaleSettings: TailscaleSettings{Enabled: true, DisplayName: "Tailnet", Hostname: "opensurge", ControlURL: "https://controlplane.tailscale.com", AllowMac: true}, AuthKey: "new-key"})
+	deps := profileApplyDeps{
+		geteuid:     func() int { return 0 },
+		validate:    func(config.Config) error { return nil },
+		stateExists: func(config.Config) (bool, error) { return true, nil },
+		reload:      func(context.Context, config.Config) error { return errors.New("candidate failed") },
+		start:       func(context.Context, config.Config) error { return nil },
+	}
+	if _, err := applyTailscale(t.Context(), configPath, fileDigest(configPath), payload, deps); err == nil || !strings.Contains(err.Error(), "previous config and auth key restored") {
+		t.Fatalf("applyTailscale() error = %v", err)
+	}
+	current, _ := os.ReadFile(configPath)
+	if !bytes.Equal(current, original) {
+		t.Fatal("failed Tailscale reload did not restore gateway config")
+	}
+	authData, _ := os.ReadFile(authKeyPath)
+	if string(authData) != "old-key\n" {
+		t.Fatalf("auth key after rollback = %q", authData)
+	}
+}
+
+func TestForgetTailscaleIdentityRequiresDisabledStoppedGateway(t *testing.T) {
+	configPath, _ := writeProfileApplyTestConfig(t)
+	_, stateDir := tailscaleManagedPaths(configPath)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "tailscaled.state"), []byte("state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removed := ""
+	deps := forgetTailscaleDeps{
+		geteuid:     func() int { return 0 },
+		stateExists: func(config.Config) (bool, error) { return false, nil },
+		removeAll: func(path string) error {
+			removed = path
+			return os.RemoveAll(path)
+		},
+	}
+	if _, err := forgetTailscaleIdentity(configPath, fileDigest(configPath), deps); err != nil {
+		t.Fatal(err)
+	}
+	if removed != stateDir || tailscaleLocalIdentityPresent(stateDir) {
+		t.Fatalf("removed=%q identity_present=%v", removed, tailscaleLocalIdentityPresent(stateDir))
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Tailscale.Enabled = true
+	if err := writeAtomic(configPath, []byte(config.Render(cfg)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := forgetTailscaleIdentity(configPath, fileDigest(configPath), deps); err == nil || !strings.Contains(err.Error(), "disable Tailscale") {
+		t.Fatalf("forget enabled Tailscale error = %v", err)
+	}
+}
+
+func TestApplyProfileRejectsInvalidCompositionDigestsBeforeWriting(t *testing.T) {
+	configPath, original := writeProfileApplyTestConfig(t)
+	deps := profileApplyDeps{geteuid: func() int { return 0 }}
+	tests := []struct {
+		name          string
+		sourceDigest  string
+		overlayDigest string
+		want          string
+	}{
+		{name: "source", sourceDigest: strings.Repeat("A", 64), want: "source digest"},
+		{name: "overlay", sourceDigest: profileApplySourceDigest(), overlayDigest: "abcd", want: "overlay digest"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := applyProfile(t.Context(), configPath, fileDigest(configPath), profileApplyFixture(), tt.sourceDigest, tt.overlayDigest, deps)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("applyProfile() error = %v", err)
+			}
+			current, readErr := os.ReadFile(configPath)
+			if readErr != nil || !bytes.Equal(current, original) {
+				t.Fatalf("invalid digest changed config: err=%v", readErr)
+			}
+		})
 	}
 }
 
@@ -221,6 +415,14 @@ func writeProfileApplyTestConfig(t *testing.T) (string, []byte) {
 
 func profileApplyFixture() []byte {
 	return []byte("proxies:\n  - {name: edge, type: http, server: 127.0.0.1, port: 8080}\nproxy-groups:\n  - {name: Main, type: select, proxies: [edge, DIRECT]}\nrules:\n  - MATCH,Main\n")
+}
+
+func profileApplySourceDigest() string {
+	return fileDigestBytes([]byte("source profile"))
+}
+
+func profileApplyOverlayDigest() string {
+	return fileDigestBytes([]byte("global profile overlay"))
 }
 
 func fileDigestBytes(data []byte) string {

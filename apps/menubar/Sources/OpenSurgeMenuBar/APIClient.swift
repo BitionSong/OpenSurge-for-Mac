@@ -16,10 +16,10 @@ enum ControlAPIError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .descriptorUnavailable, .tokenUnavailable: "OpenSurge 后台服务尚未准备好"
-        case .transportUnavailable: "无法连接 OpenSurge 后台服务"
-        case .invalidResponse: "Control API 返回了无效数据"
-        case .http(let status): "Control API 请求失败（HTTP \(status)）"
+        case .descriptorUnavailable, .tokenUnavailable: L10n.text("OpenSurge 后台服务尚未准备好")
+        case .transportUnavailable: L10n.text("无法连接 OpenSurge 后台服务")
+        case .invalidResponse: L10n.text("Control API 返回了无效数据")
+        case .http(let status): L10n.format("Control API 请求失败（HTTP %@）", String(status))
         }
     }
 }
@@ -41,6 +41,13 @@ struct ControlAPIClient {
         let body = try JSONEncoder().encode(["path": path])
         let data = try await request(endpoint, method: "POST", body: body)
         return try decoder().decode(BootstrapResponse.self, from: data).url
+    }
+
+    func setSleepPrevention(_ enabled: Bool) async throws -> SleepPreventionStatus {
+        let endpoint = try descriptor().url.appending(path: "api/v1/sleep-prevention")
+        let body = try JSONEncoder().encode(["enabled": enabled])
+        let data = try await request(endpoint, method: "PUT", body: body)
+        return try decoder().decode(SleepPreventionStatus.self, from: data)
     }
 
     private func descriptor() throws -> EndpointDescriptor {
